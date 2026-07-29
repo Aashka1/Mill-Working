@@ -11,7 +11,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Pencil, Scale } from "lucide-react";
+import { Plus, Trash2, Pencil, Scale, IndianRupee } from "lucide-react";
+import { PaymentDialog } from "@/components/PaymentDialog";
 import { toast } from "sonner";
 
 // Must cover every category the seeded catalogue uses, or those products cannot
