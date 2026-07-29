@@ -8,8 +8,8 @@ module.exports = {
   theme: {
     extend: {
       fontFamily: {
-        heading: ["'Cabinet Grotesk'", "sans-serif"],
-        sans: ["'Figtree'", "sans-serif"],
+        heading: ["'Inter'", "sans-serif"],
+        sans: ["'Inter'", "sans-serif"],
       },
       borderRadius: {
         lg: 'var(--radius)',

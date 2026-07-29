@@ -13,6 +13,8 @@ import Production from "@/pages/Production";
 import Exchange from "@/pages/Exchange";
 import Costing from "@/pages/Costing";
 import Maintenance from "@/pages/Maintenance";
+import Reports from "@/pages/Reports";
+import Settings from "@/pages/Settings";
 import Expenses from "@/pages/Expenses";
 import Customers from "@/pages/Customers";
 import Suppliers from "@/pages/Suppliers";
@@ -47,6 +49,8 @@ function App() {
             <Route path="exchange" element={<Exchange />} />
             <Route path="costing" element={<Costing />} />
             <Route path="maintenance" element={<Maintenance />} />
+            <Route path="reports" element={<Reports />} />
+            <Route path="settings" element={<Settings />} />
             <Route path="expenses" element={<Expenses />} />
             <Route path="customers" element={<Customers />} />
             <Route path="suppliers" element={<Suppliers />} />

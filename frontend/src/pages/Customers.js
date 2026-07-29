@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogT
 import { Badge } from "@/components/ui/badge";
 import { Plus, Trash2, History, Phone, MapPin } from "lucide-react";
 import { toast } from "sonner";
+import { LedgerDialog } from "@/components/LedgerDialog";
 
 export default function Customers() {
   const customers = useList("/customers");
@@ -19,6 +20,7 @@ export default function Customers() {
   const [f, setF] = useState({ name: "", phone: "", address: "" });
   const [hist, setHist] = useState(null);
   const [histName, setHistName] = useState("");
+  const [ledgerFor, setLedgerFor] = useState(null);
 
   const save = async () => {
     if (!f.name) return toast.error("Enter name");
@@ -67,7 +69,7 @@ export default function Customers() {
                 <TableCell><span className="flex items-center gap-1 text-sm text-muted-foreground"><MapPin className="h-3 w-3" />{c.address || "—"}</span></TableCell>
                 <TableCell className="text-right">{c.outstanding > 0 ? <Badge variant="outline" className="text-destructive border-destructive/30">{money(c.outstanding)}</Badge> : <Badge variant="outline" className="text-secondary border-secondary/30">Clear</Badge>}</TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
-                  <Button variant="ghost" size="icon" onClick={() => showHistory(c)} data-testid={`history-customer-${c.id}`}><History className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => setLedgerFor(c)} data-testid={`ledger-customer-${c.id}`}><History className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => customers.remove(c.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                 </TableCell>
               </TableRow>
@@ -77,25 +79,7 @@ export default function Customers() {
         </Table>
       </Card>
 
-      <Dialog open={!!hist} onOpenChange={(o) => !o && setHist(null)}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader><DialogTitle>Transaction History — {histName}</DialogTitle></DialogHeader>
-          <div className="max-h-96 overflow-y-auto space-y-4">
-            {hist && ["sales", "grinding", "oil"].map((k) => (
-              <div key={k}>
-                <p className="text-sm font-semibold capitalize mb-2">{k === "oil" ? "Oil Extraction" : k}</p>
-                {hist[k].length === 0 ? <p className="text-xs text-muted-foreground">None</p> :
-                  hist[k].map((x) => (
-                    <div key={x.id} className="flex justify-between text-sm py-1.5 border-b border-border/40">
-                      <span>{x.date} · {x.product_name || x.seed_type || "Grinding"}</span>
-                      <span className="font-medium">{money(x.total || x.total_charge)} <Badge variant="outline" className="ml-1 text-[10px]">{x.payment_status}</Badge></span>
-                    </div>
-                  ))}
-              </div>
-            ))}
-          </div>
-        </DialogContent>
-      </Dialog>
+      <LedgerDialog open={!!ledgerFor} onOpenChange={(o) => !o && setLedgerFor(null)} entity={ledgerFor} partyType="customer" onChanged={() => customers.load()} />
     </div>
   );
 }

@@ -1,0 +1,32 @@
+{
+  "summary": "Iteration 4 tested end-to-end. Backend pytest 11/11 pass covering: seeded flour types & Packing Bags, GET/PUT /api/settings (washed_loss/unwashed_loss/starting_cash persist), customer ledger (grinding debit + partial credit + running balance where balance=debits-credits), auto-credit on Paid sale (outstanding stays 0), PATCH /grinding/{id}/pay creates single credit (no double-count on second call — verified by ref_id lookup), supplier ledger auto-credit on paid purchase (outstanding=0), /api/cashbook returns opening/received/supplier/expenses/closing with correct math and starting_cash effect, /api/sales-analytics returns today/month/year + top(<=5)/least + profit, /api/audit logs stock change entries, low-stock notifications fire for new products. Frontend E2E: green/gold theme confirmed (--primary 123 46% 34%, --secondary 43 81% 46%, Inter font), sidebar has Reports & Settings, Reports page shows rep-today/month/year/profit + cashbook-card + top-N/least-N tables, Settings page saves loss% + starting cash with audit log table populated, Customers page ledger dialog opens & Record Payment updates ledger + toast, Suppliers page ledger dialog opens, Production page contains Sattu.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Customers page", "issue": "ReferenceError: ledgerFor is not defined – missing useState declaration for ledgerFor/setLedgerFor, page crashed entirely (blank + error overlay). FIXED by adding const [ledgerFor, setLedgerFor] = useState(null).", "selector": "/customers route", "priority": "CRITICAL (fixed)"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/test_iteration4.py", "/app/test_reports/pytest/iteration4.xml"],
+  "action_items": [
+    "Customers.js had leftover unused hist/setHist/histName state (from removed history dialog); consider cleaning up.",
+    "server.py is now ~1200 lines — split into routers per resource (auth, products, sales, ledger, cashbook, analytics, audit) for maintainability."
+  ],
+  "critical_code_review_comments": [
+    "Customers.js used setLedgerFor without declaring the state variable — caught by React runtime. This should have been caught in E1's smoke run. Consider adding a lint rule (no-undef) and a build-time check before shipping.",
+    "log_audit is inconsistent: sales & purchases & production log audit, but grinding, oil, expenses, payments (via /payments), and product delete/update stock delta all mostly log — however edit endpoints (PUT /sales/{id}, PUT /grinding/{id}, PUT /oil/{id}, PUT /expenses/{id}) do NOT emit audit entries even though they mutate finances. Add log_audit calls to edits & deletes for completeness.",
+    "cashbook opening derivation iterates ALL payments/expenses and filters by date string; scale concern >10-20k rows. Consider a mongodb aggregation pipeline with date index.",
+    "sales-analytics computes profit using product's current cost_per_unit at query time, not the cost at sale time — historical profit will silently drift as new purchases update WACC. Snapshot cost_per_unit on each sale row for accurate historical margin.",
+    "PATCH /purchases/{id}/pay does not update the corresponding invoice payment_status (unlike sales/grinding/oil in mark_paid). Minor inconsistency.",
+    "All list endpoints still use .to_list(1000-5000) without pagination — silent truncation at scale."
+  ],
+  "updated_files": ["/app/frontend/src/pages/Customers.js", "/app/backend/tests/test_iteration4.py"],
+  "success_rate": {"backend": "100% (11/11)", "frontend": "100% after fix"},
+  "test_credentials": "Admin: admin@agrimill.com/admin123, Staff: staff@agrimill.com/staff123 (validated via login)",
+  "seed_data_creation": "Backend tests created TEST_LedgerCust_*, TEST_PaidCust_*, TEST_LedgerSup_* customers/suppliers, one Pending grinding + partial payment + mark-paid, one Paid sale of Packing Bags, one Paid purchase. Frontend test recorded a ₹7 payment against 'Aashka Tiwari'. Safe leftover; not blocking.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 4 features fully verified. Fixed Customers.js missing useState for ledgerFor. Backend regression test at /app/backend/tests/test_iteration4.py (11 tests). Prior iteration tests test_agrimill.py, test_mill_expansion.py, test_iteration3.py are still in tree.",
+  "rca of the issue": "Frontend Customers page rendered nothing due to ReferenceError: ledgerFor is not defined at Customers.js:71 — LedgerDialog integration added references to ledgerFor/setLedgerFor but forgot the useState hook. Fixed by declaring const [ledgerFor, setLedgerFor] = useState(null) alongside the existing state at the top of the component. After fix, ledger buttons render, dialog opens, Record Payment records payment via POST /api/payments and refreshes ledger + toast displays."
+}

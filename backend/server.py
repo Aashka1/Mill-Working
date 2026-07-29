@@ -211,12 +211,17 @@ async def create_product(body: ProductBody, user: dict = Depends(get_current_use
 
 @api_router.put("/products/{pid}")
 async def update_product(pid: str, body: ProductBody, user: dict = Depends(get_current_user)):
+    old = await db.products.find_one({"id": pid})
     await db.products.update_one({"id": pid}, {"$set": body.model_dump()})
+    if old and old.get("current_stock") != body.current_stock:
+        await log_audit(user, "Changed stock", f"{body.name}: {old.get('current_stock')} → {body.current_stock} {body.unit}")
     return clean(await db.products.find_one({"id": pid}))
 
 @api_router.delete("/products/{pid}")
 async def delete_product(pid: str, user: dict = Depends(require_admin)):
+    p = await db.products.find_one({"id": pid})
     await db.products.delete_one({"id": pid})
+    await log_audit(user, "Deleted product", (p or {}).get("name", pid))
     return {"message": "deleted"}
 
 # ---------------- Purchases ----------------
@@ -241,6 +246,9 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
     doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "created_at": now_iso()}
     await db.purchases.insert_one(doc)
     await add_stock_with_cost(body.product_id, body.quantity, total)
+    if body.payment_status == "Paid":
+        await add_credit("supplier", body.supplier_name, total, body.date, doc["id"], f"Purchase {body.product_name}")
+    await log_audit(user, "Created purchase", f"{body.supplier_name} · {body.product_name} {body.quantity}kg · Rs {total}")
     return clean(doc)
 
 @api_router.delete("/purchases/{pid}")
@@ -277,6 +285,9 @@ async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": inv, "type": "Sale",
         "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
         "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
+    if body.payment_status == "Paid":
+        await add_credit("customer", body.customer_name, total, body.date, doc["id"], f"Cash sale {inv}")
+    await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity}kg · Rs {total}")
     return clean(doc)
 
 @api_router.delete("/sales/{sid}")
@@ -286,6 +297,7 @@ async def delete_sale(sid: str, user: dict = Depends(require_admin)):
         await db.products.update_one({"id": s["product_id"]}, {"$inc": {"current_stock": s["quantity"]}})
         await db.sales.delete_one({"id": sid})
         await db.invoices.delete_one({"ref_id": sid})
+        await db.payments.delete_many({"ref_id": sid})
     return {"message": "deleted"}
 
 # ---------------- Grinding ----------------
@@ -314,6 +326,8 @@ async def create_grinding(body: GrindingBody, user: dict = Depends(get_current_u
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"], "type": "Grinding",
         "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
         "total": doc["total_charge"], "payment_status": doc["payment_status"], "created_at": now_iso()})
+    if doc["payment_status"] == "Paid" and doc["total_charge"] > 0:
+        await add_credit("customer", doc["customer_name"], doc["total_charge"], doc["date"], doc["id"], f"Grinding {doc['invoice_number']}")
     return clean(doc)
 
 @api_router.delete("/grinding/{gid}")
@@ -353,6 +367,8 @@ async def create_oil(body: OilBody, user: dict = Depends(get_current_user)):
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"], "type": "Oil Extraction",
         "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
         "total": doc["total"], "payment_status": doc["payment_status"], "created_at": now_iso()})
+    if doc["payment_status"] == "Paid" and doc["total"] > 0:
+        await add_credit("customer", doc["customer_name"], doc["total"], doc["date"], doc["id"], f"Oil {doc['invoice_number']}")
     return clean(doc)
 
 @api_router.delete("/oil/{oid}")
@@ -362,6 +378,7 @@ async def delete_oil(oid: str, user: dict = Depends(require_admin)):
         await apply_oil_effects(o, -1)
         await db.oil.delete_one({"id": oid})
         await db.invoices.delete_one({"ref_id": oid})
+        await db.payments.delete_many({"ref_id": oid})
     return {"message": "deleted"}
 
 # ---------------- Expenses ----------------
@@ -398,11 +415,12 @@ class CustomerBody(BaseModel):
 async def get_customers(user: dict = Depends(get_current_user)):
     customers = [clean(c) for c in await db.customers.find().sort("name", 1).to_list(2000)]
     for c in customers:
-        pending = 0.0
+        debit = 0.0
         for coll, field in [("sales", "total"), ("grinding", "total_charge"), ("oil", "total")]:
-            docs = await db[coll].find({"customer_name": c["name"], "payment_status": "Pending"}).to_list(1000)
-            pending += sum(d.get(field, 0) for d in docs)
-        c["outstanding"] = round(pending, 2)
+            docs = await db[coll].find({"customer_name": c["name"]}).to_list(2000)
+            debit += sum(d.get(field, 0) for d in docs)
+        credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "customer", "party_name": c["name"]}).to_list(2000))
+        c["outstanding"] = round(debit - credit, 2)
     return customers
 
 @api_router.post("/customers")
@@ -444,8 +462,10 @@ class SupplierBody(BaseModel):
 async def get_suppliers(user: dict = Depends(get_current_user)):
     suppliers = [clean(s) for s in await db.suppliers.find().sort("name", 1).to_list(2000)]
     for s in suppliers:
-        docs = await db.purchases.find({"supplier_name": s["name"], "payment_status": "Pending"}).to_list(1000)
-        s["outstanding"] = round(sum(d.get("total", 0) for d in docs), 2)
+        docs = await db.purchases.find({"supplier_name": s["name"]}).to_list(2000)
+        debit = sum(d.get("total", 0) for d in docs)
+        credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "supplier", "party_name": s["name"]}).to_list(2000))
+        s["outstanding"] = round(debit - credit, 2)
     return suppliers
 
 @api_router.post("/suppliers")
@@ -683,11 +703,19 @@ async def startup():
 DEFAULT_PRODUCTS = [
     {"name": "Wheat Crop", "category": "Wheat Crop", "unit": "kg", "low_stock_threshold": 100},
     {"name": "Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
-    {"name": "Wheat Bran", "category": "Bran", "unit": "kg", "low_stock_threshold": 30},
+    {"name": "Fine Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
+    {"name": "Medium Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
+    {"name": "Coarse Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
+    {"name": "Multigrain Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
+    {"name": "Besan", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
+    {"name": "Makka Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
+    {"name": "Bajra Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
     {"name": "Sattu", "category": "Flour", "unit": "kg", "low_stock_threshold": 20},
+    {"name": "Wheat Bran", "category": "Bran", "unit": "kg", "low_stock_threshold": 30},
     {"name": "Mustard Seeds", "category": "Oil Seeds", "unit": "kg", "low_stock_threshold": 100},
     {"name": "Mustard Oil", "category": "Edible Oil", "unit": "litre", "low_stock_threshold": 20},
     {"name": "Mustard Oil Cake", "category": "Oil Cake", "unit": "kg", "low_stock_threshold": 30},
+    {"name": "Packing Bags", "category": "Packing", "unit": "pcs", "low_stock_threshold": 100},
 ]
 
 async def seed_products():
@@ -699,7 +727,7 @@ async def seed_products():
 async def get_settings_doc():
     s = await db.settings.find_one({"id": "config"})
     if not s:
-        s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0}
+        s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0, "starting_cash": 0}
         await db.settings.insert_one(s)
     return clean(s)
 
@@ -757,6 +785,7 @@ async def apply_oil_effects(doc, sign):
 class SettingsBody(BaseModel):
     washed_loss: float
     unwashed_loss: float
+    starting_cash: float = 0
 
 @api_router.get("/settings")
 async def read_settings(user: dict = Depends(get_current_user)):
@@ -805,6 +834,7 @@ async def create_production(body: ProductionBody, user: dict = Depends(get_curre
            "input_product_name": body.input_product_name, "input_quantity": body.input_quantity,
            "input_cost": input_cost, "outputs": out_records, "created_at": now_iso()}
     await db.production.insert_one(doc)
+    await log_audit(user, "Production run", f"{body.mill}: {body.input_quantity} {body.input_product_name} → " + ", ".join(f"{o.quantity} {o.product_name}" for o in body.outputs))
     return clean(doc)
 
 @api_router.delete("/production/{pid}")
@@ -851,8 +881,15 @@ class PayBody(BaseModel):
     payment_method: str = "Cash"
 
 async def mark_paid(coll, rid, method):
+    doc = await db[coll].find_one({"id": rid})
+    if not doc:
+        return
+    amt = doc.get("total") or doc.get("total_charge") or 0
     await db[coll].update_one({"id": rid}, {"$set": {"payment_status": "Paid", "payment_method": method}})
     await db.invoices.update_one({"ref_id": rid}, {"$set": {"payment_status": "Paid"}})
+    exists = await db.payments.find_one({"ref_id": rid})
+    if amt and not exists:
+        await add_credit("customer", doc.get("customer_name"), amt, doc.get("date"), rid, f"Payment {doc.get('invoice_number','')}")
 
 @api_router.patch("/sales/{rid}/pay")
 async def pay_sale(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
@@ -871,7 +908,10 @@ async def pay_oil(rid: str, body: PayBody, user: dict = Depends(get_current_user
 
 @api_router.patch("/purchases/{rid}/pay")
 async def pay_purchase(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
+    p = await db.purchases.find_one({"id": rid})
     await db.purchases.update_one({"id": rid}, {"$set": {"payment_status": "Paid"}})
+    if p and not await db.payments.find_one({"ref_id": rid}):
+        await add_credit("supplier", p.get("supplier_name"), p.get("total", 0), p.get("date"), rid, "Purchase payment")
     return {"message": "paid"}
 
 # ---- Edit records ----
@@ -1010,6 +1050,132 @@ async def costing(user: dict = Depends(get_current_user)):
                          "current_stock": p.get("current_stock", 0), "cost_per_unit": cost,
                          "rate": rate, "margin": margin, "margin_pct": pct})
     return rows
+
+# ==================== Ledger, Cash Book, Analytics, Audit ====================
+
+async def add_credit(party_type, name, amount, date, ref_id=None, note=""):
+    if not amount:
+        return
+    await db.payments.insert_one({"id": str(uuid.uuid4()), "party_type": party_type, "party_name": name,
+        "amount": round(amount, 2), "date": date, "note": note, "ref_id": ref_id, "created_at": now_iso()})
+
+async def log_audit(user, action, detail=""):
+    u = user or {}
+    await db.audit.insert_one({"id": str(uuid.uuid4()), "user": u.get("name") or u.get("email") or "system",
+        "role": u.get("role", ""), "action": action, "detail": detail, "at": now_iso()})
+
+@api_router.get("/audit")
+async def get_audit(user: dict = Depends(get_current_user)):
+    return [clean(a) for a in await db.audit.find().sort("at", -1).to_list(500)]
+
+class PaymentBody(BaseModel):
+    party_type: str
+    party_name: str
+    amount: float
+    date: str
+    note: str = ""
+
+@api_router.get("/payments")
+async def list_payments(party_type: Optional[str] = None, party_name: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = {}
+    if party_type:
+        q["party_type"] = party_type
+    if party_name:
+        q["party_name"] = party_name
+    return [clean(p) for p in await db.payments.find(q).sort("date", -1).to_list(5000)]
+
+@api_router.post("/payments")
+async def create_payment(body: PaymentBody, user: dict = Depends(get_current_user)):
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "ref_id": None, "created_at": now_iso()}
+    await db.payments.insert_one(doc)
+    await log_audit(user, "Recorded payment", f"{body.party_type} {body.party_name}: Rs {body.amount}")
+    return clean(doc)
+
+@api_router.delete("/payments/{pid}")
+async def delete_payment(pid: str, user: dict = Depends(require_admin)):
+    await db.payments.delete_one({"id": pid})
+    return {"message": "deleted"}
+
+async def build_ledger(party_type, name):
+    entries = []
+    if party_type == "customer":
+        for coll, field, label in [("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"), ("oil", "total", "Oil Extraction")]:
+            for d in await db[coll].find({"customer_name": name}).to_list(3000):
+                if d.get(field, 0):
+                    entries.append({"date": d.get("date"), "type": label, "ref": d.get("invoice_number", ""), "debit": round(d.get(field, 0), 2), "credit": 0})
+    else:
+        for d in await db.purchases.find({"supplier_name": name}).to_list(3000):
+            entries.append({"date": d.get("date"), "type": "Purchase", "ref": d.get("product_name", ""), "debit": round(d.get("total", 0), 2), "credit": 0})
+    for p in await db.payments.find({"party_type": party_type, "party_name": name}).to_list(3000):
+        entries.append({"date": p.get("date"), "type": "Payment", "ref": p.get("note", ""), "debit": 0, "credit": round(p.get("amount", 0), 2)})
+    entries.sort(key=lambda e: (e.get("date") or ""))
+    bal = 0.0
+    for e in entries:
+        bal += e["debit"] - e["credit"]
+        e["balance"] = round(bal, 2)
+    return {"name": name, "entries": entries, "total_debit": round(sum(e["debit"] for e in entries), 2),
+            "total_credit": round(sum(e["credit"] for e in entries), 2), "balance": round(bal, 2)}
+
+@api_router.get("/customers/{cid}/ledger")
+async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
+    c = await db.customers.find_one({"id": cid})
+    if not c:
+        raise HTTPException(status_code=404, detail="Not found")
+    return await build_ledger("customer", c["name"])
+
+@api_router.get("/suppliers/{sid}/ledger")
+async def supplier_ledger(sid: str, user: dict = Depends(get_current_user)):
+    s = await db.suppliers.find_one({"id": sid})
+    if not s:
+        raise HTTPException(status_code=404, detail="Not found")
+    return await build_ledger("supplier", s["name"])
+
+@api_router.get("/cashbook")
+async def cashbook(date: str, user: dict = Depends(get_current_user)):
+    settings = await get_settings_doc()
+    starting = settings.get("starting_cash", 0) or 0
+    payments = await db.payments.find().to_list(20000)
+    expenses = await db.expenses.find().to_list(20000)
+    cust_in = [p for p in payments if p.get("party_type") == "customer"]
+    supp_out = [p for p in payments if p.get("party_type") == "supplier"]
+    def before(items):
+        return [i for i in items if str(i.get("date", "")) < date]
+    def on(items):
+        return [i for i in items if str(i.get("date", "")) == date]
+    opening = starting + sum(p["amount"] for p in before(cust_in)) - sum(p["amount"] for p in before(supp_out)) - sum(e.get("amount", 0) for e in before(expenses))
+    in_today = sum(p["amount"] for p in on(cust_in))
+    supp_today = sum(p["amount"] for p in on(supp_out))
+    exp_today = sum(e.get("amount", 0) for e in on(expenses))
+    closing = opening + in_today - supp_today - exp_today
+    return {"date": date, "opening": round(opening, 2), "payments_received": round(in_today, 2),
+            "supplier_payments": round(supp_today, 2), "expenses": round(exp_today, 2), "closing": round(closing, 2)}
+
+@api_router.get("/sales-analytics")
+async def sales_analytics(user: dict = Depends(get_current_user)):
+    sales = await db.sales.find().to_list(30000)
+    products = {p["name"]: p for p in await db.products.find().to_list(1000)}
+    t = datetime.now().strftime("%Y-%m-%d")
+    m = t[:7]
+    y = t[:4]
+    def rev(prefix):
+        return round(sum(s.get("total", 0) for s in sales if str(s.get("date", "")).startswith(prefix)), 2)
+    agg = {}
+    for s in sales:
+        n = s.get("product_name", "?")
+        a = agg.setdefault(n, {"name": n, "qty": 0.0, "revenue": 0.0, "profit": 0.0})
+        a["qty"] += s.get("quantity", 0)
+        a["revenue"] += s.get("total", 0)
+        cost = products.get(n, {}).get("cost_per_unit", 0)
+        a["profit"] += s.get("total", 0) - s.get("quantity", 0) * cost
+    rows = sorted(agg.values(), key=lambda r: r["revenue"], reverse=True)
+    for r in rows:
+        r["qty"] = round(r["qty"], 2)
+        r["revenue"] = round(r["revenue"], 2)
+        r["profit"] = round(r["profit"], 2)
+    return {"today": rev(t), "month": rev(m), "year": rev(y),
+            "total_revenue": round(sum(s.get("total", 0) for s in sales), 2),
+            "total_profit": round(sum(r["profit"] for r in rows), 2),
+            "by_product": rows, "top": rows[:5], "least": rows[-5:][::-1] if rows else []}
 
 app.include_router(api_router)
 

@@ -1,5 +1,4 @@
-@import url('https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@800,500,700,400,900&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -7,69 +6,75 @@
 
 body {
   margin: 0;
-  font-family: 'Figtree', sans-serif;
+  font-family: 'Inter', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
 h1, h2, h3, h4, .font-heading {
-  font-family: 'Cabinet Grotesk', sans-serif;
+  font-family: 'Inter', sans-serif;
   letter-spacing: -0.02em;
 }
 
 @layer base {
   :root {
-    --background: 45 40% 99%;
-    --foreground: 35 12% 15%;
+    --background: 210 17% 98%;
+    --foreground: 0 0% 13%;
     --card: 0 0% 100%;
-    --card-foreground: 35 12% 15%;
+    --card-foreground: 0 0% 13%;
     --popover: 0 0% 100%;
-    --popover-foreground: 35 12% 15%;
-    --primary: 30 96% 50%;
+    --popover-foreground: 0 0% 13%;
+    --primary: 123 46% 34%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 96 42% 40%;
+    --secondary: 43 81% 46%;
     --secondary-foreground: 0 0% 100%;
-    --muted: 40 25% 93%;
-    --muted-foreground: 35 12% 45%;
-    --accent: 40 25% 93%;
-    --accent-foreground: 35 12% 15%;
-    --destructive: 0 84.2% 60.2%;
+    --muted: 210 16% 93%;
+    --muted-foreground: 0 0% 40%;
+    --accent: 210 16% 93%;
+    --accent-foreground: 0 0% 13%;
+    --destructive: 1 63% 50%;
     --destructive-foreground: 0 0% 100%;
-    --border: 40 20% 88%;
-    --input: 40 20% 88%;
-    --ring: 30 96% 50%;
-    --chart-1: 32 96% 52%;
-    --chart-2: 96 45% 42%;
-    --chart-3: 24 70% 50%;
-    --chart-4: 43 74% 66%;
-    --chart-5: 15 63% 47%;
-    --radius: 0.65rem;
+    --border: 210 14% 88%;
+    --input: 210 14% 88%;
+    --ring: 123 46% 34%;
+    --success: 123 39% 49%;
+    --warning: 33 100% 49%;
+    --info: 210 79% 46%;
+    --chart-1: 123 46% 34%;
+    --chart-2: 43 81% 46%;
+    --chart-3: 44 100% 48%;
+    --chart-4: 210 79% 46%;
+    --chart-5: 33 100% 49%;
+    --radius: 0.6rem;
   }
   .dark {
-    --background: 35 13% 9%;
-    --foreground: 40 20% 98%;
-    --card: 35 11% 13%;
-    --card-foreground: 40 20% 98%;
-    --popover: 35 11% 13%;
-    --popover-foreground: 40 20% 98%;
-    --primary: 33 96% 55%;
-    --primary-foreground: 35 13% 9%;
-    --secondary: 96 50% 55%;
-    --secondary-foreground: 35 13% 9%;
-    --muted: 35 11% 17%;
-    --muted-foreground: 40 20% 65%;
-    --accent: 35 11% 17%;
-    --accent-foreground: 40 20% 98%;
-    --destructive: 0 62.8% 40%;
+    --background: 0 0% 7%;
+    --foreground: 0 0% 95%;
+    --card: 0 0% 12%;
+    --card-foreground: 0 0% 95%;
+    --popover: 0 0% 12%;
+    --popover-foreground: 0 0% 95%;
+    --primary: 123 40% 45%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 43 75% 55%;
+    --secondary-foreground: 0 0% 7%;
+    --muted: 0 0% 17%;
+    --muted-foreground: 0 0% 62%;
+    --accent: 0 0% 17%;
+    --accent-foreground: 0 0% 95%;
+    --destructive: 1 63% 50%;
     --destructive-foreground: 0 0% 100%;
-    --border: 35 11% 17%;
-    --input: 35 11% 17%;
-    --ring: 33 96% 55%;
-    --chart-1: 33 96% 58%;
-    --chart-2: 96 50% 55%;
-    --chart-3: 24 80% 60%;
-    --chart-4: 43 74% 66%;
-    --chart-5: 15 73% 57%;
+    --border: 0 0% 18%;
+    --input: 0 0% 18%;
+    --ring: 123 40% 45%;
+    --success: 123 45% 55%;
+    --warning: 33 95% 55%;
+    --info: 210 79% 60%;
+    --chart-1: 123 45% 55%;
+    --chart-2: 43 75% 55%;
+    --chart-3: 44 95% 58%;
+    --chart-4: 210 79% 60%;
+    --chart-5: 33 95% 55%;
   }
 }
 
