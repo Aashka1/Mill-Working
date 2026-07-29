@@ -6,10 +6,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Plus, Trash2, Download, FileDown } from "lucide-react";
+import { Plus, Trash2, Download, FileDown, Pencil, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
+
+const empty = { date: today(), customer_name: "", product_id: "", product_name: "", quantity: "", price: "", payment_status: "Paid" };
 
 export default function Sales() {
   const sales = useList("/sales");
@@ -17,23 +19,29 @@ export default function Sales() {
   const customers = useList("/customers");
   const [q, setQ] = useState("");
   const filtered = useFilter(sales.items, q, ["customer_name", "product_name", "invoice_number", "payment_status", "date"]);
-
   const [open, setOpen] = useState(false);
-  const [f, setF] = useState({ date: today(), customer_name: "", product_id: "", quantity: "", price: "", payment_status: "Paid" });
+  const [editingId, setEditingId] = useState(null);
+  const [f, setF] = useState(empty);
+
+  const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
+  const openEdit = (s) => {
+    setEditingId(s.id);
+    setF({ date: s.date, customer_name: s.customer_name, product_id: s.product_id, product_name: s.product_name, quantity: String(s.quantity), price: String(s.price), payment_status: s.payment_status });
+    setOpen(true);
+  };
 
   const save = async () => {
     const prod = products.items.find((p) => p.id === f.product_id);
     if (!prod || !f.customer_name || !f.quantity || !f.price) return toast.error("Fill all fields");
-    if (+f.quantity > prod.current_stock) return toast.error(`Only ${prod.current_stock} ${prod.unit} in stock`);
-    await api.post("/sales", {
-      date: f.date, customer_name: f.customer_name, product_id: prod.id, product_name: prod.name,
-      quantity: +f.quantity, price: +f.price, payment_status: f.payment_status,
-    });
-    toast.success("Sale recorded, stock deducted");
-    setOpen(false);
-    setF({ date: today(), customer_name: "", product_id: "", quantity: "", price: "", payment_status: "Paid" });
+    if (!editingId && +f.quantity > prod.current_stock) return toast.error(`Only ${prod.current_stock} ${prod.unit} in stock`);
+    const body = { date: f.date, customer_name: f.customer_name, product_id: prod.id, product_name: prod.name, quantity: +f.quantity, price: +f.price, payment_status: f.payment_status };
+    if (editingId) { await api.put(`/sales/${editingId}`, body); toast.success("Sale updated"); }
+    else { await api.post("/sales", body); toast.success("Sale recorded, stock deducted"); }
+    setOpen(false); setEditingId(null); setF(empty);
     sales.load(); products.load();
   };
+
+  const markPaid = async (s) => { await api.patch(`/sales/${s.id}/pay`, { payment_method: "Cash" }); toast.success("Marked as paid"); sales.load(); };
 
   return (
     <div>
@@ -43,45 +51,47 @@ export default function Sales() {
         actions={
           <>
             <Button variant="outline" className="h-11" onClick={() => downloadFile("/export/sales", "sales_report.xlsx")} data-testid="export-sales-btn"><FileDown className="h-4 w-4 mr-1" /> Excel</Button>
-            <Dialog open={open} onOpenChange={setOpen}>
-              <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" data-testid="add-sale-btn"><Plus className="h-4 w-4 mr-1" /> New Sale</Button></DialogTrigger>
-              <DialogContent>
-                <DialogHeader><DialogTitle>Record Sale</DialogTitle></DialogHeader>
-                <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
-                    <div><Label>Customer</Label>
-                      <Select value={f.customer_name} onValueChange={(v) => setF({ ...f, customer_name: v })}>
-                        <SelectTrigger className="h-11 mt-1" data-testid="sale-customer"><SelectValue placeholder="Select" /></SelectTrigger>
-                        <SelectContent>{customers.items.map((c) => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
-                          {customers.items.length === 0 && <SelectItem value="Walk-in">Walk-in Customer</SelectItem>}</SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                  <div><Label>Product</Label>
-                    <Select value={f.product_id} onValueChange={(v) => setF({ ...f, product_id: v, price: products.items.find((p) => p.id === v)?.rate || "" })}>
-                      <SelectTrigger className="h-11 mt-1" data-testid="sale-product"><SelectValue placeholder="Select product" /></SelectTrigger>
-                      <SelectContent>{products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}</SelectContent>
-                    </Select>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div><Label>Quantity (kg)</Label><Input type="number" value={f.quantity} onChange={(e) => setF({ ...f, quantity: e.target.value })} className="h-11 mt-1" data-testid="sale-qty" /></div>
-                    <div><Label>Price ₹/unit</Label><Input type="number" value={f.price} onChange={(e) => setF({ ...f, price: e.target.value })} className="h-11 mt-1" data-testid="sale-price" /></div>
-                  </div>
-                  <div><Label>Payment</Label>
-                    <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
-                      <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
-                      <SelectContent><SelectItem value="Paid">Paid</SelectItem><SelectItem value="Pending">Pending</SelectItem></SelectContent>
-                    </Select>
-                  </div>
-                  <p className="text-sm text-muted-foreground">Total: <span className="font-bold text-foreground">{money((+f.quantity || 0) * (+f.price || 0))}</span></p>
-                </div>
-                <DialogFooter><Button onClick={save} data-testid="save-sale-btn">Save Sale</Button></DialogFooter>
-              </DialogContent>
-            </Dialog>
+            <Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-sale-btn"><Plus className="h-4 w-4 mr-1" /> New Sale</Button>
           </>
         }
       />
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>{editingId ? "Edit" : "Record"} Sale</DialogTitle></DialogHeader>
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
+              <div><Label>Customer</Label>
+                <Select value={f.customer_name} onValueChange={(v) => setF({ ...f, customer_name: v })}>
+                  <SelectTrigger className="h-11 mt-1" data-testid="sale-customer"><SelectValue placeholder="Select" /></SelectTrigger>
+                  <SelectContent>{customers.items.map((c) => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
+                    {customers.items.length === 0 && <SelectItem value="Walk-in">Walk-in Customer</SelectItem>}</SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div><Label>Product</Label>
+              <Select value={f.product_id} onValueChange={(v) => setF({ ...f, product_id: v, price: products.items.find((p) => p.id === v)?.rate || "" })}>
+                <SelectTrigger className="h-11 mt-1" data-testid="sale-product"><SelectValue placeholder="Select product" /></SelectTrigger>
+                <SelectContent>{products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Quantity (kg)</Label><Input type="number" value={f.quantity} onChange={(e) => setF({ ...f, quantity: e.target.value })} className="h-11 mt-1" data-testid="sale-qty" /></div>
+              <div><Label>Price ₹/unit</Label><Input type="number" value={f.price} onChange={(e) => setF({ ...f, price: e.target.value })} className="h-11 mt-1" data-testid="sale-price" /></div>
+            </div>
+            <div><Label>Payment</Label>
+              <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
+                <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="Paid">Paid</SelectItem><SelectItem value="Pending">Pending</SelectItem></SelectContent>
+              </Select>
+            </div>
+            <p className="text-sm text-muted-foreground">Total: <span className="font-bold text-foreground">{money((+f.quantity || 0) * (+f.price || 0))}</span></p>
+          </div>
+          <DialogFooter><Button onClick={save} data-testid="save-sale-btn">{editingId ? "Update" : "Save"} Sale</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Card className="border-border/60">
         <Table>
           <TableHeader><TableRow>
@@ -96,6 +106,8 @@ export default function Sales() {
                 <TableCell className="text-right">{s.quantity} kg</TableCell><TableCell className="text-right font-medium">{money(s.total)}</TableCell>
                 <TableCell><StatusBadge status={s.payment_status} /></TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
+                  {s.payment_status === "Pending" && <Button variant="ghost" size="icon" onClick={() => markPaid(s)} data-testid={`pay-sale-${s.id}`}><CheckCircle2 className="h-4 w-4 text-secondary" /></Button>}
+                  <Button variant="ghost" size="icon" onClick={() => openEdit(s)} data-testid={`edit-sale-${s.id}`}><Pencil className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => downloadFile(`/invoices/${s.id}/pdf`, `${s.invoice_number}.pdf`)} data-testid={`pdf-sale-${s.id}`}><Download className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => sales.remove(s.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                 </TableCell>

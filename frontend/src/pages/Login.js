@@ -32,7 +32,7 @@ export default function Login() {
             <div className="h-11 w-11 rounded-xl bg-primary flex items-center justify-center">
               <Wheat className="h-6 w-6 text-primary-foreground" />
             </div>
-            <span className="font-heading font-bold text-xl">AgriMill Hub</span>
+            <span className="font-heading font-bold text-xl">Gangotri Flour &amp; Oil Mill</span>
           </div>
           <div>
             <h2 className="font-heading text-4xl font-bold leading-tight tracking-tight">
@@ -51,7 +51,7 @@ export default function Login() {
             <div className="h-10 w-10 rounded-xl bg-primary flex items-center justify-center">
               <Wheat className="h-5 w-5 text-primary-foreground" />
             </div>
-            <span className="font-heading font-bold text-lg">AgriMill Hub</span>
+            <span className="font-heading font-bold text-lg">Gangotri Flour &amp; Oil Mill</span>
           </div>
           <h1 className="font-heading text-3xl font-bold tracking-tight">Sign in</h1>
           <p className="text-muted-foreground mt-2 mb-8">Enter your credentials to continue.</p>

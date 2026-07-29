@@ -19,15 +19,15 @@ h1, h2, h3, h4, .font-heading {
 
 @layer base {
   :root {
-    --background: 40 20% 98%;
+    --background: 45 40% 99%;
     --foreground: 35 12% 15%;
     --card: 0 0% 100%;
     --card-foreground: 35 12% 15%;
     --popover: 0 0% 100%;
     --popover-foreground: 35 12% 15%;
-    --primary: 38 92% 37%;
+    --primary: 30 96% 50%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 84 79% 27%;
+    --secondary: 96 42% 40%;
     --secondary-foreground: 0 0% 100%;
     --muted: 40 25% 93%;
     --muted-foreground: 35 12% 45%;
@@ -37,9 +37,9 @@ h1, h2, h3, h4, .font-heading {
     --destructive-foreground: 0 0% 100%;
     --border: 40 20% 88%;
     --input: 40 20% 88%;
-    --ring: 38 92% 37%;
-    --chart-1: 38 92% 45%;
-    --chart-2: 84 60% 35%;
+    --ring: 30 96% 50%;
+    --chart-1: 32 96% 52%;
+    --chart-2: 96 45% 42%;
     --chart-3: 24 70% 50%;
     --chart-4: 43 74% 66%;
     --chart-5: 15 63% 47%;
@@ -52,9 +52,9 @@ h1, h2, h3, h4, .font-heading {
     --card-foreground: 40 20% 98%;
     --popover: 35 11% 13%;
     --popover-foreground: 40 20% 98%;
-    --primary: 38 92% 44%;
+    --primary: 33 96% 55%;
     --primary-foreground: 35 13% 9%;
-    --secondary: 84 75% 55%;
+    --secondary: 96 50% 55%;
     --secondary-foreground: 35 13% 9%;
     --muted: 35 11% 17%;
     --muted-foreground: 40 20% 65%;
@@ -64,9 +64,9 @@ h1, h2, h3, h4, .font-heading {
     --destructive-foreground: 0 0% 100%;
     --border: 35 11% 17%;
     --input: 35 11% 17%;
-    --ring: 38 92% 44%;
-    --chart-1: 38 92% 55%;
-    --chart-2: 84 70% 55%;
+    --ring: 33 96% 55%;
+    --chart-1: 33 96% 58%;
+    --chart-2: 96 50% 55%;
     --chart-3: 24 80% 60%;
     --chart-4: 43 74% 66%;
     --chart-5: 15 73% 57%;

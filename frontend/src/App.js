@@ -9,6 +9,8 @@ import Inventory from "@/pages/Inventory";
 import Sales from "@/pages/Sales";
 import Grinding from "@/pages/Grinding";
 import OilExtraction from "@/pages/OilExtraction";
+import Production from "@/pages/Production";
+import Exchange from "@/pages/Exchange";
 import Expenses from "@/pages/Expenses";
 import Customers from "@/pages/Customers";
 import Suppliers from "@/pages/Suppliers";
@@ -39,6 +41,8 @@ function App() {
             <Route path="sales" element={<Sales />} />
             <Route path="grinding" element={<Grinding />} />
             <Route path="oil" element={<OilExtraction />} />
+            <Route path="production" element={<Production />} />
+            <Route path="exchange" element={<Exchange />} />
             <Route path="expenses" element={<Expenses />} />
             <Route path="customers" element={<Customers />} />
             <Route path="suppliers" element={<Suppliers />} />

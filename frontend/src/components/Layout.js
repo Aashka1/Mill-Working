@@ -6,7 +6,7 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   LayoutDashboard, Package, ShoppingCart, Wheat, Droplets, Receipt,
-  Users, Truck, FileText, Sun, Moon, LogOut, Bell, Menu, X
+  Users, Truck, FileText, Sun, Moon, LogOut, Bell, Menu, X, Factory, ArrowLeftRight
 } from "lucide-react";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuLabel, DropdownMenuSeparator,
@@ -19,6 +19,8 @@ const NAV = [
   { to: "/sales", label: "Sales", icon: ShoppingCart },
   { to: "/grinding", label: "Wheat Grinding", icon: Wheat },
   { to: "/oil", label: "Oil Extraction", icon: Droplets },
+  { to: "/production", label: "Production", icon: Factory },
+  { to: "/exchange", label: "Exchange", icon: ArrowLeftRight },
   { to: "/expenses", label: "Expenses", icon: Receipt },
   { to: "/customers", label: "Customers", icon: Users },
   { to: "/suppliers", label: "Suppliers", icon: Truck },
@@ -45,8 +47,8 @@ export default function Layout() {
           <Wheat className="h-5 w-5 text-primary-foreground" />
         </div>
         <div>
-          <p className="font-heading font-bold leading-none">AgriMill Hub</p>
-          <p className="text-[11px] text-muted-foreground">Mill Management</p>
+          <p className="font-heading font-bold leading-none">Gangotri Mill</p>
+          <p className="text-[11px] text-muted-foreground">Flour &amp; Oil Mill</p>
         </div>
       </div>
       <nav className="p-3 space-y-1 overflow-y-auto">

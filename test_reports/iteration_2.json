@@ -1,0 +1,48 @@
+{
+  "summary": "Iteration 2 - business logic expansion E2E test complete. Added /app/backend/tests/test_mill_expansion.py with 7 pytest classes covering Settings GET/PUT, Production (inventory decrement/increment + cost allocation + over-stock rejection 400), Grinding (Cash vs Grain paths, output_atta & loss_kg math, grain_fee added to Atta stock, Edit reverses+reapplies, Delete reverses), Oil (retained_oil/cake added to Mustard Oil & Cake stock, Edit reverses+reapplies, Delete reverses), Exchange (Wheat Crop += / Atta -=, Delete reverses), Sale Edit (net stock correctness) + Mark-as-Paid (invoice linked), Daybook (income/collected/pending/expenses/net/counts). All 7 tests pass 100%. Legacy /app/backend/tests/test_agrimill.py from iter-1 still passes 21/21. Frontend Playwright E2E as admin: sidebar shows Production & Exchange nav items, Dashboard shows Today's Summary card (daily-summary testid) with orange/green theme, Production dialog auto-fills Wheat Crop -> Atta+Bran and successfully created a run with inventory changes, Exchange dialog customer select uses Walk-in fallback and saves, Grinding dialog exposes grinding-washed + grinding-pay-method testids, Oil dialog exposes oil-pay-method + oil-cake testids, Sales rows expose pay-sale-{id} and edit-sale-{id} action buttons. Backend logs clean during runs; production endpoint verified (Wheat Crop 1000 -> reduced, Atta/Bran incremented with allocated cost). Oil Extraction sidebar link routes to /oil (not /oil-extraction) - both work but a console 404 route warning was seen when I tried the wrong path.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/production", "issue": "No validation that output quantities sum <= input quantity (mass balance). A production run can currently produce more output kg than input kg. Not requested by spec but worth noting."},
+      {"endpoint": "/api/exchanges", "issue": "Does not validate Atta stock sufficiency before decrementing; can drive Atta to negative if atta_given > current stock. Same pattern in grinding grain-fee path."},
+      {"endpoint": "/api/grinding & /api/oil edit", "issue": "PUT edit does not re-validate stock for the new grain_fee/retained values; relies on reverse-then-apply which can transiently produce negative stock (no atomic guard)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "DialogContent (all dialogs)", "issue": "Persistent Radix a11y console warning 'Missing Description or aria-describedby={undefined} for DialogContent' - carried over from iter-1, still not fixed.", "selector": "[role=dialog]", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Dashboard", "issues": ["Orange/green theme applied cleanly; Today's Summary card renders with 6 KPIs (Income Billed, Collected, Pending, Expenses, Net Cash, Orders Today). Charts and pie render with brand orange. Contrast good."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_mill_expansion.py",
+    "/app/backend/tests/test_agrimill.py",
+    "/app/test_reports/pytest/pytest_mill_expansion.xml"
+  ],
+  "action_items": [
+    "(Optional) Add mass-balance validation on POST /api/production so sum(outputs.qty) <= input_quantity.",
+    "(Optional) Validate Atta stock >= atta_given in /api/exchanges and Atta >= grain_fee_kg in /api/grinding to prevent negative stock.",
+    "(LOW) Add <DialogDescription> to each shadcn Dialog to silence Radix a11y warning (carried from iter-1)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 953 lines - exceeded the 700-line threshold; should be split into modules (auth, inventory, services, production, reports).",
+    "build_grinding_doc / apply_grinding_effects / edit_grinding pattern is clean and idempotent (reverse then reapply, keeping invoice_number). Good.",
+    "add_stock_with_cost implements proper weighted-average cost_per_unit accumulation - verified via TestProduction.",
+    "Production POST returns 400 when input_quantity > stock and 404 when input_product_id missing - correct.",
+    "PATCH /*/pay endpoints update both the record and the linked invoice - verified.",
+    "Daybook date filter uses str(i.get('date',''))==date exact-match; assumes ISO YYYY-MM-DD dates, which matches frontend today() usage.",
+    "Exchange stores loss_kg but does not persist output_atta computed from loss; loss_kg computed as wheat_qty*loss/100 rather than wheat_qty - atta_given (still consistent with spec)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_mill_expansion.py (new)"
+  ],
+  "success_rate": {"backend": "100% (7/7 new tests + 21/21 legacy)", "frontend": "100% of requested flows"},
+  "test_credentials": "Admin: admin@agrimill.com/admin123, Staff: staff@agrimill.com/staff123 (verified working)",
+  "seed_data_creation": "TEST_ prefixed suppliers/customers created; module cleanup removes TEST_ suppliers. Purchase (200kg Wheat Crop @ ₹25), production run (100kg -> 85 Atta + 13 Bran), grinding (Cash 100kg, Grain 100kg edited then deleted), exchange (created then deleted), oil (created then deleted), sale (created then edited then deleted) - so most transient data cleaned up. Cash grinding + cash sales + supplier purchase remain in DB.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Two backend test files now: test_agrimill.py (baseline) and test_mill_expansion.py (new business logic). Run each with `python -m pytest -n 0 backend/tests/<file> -v` because they share state via pytest module attrs. All requested data-testids exist and work (production-mill/input/input-qty/output-N/output-qty-N, add-production-btn, save-production-btn, add-exchange-btn, exchange-customer/washed/wheat/loss/atta, save-exchange-btn, grinding-washed, grinding-pay-method, oil-pay-method, oil-cake, pay-sale-*, edit-sale-*, daily-summary). Oil Extraction route is /oil (not /oil-extraction). Customer select fallback 'Walk-in' works when no customers exist."
+}

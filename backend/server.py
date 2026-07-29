@@ -196,6 +196,7 @@ class ProductBody(BaseModel):
     unit: str = "kg"
     current_stock: float = 0
     rate: float = 0
+    cost_per_unit: float = 0
     low_stock_threshold: float = 50
 
 @api_router.get("/products")
@@ -239,7 +240,7 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
     total = round(body.quantity * body.rate, 2)
     doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "created_at": now_iso()}
     await db.purchases.insert_one(doc)
-    await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": body.quantity}})
+    await add_stock_with_cost(body.product_id, body.quantity, total)
     return clean(doc)
 
 @api_router.delete("/purchases/{pid}")
@@ -294,7 +295,11 @@ class GrindingBody(BaseModel):
     customer_id: Optional[str] = None
     customer_name: str
     wheat_weight: float
-    charge_per_kg: float
+    washed: bool = True
+    loss_percent: float = 2.5
+    charge_per_kg: float = 0
+    payment_method: str = "Cash"
+    grain_fee_kg: float = 0
     payment_status: str = "Pending"
 
 @api_router.get("/grinding")
@@ -303,19 +308,21 @@ async def get_grinding(user: dict = Depends(get_current_user)):
 
 @api_router.post("/grinding")
 async def create_grinding(body: GrindingBody, user: dict = Depends(get_current_user)):
-    total = round(body.wheat_weight * body.charge_per_kg, 2)
-    inv = await next_invoice_number()
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total_charge": total, "invoice_number": inv, "created_at": now_iso()}
+    doc = await build_grinding_doc(body)
     await db.grinding.insert_one(doc)
-    await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": inv, "type": "Grinding",
-        "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
-        "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
+    await apply_grinding_effects(doc, 1)
+    await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"], "type": "Grinding",
+        "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
+        "total": doc["total_charge"], "payment_status": doc["payment_status"], "created_at": now_iso()})
     return clean(doc)
 
 @api_router.delete("/grinding/{gid}")
 async def delete_grinding(gid: str, user: dict = Depends(require_admin)):
-    await db.grinding.delete_one({"id": gid})
-    await db.invoices.delete_one({"ref_id": gid})
+    g = await db.grinding.find_one({"id": gid})
+    if g:
+        await apply_grinding_effects(g, -1)
+        await db.grinding.delete_one({"id": gid})
+        await db.invoices.delete_one({"ref_id": gid})
     return {"message": "deleted"}
 
 # ---------------- Oil Extraction ----------------
@@ -327,7 +334,11 @@ class OilBody(BaseModel):
     seed_type: str
     quantity_received: float
     oil_extracted: float
-    charge: float
+    oil_cake_produced: float = 0
+    charge: float = 0
+    payment_method: str = "Cash"
+    retained_oil: float = 0
+    retained_cake: float = 0
     payment_status: str = "Pending"
 
 @api_router.get("/oil")
@@ -336,18 +347,21 @@ async def get_oil(user: dict = Depends(get_current_user)):
 
 @api_router.post("/oil")
 async def create_oil(body: OilBody, user: dict = Depends(get_current_user)):
-    inv = await next_invoice_number()
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": body.charge, "invoice_number": inv, "created_at": now_iso()}
+    doc = await build_oil_doc(body)
     await db.oil.insert_one(doc)
-    await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": inv, "type": "Oil Extraction",
-        "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
-        "total": body.charge, "payment_status": body.payment_status, "created_at": now_iso()})
+    await apply_oil_effects(doc, 1)
+    await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"], "type": "Oil Extraction",
+        "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
+        "total": doc["total"], "payment_status": doc["payment_status"], "created_at": now_iso()})
     return clean(doc)
 
 @api_router.delete("/oil/{oid}")
 async def delete_oil(oid: str, user: dict = Depends(require_admin)):
-    await db.oil.delete_one({"id": oid})
-    await db.invoices.delete_one({"ref_id": oid})
+    o = await db.oil.find_one({"id": oid})
+    if o:
+        await apply_oil_effects(o, -1)
+        await db.oil.delete_one({"id": oid})
+        await db.invoices.delete_one({"ref_id": oid})
     return {"message": "deleted"}
 
 # ---------------- Expenses ----------------
@@ -488,7 +502,7 @@ async def invoice_pdf(ref_id: str, request: Request):
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=20*mm)
     styles = getSampleStyleSheet()
     title = ParagraphStyle("t", parent=styles["Title"], textColor=colors.HexColor("#B8860B"))
-    elements = [Paragraph("AgriMill Hub", title),
+    elements = [Paragraph("Gangotri Flour &amp; Oil Mill", title),
                 Paragraph("Wheat Grinding &amp; Oil Extraction Services", styles["Normal"]),
                 Spacer(1, 12),
                 Paragraph(f"<b>Invoice:</b> {data['invoice_number']} &nbsp;&nbsp; <b>Type:</b> {data['type']}", styles["Normal"]),
@@ -653,6 +667,275 @@ async def startup():
     if await db.users.find_one({"email": "staff@agrimill.com"}) is None:
         await db.users.insert_one({"email": "staff@agrimill.com", "password_hash": hash_password("staff123"),
             "name": "Staff Member", "role": "staff", "created_at": now_iso()})
+    await seed_products()
+    await get_settings_doc()
+
+# ==================== Mill Production & Advanced Logic ====================
+
+DEFAULT_PRODUCTS = [
+    {"name": "Wheat Crop", "category": "Wheat Crop", "unit": "kg", "low_stock_threshold": 100},
+    {"name": "Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
+    {"name": "Wheat Bran", "category": "Bran", "unit": "kg", "low_stock_threshold": 30},
+    {"name": "Sattu", "category": "Flour", "unit": "kg", "low_stock_threshold": 20},
+    {"name": "Mustard Seeds", "category": "Oil Seeds", "unit": "kg", "low_stock_threshold": 100},
+    {"name": "Mustard Oil", "category": "Edible Oil", "unit": "litre", "low_stock_threshold": 20},
+    {"name": "Mustard Oil Cake", "category": "Oil Cake", "unit": "kg", "low_stock_threshold": 30},
+]
+
+async def seed_products():
+    for p in DEFAULT_PRODUCTS:
+        if await db.products.find_one({"name": p["name"]}) is None:
+            await db.products.insert_one({"id": str(uuid.uuid4()), **p, "current_stock": 0,
+                "rate": 0, "cost_per_unit": 0, "created_at": now_iso()})
+
+async def get_settings_doc():
+    s = await db.settings.find_one({"id": "config"})
+    if not s:
+        s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0}
+        await db.settings.insert_one(s)
+    return clean(s)
+
+async def adjust_stock_by_name(name, delta):
+    await db.products.update_one({"name": name}, {"$inc": {"current_stock": round(delta, 3)}})
+
+async def add_stock_with_cost(pid, qty, total_cost):
+    p = await db.products.find_one({"id": pid})
+    if not p:
+        return
+    old_stock = p.get("current_stock", 0)
+    old_cost = p.get("cost_per_unit", 0)
+    new_stock = old_stock + qty
+    new_cost = ((old_stock * old_cost) + total_cost) / new_stock if new_stock > 0 else 0
+    await db.products.update_one({"id": pid}, {"$set": {
+        "current_stock": round(new_stock, 3), "cost_per_unit": round(new_cost, 4)}})
+
+# ---- build helpers ----
+async def build_grinding_doc(body: GrindingBody):
+    inv = await next_invoice_number()
+    output_atta = round(body.wheat_weight * (1 - body.loss_percent / 100), 2)
+    loss_kg = round(body.wheat_weight - output_atta, 2)
+    if body.payment_method == "Grain":
+        total_charge = 0.0
+        customer_receives = round(output_atta - body.grain_fee_kg, 2)
+    else:
+        total_charge = round(body.wheat_weight * body.charge_per_kg, 2)
+        customer_receives = output_atta
+    d = body.model_dump()
+    d.update({"id": str(uuid.uuid4()), "invoice_number": inv, "output_atta": output_atta,
+              "loss_kg": loss_kg, "customer_receives": customer_receives,
+              "total_charge": total_charge, "created_at": now_iso()})
+    return d
+
+async def build_oil_doc(body: OilBody):
+    inv = await next_invoice_number()
+    d = body.model_dump()
+    d.update({"id": str(uuid.uuid4()), "invoice_number": inv, "total": body.charge,
+              "customer_oil": round(body.oil_extracted - body.retained_oil, 2),
+              "customer_cake": round(body.oil_cake_produced - body.retained_cake, 2),
+              "created_at": now_iso()})
+    return d
+
+async def apply_grinding_effects(doc, sign):
+    if doc.get("payment_method") == "Grain" and doc.get("grain_fee_kg", 0):
+        await adjust_stock_by_name("Atta", sign * doc["grain_fee_kg"])
+
+async def apply_oil_effects(doc, sign):
+    if doc.get("retained_oil", 0):
+        await adjust_stock_by_name("Mustard Oil", sign * doc["retained_oil"])
+    if doc.get("retained_cake", 0):
+        await adjust_stock_by_name("Mustard Oil Cake", sign * doc["retained_cake"])
+
+# ---- Settings ----
+class SettingsBody(BaseModel):
+    washed_loss: float
+    unwashed_loss: float
+
+@api_router.get("/settings")
+async def read_settings(user: dict = Depends(get_current_user)):
+    return await get_settings_doc()
+
+@api_router.put("/settings")
+async def write_settings(body: SettingsBody, user: dict = Depends(get_current_user)):
+    await db.settings.update_one({"id": "config"}, {"$set": body.model_dump()}, upsert=True)
+    return await get_settings_doc()
+
+# ---- Production (converts input product into outputs) ----
+class ProdOutput(BaseModel):
+    product_id: str
+    product_name: str
+    quantity: float
+
+class ProductionBody(BaseModel):
+    date: str
+    mill: str
+    input_product_id: str
+    input_product_name: str
+    input_quantity: float
+    outputs: List[ProdOutput]
+
+@api_router.get("/production")
+async def get_production(user: dict = Depends(get_current_user)):
+    return [clean(p) for p in await db.production.find().sort("date", -1).to_list(2000)]
+
+@api_router.post("/production")
+async def create_production(body: ProductionBody, user: dict = Depends(get_current_user)):
+    inp = await db.products.find_one({"id": body.input_product_id})
+    if not inp:
+        raise HTTPException(status_code=404, detail="Input product not found")
+    if body.input_quantity > inp.get("current_stock", 0):
+        raise HTTPException(status_code=400, detail=f"Not enough stock (have {inp.get('current_stock',0)})")
+    input_cost = round(body.input_quantity * inp.get("cost_per_unit", 0), 2)
+    total_out = sum(o.quantity for o in body.outputs) or 1
+    await db.products.update_one({"id": body.input_product_id}, {"$inc": {"current_stock": -body.input_quantity}})
+    out_records = []
+    for o in body.outputs:
+        allocated = round(input_cost * (o.quantity / total_out), 2)
+        await add_stock_with_cost(o.product_id, o.quantity, allocated)
+        out_records.append({"product_name": o.product_name, "quantity": o.quantity,
+                            "cost": allocated, "cost_per_unit": round(allocated / o.quantity, 3) if o.quantity else 0})
+    doc = {"id": str(uuid.uuid4()), "date": body.date, "mill": body.mill,
+           "input_product_name": body.input_product_name, "input_quantity": body.input_quantity,
+           "input_cost": input_cost, "outputs": out_records, "created_at": now_iso()}
+    await db.production.insert_one(doc)
+    return clean(doc)
+
+@api_router.delete("/production/{pid}")
+async def delete_production(pid: str, user: dict = Depends(require_admin)):
+    await db.production.delete_one({"id": pid})
+    return {"message": "deleted"}
+
+# ---- Exchange (wheat crop for atta) ----
+class ExchangeBody(BaseModel):
+    date: str
+    customer_name: str
+    wheat_qty: float
+    washed: bool = True
+    loss_percent: float = 2.5
+    atta_given: float
+
+@api_router.get("/exchanges")
+async def get_exchanges(user: dict = Depends(get_current_user)):
+    return [clean(e) for e in await db.exchanges.find().sort("date", -1).to_list(2000)]
+
+@api_router.post("/exchanges")
+async def create_exchange(body: ExchangeBody, user: dict = Depends(get_current_user)):
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(),
+           "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2), "created_at": now_iso()}
+    await db.exchanges.insert_one(doc)
+    await adjust_stock_by_name("Wheat Crop", body.wheat_qty)
+    await adjust_stock_by_name("Atta", -body.atta_given)
+    return clean(doc)
+
+@api_router.delete("/exchanges/{eid}")
+async def delete_exchange(eid: str, user: dict = Depends(require_admin)):
+    e = await db.exchanges.find_one({"id": eid})
+    if e:
+        await adjust_stock_by_name("Wheat Crop", -e["wheat_qty"])
+        await adjust_stock_by_name("Atta", e["atta_given"])
+        await db.exchanges.delete_one({"id": eid})
+    return {"message": "deleted"}
+
+# ---- Mark as paid ----
+class PayBody(BaseModel):
+    payment_method: str = "Cash"
+
+async def mark_paid(coll, rid, method):
+    await db[coll].update_one({"id": rid}, {"$set": {"payment_status": "Paid", "payment_method": method}})
+    await db.invoices.update_one({"ref_id": rid}, {"$set": {"payment_status": "Paid"}})
+
+@api_router.patch("/sales/{rid}/pay")
+async def pay_sale(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
+    await mark_paid("sales", rid, body.payment_method)
+    return {"message": "paid"}
+
+@api_router.patch("/grinding/{rid}/pay")
+async def pay_grinding(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
+    await mark_paid("grinding", rid, body.payment_method)
+    return {"message": "paid"}
+
+@api_router.patch("/oil/{rid}/pay")
+async def pay_oil(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
+    await mark_paid("oil", rid, body.payment_method)
+    return {"message": "paid"}
+
+@api_router.patch("/purchases/{rid}/pay")
+async def pay_purchase(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
+    await db.purchases.update_one({"id": rid}, {"$set": {"payment_status": "Paid"}})
+    return {"message": "paid"}
+
+# ---- Edit records ----
+@api_router.put("/sales/{sid}")
+async def edit_sale(sid: str, body: SaleBody, user: dict = Depends(get_current_user)):
+    old = await db.sales.find_one({"id": sid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    await db.products.update_one({"id": old["product_id"]}, {"$inc": {"current_stock": old["quantity"]}})
+    total = round(body.quantity * body.price, 2)
+    await db.sales.update_one({"id": sid}, {"$set": {**body.model_dump(), "total": total}})
+    await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": -body.quantity}})
+    await db.invoices.update_one({"ref_id": sid}, {"$set": {"customer_name": body.customer_name,
+        "date": body.date, "total": total, "payment_status": body.payment_status}})
+    return clean(await db.sales.find_one({"id": sid}))
+
+@api_router.put("/grinding/{gid}")
+async def edit_grinding(gid: str, body: GrindingBody, user: dict = Depends(get_current_user)):
+    old = await db.grinding.find_one({"id": gid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    await apply_grinding_effects(old, -1)
+    doc = await build_grinding_doc(body)
+    doc["id"] = gid
+    doc["invoice_number"] = old["invoice_number"]
+    await db.grinding.replace_one({"id": gid}, doc)
+    await apply_grinding_effects(doc, 1)
+    await db.invoices.update_one({"ref_id": gid}, {"$set": {"customer_name": doc["customer_name"],
+        "date": doc["date"], "total": doc["total_charge"], "payment_status": doc["payment_status"]}})
+    return clean(doc)
+
+@api_router.put("/oil/{oid}")
+async def edit_oil(oid: str, body: OilBody, user: dict = Depends(get_current_user)):
+    old = await db.oil.find_one({"id": oid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    await apply_oil_effects(old, -1)
+    doc = await build_oil_doc(body)
+    doc["id"] = oid
+    doc["invoice_number"] = old["invoice_number"]
+    await db.oil.replace_one({"id": oid}, doc)
+    await apply_oil_effects(doc, 1)
+    await db.invoices.update_one({"ref_id": oid}, {"$set": {"customer_name": doc["customer_name"],
+        "date": doc["date"], "total": doc["total"], "payment_status": doc["payment_status"]}})
+    return clean(doc)
+
+@api_router.put("/expenses/{eid}")
+async def edit_expense(eid: str, body: ExpenseBody, user: dict = Depends(get_current_user)):
+    await db.expenses.update_one({"id": eid}, {"$set": body.model_dump()})
+    return clean(await db.expenses.find_one({"id": eid}))
+
+# ---- Daybook (end-of-day summary) ----
+@api_router.get("/daybook")
+async def daybook(date: str, user: dict = Depends(get_current_user)):
+    def f(items):
+        return [i for i in items if str(i.get("date", "")) == date]
+    sales = f(await db.sales.find().to_list(5000))
+    grinding = f(await db.grinding.find().to_list(5000))
+    oil = f(await db.oil.find().to_list(5000))
+    expenses = f(await db.expenses.find().to_list(5000))
+    purchases = f(await db.purchases.find().to_list(5000))
+    sales_total = sum(s.get("total", 0) for s in sales)
+    grinding_total = sum(g.get("total_charge", 0) for g in grinding)
+    oil_total = sum(o.get("total", 0) for o in oil)
+    income = sales_total + grinding_total + oil_total
+    collected = (sum(s.get("total", 0) for s in sales if s.get("payment_status") == "Paid")
+                 + sum(g.get("total_charge", 0) for g in grinding if g.get("payment_status") == "Paid")
+                 + sum(o.get("total", 0) for o in oil if o.get("payment_status") == "Paid"))
+    exp_total = sum(e.get("amount", 0) for e in expenses)
+    return {"date": date, "sales_total": round(sales_total, 2), "grinding_total": round(grinding_total, 2),
+            "oil_total": round(oil_total, 2), "income": round(income, 2), "collected": round(collected, 2),
+            "pending": round(income - collected, 2), "expenses": round(exp_total, 2),
+            "purchases": round(sum(p.get("total", 0) for p in purchases), 2),
+            "net": round(collected - exp_total, 2),
+            "counts": {"sales": len(sales), "grinding": len(grinding), "oil": len(oil), "expenses": len(expenses)}}
 
 app.include_router(api_router)
 

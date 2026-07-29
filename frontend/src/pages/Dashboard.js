@@ -6,7 +6,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
   TrendingUp, Wallet, ShoppingCart, Droplets, Wheat, Receipt,
-  AlertTriangle, Package, Landmark, Users,
+  AlertTriangle, Package, Landmark, Users, CalendarCheck,
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
@@ -17,9 +17,12 @@ const PIE_COLORS = ["hsl(var(--chart-1))", "hsl(var(--chart-2))", "hsl(var(--cha
 
 export default function Dashboard() {
   const [d, setD] = useState(null);
+  const [day, setDay] = useState(null);
+  const dayDate = new Date().toISOString().slice(0, 10);
 
   useEffect(() => {
     api.get("/dashboard").then((r) => setD(r.data)).catch(() => {});
+    api.get(`/daybook?date=${dayDate}`).then((r) => setDay(r.data)).catch(() => {});
   }, []);
 
   if (!d) return <div className="text-muted-foreground">Loading dashboard...</div>;
@@ -37,6 +40,23 @@ export default function Dashboard() {
         <StatCard testid="stat-pending" label="Pending Payments" value={money(d.pending_customer)} icon={Landmark} accent="destructive" sub="Customer dues" />
         <StatCard testid="stat-stock" label="Total Stock" value={`${d.total_stock} kg`} icon={Package} accent="primary" sub={`${d.inventory_count} products`} />
       </div>
+
+      {day && (
+        <Card className="p-6 border-border/60 mb-6" data-testid="daily-summary">
+          <div className="flex items-center gap-2 mb-4">
+            <CalendarCheck className="h-5 w-5 text-primary" />
+            <h3 className="font-heading font-bold text-lg">Today's Summary — {day.date}</h3>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 text-sm">
+            <div><p className="text-muted-foreground">Income Billed</p><p className="font-heading font-bold text-lg">{money(day.income)}</p></div>
+            <div><p className="text-muted-foreground">Collected</p><p className="font-heading font-bold text-lg text-secondary">{money(day.collected)}</p></div>
+            <div><p className="text-muted-foreground">Pending</p><p className="font-heading font-bold text-lg text-destructive">{money(day.pending)}</p></div>
+            <div><p className="text-muted-foreground">Expenses</p><p className="font-heading font-bold text-lg">{money(day.expenses)}</p></div>
+            <div><p className="text-muted-foreground">Net Cash</p><p className="font-heading font-bold text-lg">{money(day.net)}</p></div>
+            <div><p className="text-muted-foreground">Orders Today</p><p className="font-heading font-bold text-lg">{day.counts.sales + day.counts.grinding + day.counts.oil}</p></div>
+          </div>
+        </Card>
+      )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
         <StatCard testid="stat-sales" label="Product Sales" value={money(d.total_sales)} icon={ShoppingCart} accent="primary" />
@@ -87,7 +107,6 @@ export default function Dashboard() {
             <div className="space-y-2">
               {d.low_stock.map((p, i) => (
                 <div key={i} className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
-                  <span className="font-medium">{p.name}</span>
                   <Badge variant="outline" className="text-destructive border-destructive/30">
                     {p.stock} {p.unit} left
                   </Badge>
