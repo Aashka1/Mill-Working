@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useList, useFilter, PageToolbar, StatusBadge } from "@/components/common";
-import { money, today } from "@/lib/api";
+import { money, today, formatApiErrorDetail } from "@/lib/api";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,8 +11,19 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, Trash2, Pencil } from "lucide-react";
 import { toast } from "sonner";
+
+// Must cover every category the seeded catalogue uses, or those products cannot
+// be created from this form. "Wheat Crop" is the raw grain; "Wheat" was a stale
+// label that matched nothing in the data.
+const CATEGORIES = ["Wheat Crop", "Flour", "Bran", "Oil Seeds", "Edible Oil", "Oil Cake", "Packing", "Other"];
+
+// "pcs" and "bag" both appear on packing items — bags bought loose are counted
+// in pieces, bags sold by size are priced per bag.
+const UNITS = ["kg", "litre", "quintal", "bag", "pcs"];
+
+const BLANK_PRODUCT = { name: "", category: "Flour", unit: "kg", current_stock: 0, rate: 0, low_stock_threshold: 50 };
 
 export default function Inventory() {
   const products = useList("/products");
@@ -24,13 +35,46 @@ export default function Inventory() {
   const fPurch = useFilter(purchases.items, pq, ["supplier_name", "product_name", "date"]);
 
   const [prodOpen, setProdOpen] = useState(false);
-  const [pf, setPf] = useState({ name: "", category: "Wheat", unit: "kg", current_stock: 0, rate: 0, low_stock_threshold: 50 });
+  const [editingProduct, setEditingProduct] = useState(null);
+  const [pf, setPf] = useState({ ...BLANK_PRODUCT });
+
+  const openNewProduct = () => { setEditingProduct(null); setPf({ ...BLANK_PRODUCT }); setProdOpen(true); };
+  const openEditProduct = (p) => {
+    setEditingProduct(p.id);
+    setPf({ name: p.name, category: p.category, unit: p.unit, current_stock: p.current_stock, rate: p.rate, low_stock_threshold: p.low_stock_threshold });
+    setProdOpen(true);
+  };
+
   const saveProduct = async () => {
     if (!pf.name) return toast.error("Enter product name");
-    await products.create({ ...pf, current_stock: +pf.current_stock, rate: +pf.rate, low_stock_threshold: +pf.low_stock_threshold });
+    const body = { ...pf, current_stock: +pf.current_stock, rate: +pf.rate, low_stock_threshold: +pf.low_stock_threshold };
+    try {
+      if (editingProduct) {
+        await api.put(`/products/${editingProduct}`, body);
+        toast.success("Product updated");
+      } else {
+        // Adding a name that already exists tops that product up instead of
+        // creating a second row — say so, so the stock is not entered twice.
+        const { data } = await api.post("/products", body);
+        toast.success(data.merged
+          ? `Added to existing ${data.name} — now ${data.current_stock} ${data.unit}`
+          : "Product added");
+      }
+    } catch (err) {
+      return toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
+    }
+    products.load();
     setProdOpen(false);
-    setPf({ name: "", category: "Wheat", unit: "kg", current_stock: 0, rate: 0, low_stock_threshold: 50 });
+    setEditingProduct(null);
+    setPf({ ...BLANK_PRODUCT });
   };
+
+  // A product already in the catalogue may use a category or unit that predates
+  // these lists; include it so the dropdown shows the real value instead of an
+  // empty box.
+  const categoryOptions = pf.category && !CATEGORIES.includes(pf.category) ? [...CATEGORIES, pf.category] : CATEGORIES;
+  const unitOptions = pf.unit && !UNITS.includes(pf.unit) ? [...UNITS, pf.unit] : UNITS;
+  const unitOf = (productId, fallback = "") => products.items.find((p) => p.id === productId)?.unit || fallback;
 
   const [purOpen, setPurOpen] = useState(false);
   const [buf, setBuf] = useState({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid" });
@@ -47,6 +91,8 @@ export default function Inventory() {
     products.load(); purchases.load();
   };
 
+  const purchaseUnit = unitOf(buf.product_id, "unit");
+
   return (
     <div>
       <PageToolbar title="Inventory Management" subtitle="Shop-owned stock and purchases" />
@@ -59,31 +105,29 @@ export default function Inventory() {
         <TabsContent value="stock">
           <div className="flex justify-between items-center mb-4">
             <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search products..." className="h-11 max-w-xs" data-testid="search-products" />
-            <Dialog open={prodOpen} onOpenChange={setProdOpen}>
-              <DialogTrigger asChild>
-                <Button className="h-11 active:scale-95 transition-transform" data-testid="add-product-btn"><Plus className="h-4 w-4 mr-1" /> Add Product</Button>
-              </DialogTrigger>
+            <Button className="h-11 active:scale-95 transition-transform" onClick={openNewProduct} data-testid="add-product-btn"><Plus className="h-4 w-4 mr-1" /> Add Product</Button>
+            <Dialog open={prodOpen} onOpenChange={(o) => { setProdOpen(o); if (!o) setEditingProduct(null); }}>
               <DialogContent>
-                <DialogHeader><DialogTitle>Add Product</DialogTitle></DialogHeader>
+                <DialogHeader><DialogTitle>{editingProduct ? "Edit" : "Add"} Product</DialogTitle></DialogHeader>
                 <div className="space-y-4">
                   <div><Label>Name</Label><Input value={pf.name} onChange={(e) => setPf({ ...pf, name: e.target.value })} className="h-11 mt-1" data-testid="product-name" /></div>
                   <div className="grid grid-cols-2 gap-4">
                     <div><Label>Category</Label>
                       <Select value={pf.category} onValueChange={(v) => setPf({ ...pf, category: v })}>
                         <SelectTrigger className="h-11 mt-1" data-testid="product-category"><SelectValue /></SelectTrigger>
-                        <SelectContent>{["Wheat", "Oil Seeds", "Edible Oil", "Flour", "Other"].map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                        <SelectContent>{categoryOptions.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
                       </Select>
                     </div>
                     <div><Label>Unit</Label>
                       <Select value={pf.unit} onValueChange={(v) => setPf({ ...pf, unit: v })}>
                         <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
-                        <SelectContent>{["kg", "litre", "quintal", "bag"].map((u) => <SelectItem key={u} value={u}>{u}</SelectItem>)}</SelectContent>
+                        <SelectContent>{unitOptions.map((u) => <SelectItem key={u} value={u}>{u}</SelectItem>)}</SelectContent>
                       </Select>
                     </div>
                   </div>
                   <div className="grid grid-cols-3 gap-4">
-                    <div><Label>Opening Stock</Label><Input type="number" value={pf.current_stock} onChange={(e) => setPf({ ...pf, current_stock: e.target.value })} className="h-11 mt-1" data-testid="product-stock" /></div>
-                    <div><Label>Rate ₹</Label><Input type="number" value={pf.rate} onChange={(e) => setPf({ ...pf, rate: e.target.value })} className="h-11 mt-1" /></div>
+                    <div><Label>{editingProduct ? "Stock" : "Opening Stock"} ({pf.unit})</Label><Input type="number" value={pf.current_stock} onChange={(e) => setPf({ ...pf, current_stock: e.target.value })} className="h-11 mt-1" data-testid="product-stock" /></div>
+                    <div><Label>Rate ₹/{pf.unit}</Label><Input type="number" value={pf.rate} onChange={(e) => setPf({ ...pf, rate: e.target.value })} className="h-11 mt-1" /></div>
                     <div><Label>Low Alert</Label><Input type="number" value={pf.low_stock_threshold} onChange={(e) => setPf({ ...pf, low_stock_threshold: e.target.value })} className="h-11 mt-1" /></div>
                   </div>
                 </div>
@@ -107,7 +151,10 @@ export default function Inventory() {
                       <TableCell className="text-right">{p.current_stock} {p.unit}</TableCell>
                       <TableCell className="text-right">{money(p.rate)}</TableCell>
                       <TableCell>{low ? <Badge variant="outline" className="text-destructive border-destructive/30">Low</Badge> : <Badge variant="outline" className="text-secondary border-secondary/30">OK</Badge>}</TableCell>
-                      <TableCell className="text-right"><Button variant="ghost" size="icon" onClick={() => products.remove(p.id)} data-testid={`del-product-${p.id}`}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                      <TableCell className="text-right flex gap-1 justify-end">
+                        <Button variant="ghost" size="icon" onClick={() => openEditProduct(p)} data-testid={`edit-product-${p.id}`}><Pencil className="h-4 w-4" /></Button>
+                        <Button variant="ghost" size="icon" onClick={() => products.remove(p.id)} data-testid={`del-product-${p.id}`}><Trash2 className="h-4 w-4 text-destructive" /></Button>
+                      </TableCell>
                     </TableRow>
                   );
                 })}
@@ -144,8 +191,8 @@ export default function Inventory() {
                     </Select>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
-                    <div><Label>Quantity (kg)</Label><Input type="number" value={buf.quantity} onChange={(e) => setBuf({ ...buf, quantity: e.target.value })} className="h-11 mt-1" data-testid="purchase-qty" /></div>
-                    <div><Label>Rate ₹/unit</Label><Input type="number" value={buf.rate} onChange={(e) => setBuf({ ...buf, rate: e.target.value })} className="h-11 mt-1" data-testid="purchase-rate" /></div>
+                    <div><Label>Quantity ({purchaseUnit})</Label><Input type="number" value={buf.quantity} onChange={(e) => setBuf({ ...buf, quantity: e.target.value })} className="h-11 mt-1" data-testid="purchase-qty" /></div>
+                    <div><Label>Rate ₹/{purchaseUnit}</Label><Input type="number" value={buf.rate} onChange={(e) => setBuf({ ...buf, rate: e.target.value })} className="h-11 mt-1" data-testid="purchase-rate" /></div>
                   </div>
                   <div><Label>Payment</Label>
                     <Select value={buf.payment_status} onValueChange={(v) => setBuf({ ...buf, payment_status: v })}>
@@ -170,7 +217,7 @@ export default function Inventory() {
                 {fPurch.map((p) => (
                   <TableRow key={p.id} className="hover:bg-muted/50">
                     <TableCell>{p.date}</TableCell><TableCell>{p.supplier_name}</TableCell><TableCell>{p.product_name}</TableCell>
-                    <TableCell className="text-right">{p.quantity} kg</TableCell><TableCell className="text-right">{money(p.rate)}</TableCell>
+                    <TableCell className="text-right">{p.quantity} {unitOf(p.product_id)}</TableCell><TableCell className="text-right">{money(p.rate)}</TableCell>
                     <TableCell className="text-right font-medium">{money(p.total)}</TableCell><TableCell><StatusBadge status={p.payment_status} /></TableCell>
                     <TableCell className="text-right"><Button variant="ghost" size="icon" onClick={() => purchases.remove(p.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
                   </TableRow>

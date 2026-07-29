@@ -387,21 +387,73 @@ class ProductBody(BaseModel):
     cost_per_unit: float = 0
     low_stock_threshold: float = 50
 
+def product_key(name: str) -> str:
+    """Normalised product name. 'Atta', 'atta' and ' Atta ' are one product.
+
+    Stock is moved by name in several places (grinding fees, exchange, oil
+    retention), so two rows sharing a name would make those updates land on
+    whichever row Mongo happened to return first. Names are kept unique.
+    """
+    return " ".join((name or "").split()).lower()
+
 @api_router.get("/products")
 async def get_products(user: dict = Depends(get_current_user)):
     return [clean(p) for p in await db.products.find().sort("name", 1).to_list(1000)]
 
 @api_router.post("/products")
 async def create_product(body: ProductBody, user: dict = Depends(get_current_user)):
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "created_at": now_iso()}
+    key = product_key(body.name)
+    if not key:
+        raise HTTPException(status_code=400, detail="Enter a product name")
+
+    existing = await db.products.find_one({"name_key": key})
+    if existing:
+        # Same name in a different category is ambiguous rather than a top-up:
+        # refuse instead of silently filing stock under the wrong category.
+        if existing.get("category") != body.category:
+            raise HTTPException(status_code=400, detail=(
+                f'"{existing["name"]}" already exists under category '
+                f'"{existing.get("category")}". Pick that category to add stock to it, '
+                f"or give this product a different name."))
+        if existing.get("unit") != body.unit:
+            raise HTTPException(status_code=400, detail=(
+                f'"{existing["name"]}" is measured in {existing.get("unit")}, not {body.unit}. '
+                f"Edit the product if the unit needs to change."))
+        # Adding an existing product tops up its stock rather than creating a
+        # second row, and carries the purchase cost into the running average.
+        added = body.current_stock
+        if added:
+            await add_stock_with_cost(existing["id"], added, added * (body.rate or existing.get("rate", 0)))
+        updates = {}
+        if body.rate:
+            updates["rate"] = body.rate
+        if body.low_stock_threshold:
+            updates["low_stock_threshold"] = body.low_stock_threshold
+        if updates:
+            await db.products.update_one({"id": existing["id"]}, {"$set": updates})
+        merged = await db.products.find_one({"id": existing["id"]})
+        await log_audit(user, "Added stock", f'{merged["name"]}: +{added} {merged.get("unit")} (now {merged.get("current_stock")})')
+        return {**clean(merged), "merged": True}
+
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "name_key": key, "created_at": now_iso()}
     await db.products.insert_one(doc)
-    return clean(doc)
+    await log_audit(user, "Created product", f'{body.name} ({body.category})')
+    return {**clean(doc), "merged": False}
 
 @api_router.put("/products/{pid}")
 async def update_product(pid: str, body: ProductBody, user: dict = Depends(get_current_user)):
     old = await db.products.find_one({"id": pid})
-    await db.products.update_one({"id": pid}, {"$set": body.model_dump()})
-    if old and old.get("current_stock") != body.current_stock:
+    if not old:
+        raise HTTPException(status_code=404, detail="Product not found")
+    key = product_key(body.name)
+    if not key:
+        raise HTTPException(status_code=400, detail="Enter a product name")
+    # Renaming onto another product would recreate the duplicate this guards against.
+    clash = await db.products.find_one({"name_key": key, "id": {"$ne": pid}})
+    if clash:
+        raise HTTPException(status_code=400, detail=f'Another product is already named "{clash["name"]}"')
+    await db.products.update_one({"id": pid}, {"$set": {**body.model_dump(), "name_key": key}})
+    if old.get("current_stock") != body.current_stock:
         await log_audit(user, "Changed stock", f"{body.name}: {old.get('current_stock')} → {body.current_stock} {body.unit}")
     return clean(await db.products.find_one({"id": pid}))
 
@@ -436,7 +488,7 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
     await add_stock_with_cost(body.product_id, body.quantity, total)
     if body.payment_status == "Paid":
         await add_credit("supplier", body.supplier_name, total, body.date, doc["id"], f"Purchase {body.product_name}")
-    await log_audit(user, "Created purchase", f"{body.supplier_name} · {body.product_name} {body.quantity}kg · Rs {total}")
+    await log_audit(user, "Created purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
     return clean(doc)
 
 @api_router.delete("/purchases/{pid}")
@@ -475,7 +527,7 @@ async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
         "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
     if body.payment_status == "Paid":
         await add_credit("customer", body.customer_name, total, body.date, doc["id"], f"Cash sale {inv}")
-    await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity}kg · Rs {total}")
+    await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
     return clean(doc)
 
 @api_router.delete("/sales/{sid}")
@@ -678,12 +730,24 @@ async def delete_supplier(sid: str, user: dict = Depends(require_admin)):
 async def get_invoices(user: dict = Depends(get_current_user)):
     return [clean(i) for i in await db.invoices.find().sort("created_at", -1).to_list(2000)]
 
+async def product_unit(product_id: str, default: str = "kg") -> str:
+    """Unit a product is measured in. Sales do not store it, so read the catalogue.
+
+    Matters on customer-facing invoices: packing is sold by the bag and oil by
+    the litre, and printing either as "kg" is simply wrong.
+    """
+    if not product_id:
+        return default
+    p = await db.products.find_one({"id": product_id})
+    return (p or {}).get("unit") or default
+
 async def build_invoice_data(ref_id: str):
     sale = await db.sales.find_one({"id": ref_id})
     if sale:
+        unit = await product_unit(sale.get("product_id"))
         return {"type": "Sale", "invoice_number": sale["invoice_number"], "date": sale["date"],
                 "customer_name": sale["customer_name"], "payment_status": sale["payment_status"],
-                "items": [{"desc": sale["product_name"], "qty": f'{sale["quantity"]} kg',
+                "items": [{"desc": sale["product_name"], "qty": f'{sale["quantity"]} {unit}',
                            "rate": sale["price"], "amount": sale["total"]}], "total": sale["total"]}
     g = await db.grinding.find_one({"id": ref_id})
     if g:
@@ -889,6 +953,7 @@ async def startup():
     # No demo staff account is seeded. Startup runs on every wake from idle, so
     # a seeded account would keep reappearing after being deleted. Admins add
     # staff from Settings instead.
+    await consolidate_products()
     await seed_products()
     await get_settings_doc()
 
@@ -912,11 +977,60 @@ DEFAULT_PRODUCTS = [
     {"name": "Packing Bags", "category": "Packing", "unit": "pcs", "low_stock_threshold": 100},
 ]
 
+async def consolidate_products():
+    """Backfill name_key and fold pre-existing duplicate products into one row.
+
+    Products created before name_key existed can share a name. That breaks
+    adjust_stock_by_name, which would update an arbitrary one of them, and it
+    blocks the unique index below. Runs on every boot but is a no-op once clean.
+    """
+    async for p in db.products.find({"name_key": {"$exists": False}}):
+        await db.products.update_one({"_id": p["_id"]}, {"$set": {"name_key": product_key(p.get("name", ""))}})
+
+    groups = await db.products.aggregate([
+        {"$group": {"_id": "$name_key", "ids": {"$push": "$id"}, "n": {"$sum": 1}}},
+        {"$match": {"n": {"$gt": 1}}},
+    ]).to_list(1000)
+
+    for g in groups:
+        dupes = await db.products.find({"id": {"$in": g["ids"]}}).to_list(100)
+        # Keep the row carrying the most stock; it is the one in real use.
+        dupes.sort(key=lambda d: (d.get("current_stock", 0) or 0, d.get("created_at") or ""), reverse=True)
+        keeper, rest = dupes[0], dupes[1:]
+
+        total_stock = sum(d.get("current_stock", 0) or 0 for d in dupes)
+        # Weighted average so the merged cost basis still reflects what was paid.
+        valued = sum((d.get("current_stock", 0) or 0) * (d.get("cost_per_unit", 0) or 0) for d in dupes)
+        merged = {
+            "current_stock": round(total_stock, 3),
+            "cost_per_unit": round(valued / total_stock, 4) if total_stock > 0 else 0,
+            "rate": max((d.get("rate", 0) or 0) for d in dupes),
+            "low_stock_threshold": max((d.get("low_stock_threshold", 0) or 0) for d in dupes),
+        }
+        await db.products.update_one({"id": keeper["id"]}, {"$set": merged})
+
+        # Repoint history at the survivor so unit lookups and edits keep working.
+        for d in rest:
+            for coll, field in ((db.sales, "product_id"), (db.purchases, "product_id"),
+                                (db.production, "input_product_id"), (db.production, "outputs.$[o].product_id")):
+                if field.startswith("outputs"):
+                    await coll.update_many({"outputs.product_id": d["id"]},
+                                           {"$set": {"outputs.$[o].product_id": keeper["id"]}},
+                                           array_filters=[{"o.product_id": d["id"]}])
+                else:
+                    await coll.update_many({field: d["id"]}, {"$set": {field: keeper["id"]}})
+            await db.products.delete_one({"id": d["id"]})
+
+        logger.warning("Merged %d duplicate product rows named %r into one (stock %s)",
+                       len(rest) + 1, keeper.get("name"), merged["current_stock"])
+
+    await db.products.create_index("name_key", unique=True)
+
 async def seed_products():
     for p in DEFAULT_PRODUCTS:
-        if await db.products.find_one({"name": p["name"]}) is None:
-            await db.products.insert_one({"id": str(uuid.uuid4()), **p, "current_stock": 0,
-                "rate": 0, "cost_per_unit": 0, "created_at": now_iso()})
+        if await db.products.find_one({"name_key": product_key(p["name"])}) is None:
+            await db.products.insert_one({"id": str(uuid.uuid4()), **p, "name_key": product_key(p["name"]),
+                "current_stock": 0, "rate": 0, "cost_per_unit": 0, "created_at": now_iso()})
 
 async def get_settings_doc():
     s = await db.settings.find_one({"id": "config"})
@@ -926,7 +1040,15 @@ async def get_settings_doc():
     return clean(s)
 
 async def adjust_stock_by_name(name, delta):
-    await db.products.update_one({"name": name}, {"$inc": {"current_stock": round(delta, 3)}})
+    """Move stock for a product identified by name.
+
+    Matches the normalised key so casing and stray spaces cannot miss the row.
+    Names are unique (see product_key), so this always targets exactly one.
+    """
+    res = await db.products.update_one({"name_key": product_key(name)},
+                                       {"$inc": {"current_stock": round(delta, 3)}})
+    if res.matched_count == 0:
+        logger.warning("adjust_stock_by_name: no product named %r; %+g not applied", name, delta)
 
 async def add_stock_with_cost(pid, qty, total_cost):
     p = await db.products.find_one({"id": pid})

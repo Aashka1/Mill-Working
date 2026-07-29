@@ -23,6 +23,11 @@ export default function Sales() {
   const [editingId, setEditingId] = useState(null);
   const [f, setF] = useState(empty);
 
+  // Products are not all measured in kg — oil is litres, packing is bags — so
+  // every quantity is labelled with the unit of the product it belongs to.
+  const unitOf = (productId, fallback = "") => products.items.find((p) => p.id === productId)?.unit || fallback;
+  const selectedUnit = unitOf(f.product_id, "unit");
+
   const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
   const openEdit = (s) => {
     setEditingId(s.id);
@@ -77,8 +82,8 @@ export default function Sales() {
               </Select>
             </div>
             <div className="grid grid-cols-2 gap-4">
-              <div><Label>Quantity (kg)</Label><Input type="number" value={f.quantity} onChange={(e) => setF({ ...f, quantity: e.target.value })} className="h-11 mt-1" data-testid="sale-qty" /></div>
-              <div><Label>Price ₹/unit</Label><Input type="number" value={f.price} onChange={(e) => setF({ ...f, price: e.target.value })} className="h-11 mt-1" data-testid="sale-price" /></div>
+              <div><Label>Quantity ({selectedUnit})</Label><Input type="number" value={f.quantity} onChange={(e) => setF({ ...f, quantity: e.target.value })} className="h-11 mt-1" data-testid="sale-qty" /></div>
+              <div><Label>Price ₹/{selectedUnit}</Label><Input type="number" value={f.price} onChange={(e) => setF({ ...f, price: e.target.value })} className="h-11 mt-1" data-testid="sale-price" /></div>
             </div>
             <div><Label>Payment</Label>
               <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
@@ -103,7 +108,7 @@ export default function Sales() {
               <TableRow key={s.id} className="hover:bg-muted/50" data-testid={`sale-row-${s.id}`}>
                 <TableCell className="font-mono text-xs">{s.invoice_number}</TableCell><TableCell>{s.date}</TableCell>
                 <TableCell className="font-medium">{s.customer_name}</TableCell><TableCell>{s.product_name}</TableCell>
-                <TableCell className="text-right">{s.quantity} kg</TableCell><TableCell className="text-right font-medium">{money(s.total)}</TableCell>
+                <TableCell className="text-right">{s.quantity} {unitOf(s.product_id)}</TableCell><TableCell className="text-right font-medium">{money(s.total)}</TableCell>
                 <TableCell><StatusBadge status={s.payment_status} /></TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   {s.payment_status === "Pending" && <Button variant="ghost" size="icon" onClick={() => markPaid(s)} data-testid={`pay-sale-${s.id}`}><CheckCircle2 className="h-4 w-4 text-secondary" /></Button>}
