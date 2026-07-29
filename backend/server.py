@@ -508,6 +508,8 @@ class PurchaseBody(BaseModel):
     quantity: float
     rate: float
     payment_status: str = "Paid"
+    # Blank means "settled in full"; any number records a part payment.
+    amount_paid: Optional[float] = None
 
 @api_router.get("/purchases")
 async def get_purchases(user: dict = Depends(get_current_user)):
@@ -519,8 +521,10 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
     doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "created_at": now_iso()}
     await db.purchases.insert_one(doc)
     await add_stock_with_cost(body.product_id, body.quantity, total)
-    if body.payment_status == "Paid":
-        await add_credit("supplier", body.supplier_name, total, body.date, doc["id"], f"Purchase {body.product_name}")
+    received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
+    await add_credit("supplier", body.supplier_name, min(received, total), body.date, doc["id"], f"Purchase {body.product_name}")
+    await sync_payment_state("purchases", doc["id"])
+    doc = await db.purchases.find_one({"id": doc["id"]})
     await log_audit(user, "Created purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
     return clean(doc)
 
@@ -535,6 +539,7 @@ async def edit_purchase(pid: str, body: PurchaseBody, user: dict = Depends(get_c
     total = round(body.quantity * body.rate, 2)
     await db.purchases.update_one({"id": pid}, {"$set": {**body.model_dump(), "total": total}})
     await add_stock_with_cost(body.product_id, body.quantity, total)
+    await sync_payment_state("purchases", pid)
     await log_audit(user, "Edited purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
     return clean(await db.purchases.find_one({"id": pid}))
 
@@ -544,6 +549,7 @@ async def delete_purchase(pid: str, user: dict = Depends(require_admin)):
     if p:
         await db.products.update_one({"id": p["product_id"]}, {"$inc": {"current_stock": -p["quantity"]}})
         await db.purchases.delete_one({"id": pid})
+        await db.payments.delete_many({"ref_id": pid})
     return {"message": "deleted"}
 
 # ---------------- Sales ----------------
@@ -557,6 +563,25 @@ class SaleBody(BaseModel):
     quantity: float
     price: float
     payment_status: str = "Paid"
+    amount_paid: Optional[float] = None
+
+async def product_cost(product_id: str) -> float:
+    p = await db.products.find_one({"id": product_id})
+    return round((p or {}).get("cost_per_unit", 0) or 0, 4)
+
+def sale_cogs(sale: dict, cost_by_name: dict) -> float:
+    """Cost of the goods in one sale.
+
+    Uses the cost captured on the sale when present. Sales written before that
+    snapshot existed fall back to the product's current average cost, which is
+    what the old reports did and is the best available for historical rows.
+    """
+    if sale.get("cogs") is not None:
+        return sale.get("cogs", 0) or 0
+    unit = sale.get("unit_cost")
+    if unit is None:
+        unit = cost_by_name.get(sale.get("product_name"), 0)
+    return round((sale.get("quantity", 0) or 0) * (unit or 0), 2)
 
 @api_router.get("/sales")
 async def get_sales(user: dict = Depends(get_current_user)):
@@ -566,14 +591,21 @@ async def get_sales(user: dict = Depends(get_current_user)):
 async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
     total = round(body.quantity * body.price, 2)
     inv = await next_invoice_number()
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "invoice_number": inv, "created_at": now_iso()}
+    # Snapshot what this stock cost at the moment it left the shop. cost_per_unit
+    # on the product is a running weighted average, so reading it later would let
+    # a future purchase silently rewrite the profit on a sale already made.
+    unit_cost = await product_cost(body.product_id)
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "invoice_number": inv,
+           "unit_cost": unit_cost, "cogs": round(body.quantity * unit_cost, 2), "created_at": now_iso()}
     await db.sales.insert_one(doc)
     await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": -body.quantity}})
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": inv, "type": "Sale",
         "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
         "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
-    if body.payment_status == "Paid":
-        await add_credit("customer", body.customer_name, total, body.date, doc["id"], f"Cash sale {inv}")
+    received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
+    await add_credit("customer", body.customer_name, min(received, total), body.date, doc["id"], f"Cash sale {inv}")
+    await sync_payment_state("sales", doc["id"])
+    doc = await db.sales.find_one({"id": doc["id"]})
     await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
     return clean(doc)
 
@@ -593,6 +625,11 @@ class GrindingBody(BaseModel):
     date: str
     customer_id: Optional[str] = None
     customer_name: str
+    # wheat_weight predates the mill grinding anything but wheat; it now means
+    # "weight of whatever was brought in", kept under the old name so existing
+    # records and reports stay readable.
+    grain_type: str = "Wheat"
+    output_product: str = "Atta"
     wheat_weight: float
     washed: bool = True
     loss_percent: float = 2.5
@@ -600,6 +637,7 @@ class GrindingBody(BaseModel):
     payment_method: str = "Cash"
     grain_fee_kg: float = 0
     payment_status: str = "Pending"
+    amount_paid: Optional[float] = None
 
 @api_router.get("/grinding")
 async def get_grinding(user: dict = Depends(get_current_user)):
@@ -613,8 +651,11 @@ async def create_grinding(body: GrindingBody, user: dict = Depends(get_current_u
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"], "type": "Grinding",
         "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
         "total": doc["total_charge"], "payment_status": doc["payment_status"], "created_at": now_iso()})
-    if doc["payment_status"] == "Paid" and doc["total_charge"] > 0:
-        await add_credit("customer", doc["customer_name"], doc["total_charge"], doc["date"], doc["id"], f"Grinding {doc['invoice_number']}")
+    charge = doc["total_charge"]
+    received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
+    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}")
+    await sync_payment_state("grinding", doc["id"])
+    doc = await db.grinding.find_one({"id": doc["id"]})
     return clean(doc)
 
 @api_router.delete("/grinding/{gid}")
@@ -624,6 +665,7 @@ async def delete_grinding(gid: str, user: dict = Depends(require_admin)):
         await apply_grinding_effects(g, -1)
         await db.grinding.delete_one({"id": gid})
         await db.invoices.delete_one({"ref_id": gid})
+        await db.payments.delete_many({"ref_id": gid})
     return {"message": "deleted"}
 
 # ---------------- Oil Extraction ----------------
@@ -640,7 +682,14 @@ class OilBody(BaseModel):
     payment_method: str = "Cash"
     retained_oil: float = 0
     retained_cake: float = 0
+    # Cake the customer sells to the shop, priced per kg. Distinct from
+    # retained_cake: that is cake kept as the processing fee and arrives free,
+    # whereas this is a purchase, so it carries a cost and its value comes off
+    # the customer's bill.
+    cake_sold_to_shop: float = 0
+    cake_rate: float = 0
     payment_status: str = "Pending"
+    amount_paid: Optional[float] = None
 
 @api_router.get("/oil")
 async def get_oil(user: dict = Depends(get_current_user)):
@@ -654,8 +703,11 @@ async def create_oil(body: OilBody, user: dict = Depends(get_current_user)):
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"], "type": "Oil Extraction",
         "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
         "total": doc["total"], "payment_status": doc["payment_status"], "created_at": now_iso()})
-    if doc["payment_status"] == "Paid" and doc["total"] > 0:
-        await add_credit("customer", doc["customer_name"], doc["total"], doc["date"], doc["id"], f"Oil {doc['invoice_number']}")
+    charge = doc["total"]
+    received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
+    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Oil {doc['invoice_number']}")
+    await sync_payment_state("oil", doc["id"])
+    doc = await db.oil.find_one({"id": doc["id"]})
     return clean(doc)
 
 @api_router.delete("/oil/{oid}")
@@ -800,15 +852,23 @@ async def build_invoice_data(ref_id: str):
     if g:
         return {"type": "Grinding Service", "invoice_number": g["invoice_number"], "date": g["date"],
                 "customer_name": g["customer_name"], "payment_status": g["payment_status"],
-                "items": [{"desc": f'Wheat Grinding ({g["wheat_weight"]} kg)', "qty": f'{g["wheat_weight"]} kg',
+                "items": [{"desc": f'{g.get("grain_type", "Wheat")} Grinding ({g["wheat_weight"]} kg)', "qty": f'{g["wheat_weight"]} kg',
                            "rate": g["charge_per_kg"], "amount": g["total_charge"]}], "total": g["total_charge"]}
     o = await db.oil.find_one({"id": ref_id})
     if o:
+        items = [{"desc": f'{o["seed_type"]} Oil Extraction ({o["oil_extracted"]} L extracted)',
+                  "qty": f'{o["quantity_received"]} kg', "rate": o["charge"], "amount": o["charge"]}]
+        # Show the cake purchase as its own negative line, otherwise the
+        # customer cannot see why the bill is lower than the extraction charge.
+        if o.get("cake_sold_to_shop", 0):
+            items.append({"desc": "Less: mustard cake purchased from customer",
+                          "qty": f'{o["cake_sold_to_shop"]} kg',
+                          "rate": o.get("cake_rate", 0),
+                          "amount": -o.get("cake_value", 0)})
         return {"type": "Oil Extraction Service", "invoice_number": o["invoice_number"], "date": o["date"],
                 "customer_name": o["customer_name"], "payment_status": o["payment_status"],
-                "items": [{"desc": f'{o["seed_type"]} Oil Extraction ({o["oil_extracted"]} L extracted)',
-                           "qty": f'{o["quantity_received"]} kg', "rate": o["charge"], "amount": o["charge"]}],
-                "total": o["charge"]}
+                "items": items,
+                "total": o.get("total", o["charge"])}
     return None
 
 @api_router.get("/invoices/{ref_id}/pdf")
@@ -872,7 +932,14 @@ async def dashboard(user: dict = Depends(get_current_user)):
     total_expenses = sum(e.get("amount", 0) for e in expenses)
     service_income = grinding_income + oil_income
     total_income = total_sales + service_income
-    profit = total_income - total_purchases - total_expenses
+
+    # Profit charges the cost of what was actually sold, not everything bought.
+    # Buying stock converts cash into inventory; it becomes a cost only when
+    # that stock is sold. Subtracting whole purchases showed a loss whenever the
+    # shop restocked — 250 kg bought against 25 kg sold read as 225 kg of loss.
+    cost_by_name = {p.get("name"): p.get("cost_per_unit", 0) or 0 for p in products}
+    total_cogs = sum(sale_cogs(s, cost_by_name) for s in sales)
+    profit = total_income - total_cogs - total_expenses
 
     def day_sum(items, field):
         return sum(i.get(field, 0) for i in items if str(i.get("date", "")).startswith(today))
@@ -882,10 +949,18 @@ async def dashboard(user: dict = Depends(get_current_user)):
     daily_income = day_sum(sales, "total") + day_sum(grinding, "total_charge") + day_sum(oil, "total")
     monthly_income = month_sum(sales, "total") + month_sum(grinding, "total_charge") + month_sum(oil, "total")
 
+    # Outstanding is the unpaid balance, so a part-paid bill contributes only
+    # what is still owed. Records written before part payment existed have no
+    # balance_due, so fall back to the total when the status is not Paid.
+    def owed(d, field):
+        if d.get("balance_due") is not None:
+            return d.get("balance_due", 0)
+        return 0 if d.get("payment_status") == "Paid" else d.get(field, 0)
+
     pending_customer = 0.0
     for coll, field in [(sales, "total"), (grinding, "total_charge"), (oil, "total")]:
-        pending_customer += sum(d.get(field, 0) for d in coll if d.get("payment_status") == "Pending")
-    supplier_dues = sum(p.get("total", 0) for p in purchases if p.get("payment_status") == "Pending")
+        pending_customer += sum(owed(d, field) for d in coll)
+    supplier_dues = sum(owed(p, "total") for p in purchases)
 
     low_stock = [{"name": p["name"], "stock": p.get("current_stock", 0), "threshold": p.get("low_stock_threshold", 0), "unit": p.get("unit", "kg")}
                  for p in products if p.get("current_stock", 0) <= p.get("low_stock_threshold", 0)]
@@ -897,7 +972,10 @@ async def dashboard(user: dict = Depends(get_current_user)):
         m = d.strftime("%Y-%m")
         label = d.strftime("%b")
         inc = month_income_for(sales, "total", m) + month_income_for(grinding, "total_charge", m) + month_income_for(oil, "total", m)
-        exp = month_income_for(expenses, "amount", m) + month_income_for(purchases, "total", m)
+        # Cost of goods sold that month, not stock bought that month, so the
+        # line tracks the same profit the headline figure reports.
+        month_cogs = sum(sale_cogs(s, cost_by_name) for s in sales if str(s.get("date", "")).startswith(m))
+        exp = month_income_for(expenses, "amount", m) + month_cogs
         trend.append({"month": label, "income": round(inc, 2), "expense": round(exp, 2)})
 
     return {
@@ -908,6 +986,7 @@ async def dashboard(user: dict = Depends(get_current_user)):
         "grinding_orders": len(grinding),
         "oil_orders": len(oil),
         "total_expenses": round(total_expenses, 2),
+        "total_cogs": round(total_cogs, 2),
         "profit": round(profit, 2),
         "daily_income": round(daily_income, 2),
         "monthly_income": round(monthly_income, 2),
@@ -935,13 +1014,16 @@ async def notifications(user: dict = Depends(get_current_user)):
             notes.append({"type": "low_stock", "level": "warning",
                           "message": f'Low stock: {p["name"]} ({p.get("current_stock",0)} {p.get("unit","kg")} left)'})
     for coll, field, label in [("sales", "total", "sale"), ("grinding", "total_charge", "grinding"), ("oil", "total", "oil extraction")]:
-        docs = await db[coll].find({"payment_status": "Pending"}).to_list(1000)
+        docs = await db[coll].find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000)
         for d in docs:
+            due = d.get("balance_due", d.get(field, 0))
+            part = " (part paid)" if d.get("payment_status") == "Partial" else ""
             notes.append({"type": "pending_payment", "level": "info",
-                          "message": f'Pending payment from {d.get("customer_name","?")} - Rs {d.get(field,0):.0f} ({label})'})
-    for p in await db.purchases.find({"payment_status": "Pending"}).to_list(1000):
+                          "message": f'Pending payment from {d.get("customer_name","?")} - Rs {due:.0f}{part} ({label})'})
+    for p in await db.purchases.find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000):
+        due = p.get("balance_due", p.get("total", 0))
         notes.append({"type": "supplier_due", "level": "info",
-                      "message": f'Supplier due: {p.get("supplier_name","?")} - Rs {p.get("total",0):.0f}'})
+                      "message": f'Supplier due: {p.get("supplier_name","?")} - Rs {due:.0f}'})
     today_str = datetime.now().strftime("%Y-%m-%d")
     soon = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
     for m in await db.maintenance.find().to_list(1000):
@@ -1018,6 +1100,12 @@ DEFAULT_PRODUCTS = [
     {"name": "Bajra Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
     {"name": "Sattu", "category": "Flour", "unit": "kg", "low_stock_threshold": 20},
     {"name": "Wheat Bran", "category": "Bran", "unit": "kg", "low_stock_threshold": 30},
+    # Raw inputs for the Besan and Masala mills. Production resolves a mill's
+    # input and outputs by product name, so a missing row here makes that mill
+    # unusable with no visible reason.
+    {"name": "Gram (Chana)", "category": "Other", "unit": "kg", "low_stock_threshold": 50},
+    {"name": "Whole Spices", "category": "Other", "unit": "kg", "low_stock_threshold": 20},
+    {"name": "Masala", "category": "Masala", "unit": "kg", "low_stock_threshold": 20},
     {"name": "Mustard Seeds", "category": "Oil Seeds", "unit": "kg", "low_stock_threshold": 100},
     {"name": "Mustard Oil", "category": "Edible Oil", "unit": "litre", "low_stock_threshold": 20},
     {"name": "Mustard Oil Cake", "category": "Oil Cake", "unit": "kg", "low_stock_threshold": 30},
@@ -1079,12 +1167,53 @@ async def seed_products():
             await db.products.insert_one({"id": str(uuid.uuid4()), **p, "name_key": product_key(p["name"]),
                 "current_stock": 0, "rate": 0, "cost_per_unit": 0, "created_at": now_iso()})
 
+# What the mill will grind, and what each item yields. The operator can add to
+# this from the grinding form — masala, a new millet — without a code change.
+DEFAULT_GRAIN_TYPES = [
+    {"name": "Wheat", "output": "Atta"},
+    {"name": "Gram (Chana)", "output": "Besan"},
+    {"name": "Multigrain Mix", "output": "Multigrain Atta"},
+    {"name": "Maize (Makka)", "output": "Makka Atta"},
+    {"name": "Bajra", "output": "Bajra Atta"},
+    {"name": "Roasted Gram", "output": "Sattu"},
+]
+
 async def get_settings_doc():
     s = await db.settings.find_one({"id": "config"})
     if not s:
         s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0, "starting_cash": 0}
         await db.settings.insert_one(s)
+    if not s.get("grain_types"):
+        await db.settings.update_one({"id": "config"}, {"$set": {"grain_types": DEFAULT_GRAIN_TYPES}})
+        s["grain_types"] = DEFAULT_GRAIN_TYPES
     return clean(s)
+
+class GrainTypeBody(BaseModel):
+    name: str
+    output: str
+
+@api_router.get("/grain-types")
+async def list_grain_types(user: dict = Depends(get_current_user)):
+    return (await get_settings_doc()).get("grain_types", DEFAULT_GRAIN_TYPES)
+
+@api_router.post("/grain-types")
+async def add_grain_type(body: GrainTypeBody, user: dict = Depends(get_current_user)):
+    name = body.name.strip()
+    output = (body.output or "").strip() or f"{name} Atta"
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a name")
+    types = (await get_settings_doc()).get("grain_types", [])
+    if any(t.get("name", "").lower() == name.lower() for t in types):
+        raise HTTPException(status_code=400, detail=f'"{name}" is already in the list')
+    types.append({"name": name, "output": output})
+    await db.settings.update_one({"id": "config"}, {"$set": {"grain_types": types}})
+    # Ground output has to exist in the catalogue for the shop's cut to be stocked.
+    if await db.products.find_one({"name_key": product_key(output)}) is None:
+        await db.products.insert_one({"id": str(uuid.uuid4()), "name": output, "name_key": product_key(output),
+            "category": "Flour", "unit": "kg", "current_stock": 0, "cost_per_unit": 0, "rate": 0,
+            "low_stock_threshold": 20, "created_at": now_iso()})
+    await log_audit(user, "Added grinding item", f"{name} → {output}")
+    return types
 
 async def adjust_stock_by_name(name, delta):
     """Move stock for a product identified by name.
@@ -1096,6 +1225,20 @@ async def adjust_stock_by_name(name, delta):
                                        {"$inc": {"current_stock": round(delta, 3)}})
     if res.matched_count == 0:
         logger.warning("adjust_stock_by_name: no product named %r; %+g not applied", name, delta)
+
+async def add_stock_by_name_with_cost(name, qty, total_cost):
+    """Move stock by name while folding the money paid into the cost basis.
+
+    adjust_stock_by_name only touches quantity, which is right for stock that
+    arrived free. Stock the shop actually bought must go through here, or its
+    cost_per_unit stays stale and sales-analytics reports the whole sale price
+    as profit.
+    """
+    p = await db.products.find_one({"name_key": product_key(name)})
+    if not p:
+        logger.warning("add_stock_by_name_with_cost: no product named %r; %+g not applied", name, qty)
+        return
+    await add_stock_with_cost(p["id"], qty, total_cost)
 
 async def add_stock_with_cost(pid, qty, total_cost):
     p = await db.products.find_one({"id": pid})
@@ -1125,24 +1268,50 @@ async def build_grinding_doc(body: GrindingBody):
               "total_charge": total_charge, "created_at": now_iso()})
     return d
 
+def grinding_output_name(doc: dict) -> str:
+    """Product the shop's grain fee is stocked as. Older rows are all atta."""
+    return doc.get("output_product") or "Atta"
+
 async def build_oil_doc(body: OilBody):
     inv = await next_invoice_number()
+    allocated = round(body.retained_cake + body.cake_sold_to_shop, 3)
+    if allocated > body.oil_cake_produced + 0.009:
+        raise HTTPException(status_code=400, detail=(
+            f"Cake kept plus cake bought is {allocated} kg but only "
+            f"{body.oil_cake_produced} kg was produced"))
+    if body.cake_sold_to_shop and body.cake_rate <= 0:
+        raise HTTPException(status_code=400, detail="Enter a rate for the cake being bought")
+    # The shop pays for the cake by knocking its value off the extraction charge,
+    # so the net is what the customer actually owes. It may go negative when the
+    # cake is worth more than the grinding; that is a genuine credit to the
+    # customer and flows through the ledger as one.
+    cake_value = round(body.cake_sold_to_shop * body.cake_rate, 2)
     d = body.model_dump()
-    d.update({"id": str(uuid.uuid4()), "invoice_number": inv, "total": body.charge,
+    d.update({"id": str(uuid.uuid4()), "invoice_number": inv,
+              "cake_value": cake_value,
+              "total": round(body.charge - cake_value, 2),
               "customer_oil": round(body.oil_extracted - body.retained_oil, 2),
-              "customer_cake": round(body.oil_cake_produced - body.retained_cake, 2),
+              "customer_cake": round(body.oil_cake_produced - body.retained_cake - body.cake_sold_to_shop, 2),
               "created_at": now_iso()})
     return d
 
 async def apply_grinding_effects(doc, sign):
     if doc.get("payment_method") == "Grain" and doc.get("grain_fee_kg", 0):
-        await adjust_stock_by_name("Atta", sign * doc["grain_fee_kg"])
+        await adjust_stock_by_name(grinding_output_name(doc), sign * doc["grain_fee_kg"])
 
 async def apply_oil_effects(doc, sign):
     if doc.get("retained_oil", 0):
         await adjust_stock_by_name("Mustard Oil", sign * doc["retained_oil"])
     if doc.get("retained_cake", 0):
+        # Kept as the processing fee: quantity only, nothing was paid for it.
         await adjust_stock_by_name("Mustard Oil Cake", sign * doc["retained_cake"])
+    if doc.get("cake_sold_to_shop", 0):
+        # Bought from the customer: the value must enter the weighted-average
+        # cost basis, and sign flips both quantity and cost together so an edit
+        # or delete reverses it exactly.
+        await add_stock_by_name_with_cost("Mustard Oil Cake",
+                                          sign * doc["cake_sold_to_shop"],
+                                          sign * doc.get("cake_value", 0))
 
 # ---- Settings ----
 class SettingsBody(BaseModel):
@@ -1319,43 +1488,60 @@ async def delete_exchange(eid: str, user: dict = Depends(require_admin)):
         await db.exchanges.delete_one({"id": eid})
     return {"message": "deleted"}
 
-# ---- Mark as paid ----
+# ---- Record a payment ----
 class PayBody(BaseModel):
     payment_method: str = "Cash"
+    # Omitted means "settle the whole balance", preserving the original
+    # mark-as-paid behaviour for callers that do not send an amount.
+    amount: Optional[float] = None
+    date: Optional[str] = None
 
-async def mark_paid(coll, rid, method):
+async def take_payment(coll, rid, method, amount=None, date=None, party="customer", party_field="customer_name"):
     doc = await db[coll].find_one({"id": rid})
     if not doc:
-        return
-    amt = doc.get("total") or doc.get("total_charge") or 0
-    await db[coll].update_one({"id": rid}, {"$set": {"payment_status": "Paid", "payment_method": method}})
-    await db.invoices.update_one({"ref_id": rid}, {"$set": {"payment_status": "Paid"}})
-    exists = await db.payments.find_one({"ref_id": rid})
-    if amt and not exists:
-        await add_credit("customer", doc.get("customer_name"), amt, doc.get("date"), rid, f"Payment {doc.get('invoice_number','')}")
+        raise HTTPException(status_code=404, detail="Not found")
+    total = doc.get(TOTAL_FIELD.get(coll, "total"), 0) or 0
+    already = await paid_against(rid)
+    balance = round(total - already, 2)
+    if balance <= 0:
+        raise HTTPException(status_code=400, detail="This bill is already settled")
+    amt = balance if amount is None else round(float(amount), 2)
+    if amt <= 0:
+        raise HTTPException(status_code=400, detail="Enter an amount greater than zero")
+    if amt > balance + 0.009:
+        raise HTTPException(status_code=400, detail=f"Balance is only Rs {balance:.2f}")
+    await add_credit(party, doc.get(party_field), amt, date or doc.get("date"), rid,
+                     f"Payment {doc.get('invoice_number', '')}".strip())
+    await db[coll].update_one({"id": rid}, {"$set": {"payment_method": method}})
+    return await sync_payment_state(coll, rid)
+
+async def mark_paid(coll, rid, method):
+    await take_payment(coll, rid, method)
 
 @api_router.patch("/sales/{rid}/pay")
 async def pay_sale(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    await mark_paid("sales", rid, body.payment_method)
-    return {"message": "paid"}
+    state = await take_payment("sales", rid, body.payment_method, body.amount, body.date)
+    await log_audit(user, "Recorded payment", f'sales {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
+    return state
 
 @api_router.patch("/grinding/{rid}/pay")
 async def pay_grinding(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    await mark_paid("grinding", rid, body.payment_method)
-    return {"message": "paid"}
+    state = await take_payment("grinding", rid, body.payment_method, body.amount, body.date)
+    await log_audit(user, "Recorded payment", f'grinding {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
+    return state
 
 @api_router.patch("/oil/{rid}/pay")
 async def pay_oil(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    await mark_paid("oil", rid, body.payment_method)
-    return {"message": "paid"}
+    state = await take_payment("oil", rid, body.payment_method, body.amount, body.date)
+    await log_audit(user, "Recorded payment", f'oil {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
+    return state
 
 @api_router.patch("/purchases/{rid}/pay")
 async def pay_purchase(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    p = await db.purchases.find_one({"id": rid})
-    await db.purchases.update_one({"id": rid}, {"$set": {"payment_status": "Paid"}})
-    if p and not await db.payments.find_one({"ref_id": rid}):
-        await add_credit("supplier", p.get("supplier_name"), p.get("total", 0), p.get("date"), rid, "Purchase payment")
-    return {"message": "paid"}
+    state = await take_payment("purchases", rid, body.payment_method, body.amount, body.date,
+                               party="supplier", party_field="supplier_name")
+    await log_audit(user, "Recorded payment", f'purchase {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
+    return state
 
 # ---- Edit records ----
 @api_router.put("/sales/{sid}")
@@ -1368,7 +1554,8 @@ async def edit_sale(sid: str, body: SaleBody, user: dict = Depends(get_current_u
     await db.sales.update_one({"id": sid}, {"$set": {**body.model_dump(), "total": total}})
     await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": -body.quantity}})
     await db.invoices.update_one({"ref_id": sid}, {"$set": {"customer_name": body.customer_name,
-        "date": body.date, "total": total, "payment_status": body.payment_status}})
+        "date": body.date, "total": total}})
+    await sync_payment_state("sales", sid)
     return clean(await db.sales.find_one({"id": sid}))
 
 @api_router.put("/grinding/{gid}")
@@ -1383,8 +1570,9 @@ async def edit_grinding(gid: str, body: GrindingBody, user: dict = Depends(get_c
     await db.grinding.replace_one({"id": gid}, doc)
     await apply_grinding_effects(doc, 1)
     await db.invoices.update_one({"ref_id": gid}, {"$set": {"customer_name": doc["customer_name"],
-        "date": doc["date"], "total": doc["total_charge"], "payment_status": doc["payment_status"]}})
-    return clean(doc)
+        "date": doc["date"], "total": doc["total_charge"]}})
+    await sync_payment_state("grinding", gid)
+    return clean(await db.grinding.find_one({"id": gid}))
 
 @api_router.put("/oil/{oid}")
 async def edit_oil(oid: str, body: OilBody, user: dict = Depends(get_current_user)):
@@ -1398,8 +1586,9 @@ async def edit_oil(oid: str, body: OilBody, user: dict = Depends(get_current_use
     await db.oil.replace_one({"id": oid}, doc)
     await apply_oil_effects(doc, 1)
     await db.invoices.update_one({"ref_id": oid}, {"$set": {"customer_name": doc["customer_name"],
-        "date": doc["date"], "total": doc["total"], "payment_status": doc["payment_status"]}})
-    return clean(doc)
+        "date": doc["date"], "total": doc["total"]}})
+    await sync_payment_state("oil", oid)
+    return clean(await db.oil.find_one({"id": oid}))
 
 @api_router.put("/expenses/{eid}")
 async def edit_expense(eid: str, body: ExpenseBody, user: dict = Depends(get_current_user)):
@@ -1420,9 +1609,14 @@ async def daybook(date: str, user: dict = Depends(get_current_user)):
     grinding_total = sum(g.get("total_charge", 0) for g in grinding)
     oil_total = sum(o.get("total", 0) for o in oil)
     income = sales_total + grinding_total + oil_total
-    collected = (sum(s.get("total", 0) for s in sales if s.get("payment_status") == "Paid")
-                 + sum(g.get("total_charge", 0) for g in grinding if g.get("payment_status") == "Paid")
-                 + sum(o.get("total", 0) for o in oil if o.get("payment_status") == "Paid"))
+    def taken(d, field):
+        if d.get("amount_paid") is not None:
+            return d.get("amount_paid", 0)
+        return d.get(field, 0) if d.get("payment_status") == "Paid" else 0
+
+    collected = (sum(taken(s, "total") for s in sales)
+                 + sum(taken(g, "total_charge") for g in grinding)
+                 + sum(taken(o, "total") for o in oil))
     exp_total = sum(e.get("amount", 0) for e in expenses)
     return {"date": date, "sales_total": round(sales_total, 2), "grinding_total": round(grinding_total, 2),
             "oil_total": round(oil_total, 2), "income": round(income, 2), "collected": round(collected, 2),
@@ -1481,7 +1675,7 @@ async def delete_maintenance(mid: str, user: dict = Depends(require_admin)):
 
 @api_router.get("/costing")
 async def costing(user: dict = Depends(get_current_user)):
-    finished = {"Flour", "Bran", "Edible Oil", "Oil Cake"}
+    finished = {"Flour", "Bran", "Edible Oil", "Oil Cake", "Masala"}
     rows = []
     for p in await db.products.find().sort("name", 1).to_list(1000):
         if p.get("category") in finished:
@@ -1501,6 +1695,39 @@ async def add_credit(party_type, name, amount, date, ref_id=None, note=""):
         return
     await db.payments.insert_one({"id": str(uuid.uuid4()), "party_type": party_type, "party_name": name,
         "amount": round(amount, 2), "date": date, "note": note, "ref_id": ref_id, "created_at": now_iso()})
+
+# ---------------- Part payment ----------------
+# A bill can be settled over several visits. The payments collection is the
+# single source of truth for how much has come in; amount_paid on the record is
+# a cached sum of it, recomputed rather than incremented so an edit or a
+# repeated call can never double-count.
+
+TOTAL_FIELD = {"sales": "total", "grinding": "total_charge", "oil": "total", "purchases": "total"}
+
+def payment_state(total: float, paid: float) -> str:
+    if paid <= 0:
+        return "Pending"
+    if paid + 0.009 >= (total or 0):
+        return "Paid"
+    return "Partial"
+
+async def paid_against(ref_id: str) -> float:
+    rows = await db.payments.find({"ref_id": ref_id}).to_list(500)
+    return round(sum(r.get("amount", 0) for r in rows), 2)
+
+async def sync_payment_state(coll: str, rid: str) -> dict:
+    """Recompute amount_paid/balance/status for a record from its payments."""
+    doc = await db[coll].find_one({"id": rid})
+    if not doc:
+        return {}
+    total = doc.get(TOTAL_FIELD.get(coll, "total"), 0) or 0
+    paid = await paid_against(rid)
+    status = payment_state(total, paid)
+    await db[coll].update_one({"id": rid}, {"$set": {
+        "amount_paid": paid, "balance_due": round(max(total - paid, 0), 2), "payment_status": status}})
+    await db.invoices.update_one({"ref_id": rid}, {"$set": {
+        "amount_paid": paid, "balance_due": round(max(total - paid, 0), 2), "payment_status": status}})
+    return {"amount_paid": paid, "balance_due": round(max(total - paid, 0), 2), "payment_status": status}
 
 async def log_audit(user, action, detail=""):
     u = user or {}
@@ -1602,21 +1829,26 @@ async def sales_analytics(user: dict = Depends(get_current_user)):
     y = t[:4]
     def rev(prefix):
         return round(sum(s.get("total", 0) for s in sales if str(s.get("date", "")).startswith(prefix)), 2)
+    # Same costing rule as the dashboard, so the two profit figures agree.
+    cost_by_name = {n: p.get("cost_per_unit", 0) or 0 for n, p in products.items()}
     agg = {}
     for s in sales:
         n = s.get("product_name", "?")
-        a = agg.setdefault(n, {"name": n, "qty": 0.0, "revenue": 0.0, "profit": 0.0})
+        a = agg.setdefault(n, {"name": n, "qty": 0.0, "revenue": 0.0, "cogs": 0.0, "profit": 0.0})
         a["qty"] += s.get("quantity", 0)
         a["revenue"] += s.get("total", 0)
-        cost = products.get(n, {}).get("cost_per_unit", 0)
-        a["profit"] += s.get("total", 0) - s.get("quantity", 0) * cost
+        cogs = sale_cogs(s, cost_by_name)
+        a["cogs"] += cogs
+        a["profit"] += s.get("total", 0) - cogs
     rows = sorted(agg.values(), key=lambda r: r["revenue"], reverse=True)
     for r in rows:
         r["qty"] = round(r["qty"], 2)
         r["revenue"] = round(r["revenue"], 2)
+        r["cogs"] = round(r["cogs"], 2)
         r["profit"] = round(r["profit"], 2)
     return {"today": rev(t), "month": rev(m), "year": rev(y),
             "total_revenue": round(sum(s.get("total", 0) for s in sales), 2),
+            "total_cogs": round(sum(r["cogs"] for r in rows), 2),
             "total_profit": round(sum(r["profit"] for r in rows), 2),
             "by_product": rows, "top": rows[:5], "least": rows[-5:][::-1] if rows else []}
 

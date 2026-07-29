@@ -9,11 +9,12 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Download, FileDown, Info, Pencil, CheckCircle2 } from "lucide-react";
+import { Plus, Trash2, Download, FileDown, Info, Pencil, IndianRupee } from "lucide-react";
+import { PaymentDialog } from "@/components/PaymentDialog";
 import { toast } from "sonner";
 
 const SEEDS = ["Mustard", "Groundnut", "Sesame", "Coconut", "Sunflower", "Other"];
-const empty = { date: today(), customer_name: "", seed_type: "Mustard", quantity_received: "", oil_extracted: "", oil_cake_produced: "", charge: "", payment_method: "Cash", retained_oil: "", retained_cake: "", payment_status: "Pending" };
+const empty = { date: today(), customer_name: "", seed_type: "Mustard", quantity_received: "", oil_extracted: "", oil_cake_produced: "", charge: "", payment_method: "Cash", retained_oil: "", retained_cake: "", cake_sold_to_shop: "", cake_rate: "", payment_status: "Pending", amount_paid: "" };
 
 export default function OilExtraction() {
   const oil = useList("/oil");
@@ -23,24 +24,34 @@ export default function OilExtraction() {
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [f, setF] = useState(empty);
+  const [payFor, setPayFor] = useState(null);
 
   const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
   const openEdit = (o) => {
     setEditingId(o.id);
-    setF({ date: o.date, customer_name: o.customer_name, seed_type: o.seed_type, quantity_received: String(o.quantity_received), oil_extracted: String(o.oil_extracted), oil_cake_produced: String(o.oil_cake_produced || ""), charge: String(o.charge), payment_method: o.payment_method || "Cash", retained_oil: String(o.retained_oil || ""), retained_cake: String(o.retained_cake || ""), payment_status: o.payment_status });
+    setF({ date: o.date, customer_name: o.customer_name, seed_type: o.seed_type, quantity_received: String(o.quantity_received), oil_extracted: String(o.oil_extracted), oil_cake_produced: String(o.oil_cake_produced || ""), charge: String(o.charge), payment_method: o.payment_method || "Cash", retained_oil: String(o.retained_oil || ""), retained_cake: String(o.retained_cake || ""), cake_sold_to_shop: String(o.cake_sold_to_shop || ""), cake_rate: String(o.cake_rate || ""), payment_status: o.payment_status, amount_paid: "" });
     setOpen(true);
   };
 
   const save = async () => {
     if (!f.customer_name || !f.quantity_received) return toast.error("Fill all fields");
-    const body = { date: f.date, customer_name: f.customer_name, seed_type: f.seed_type, quantity_received: +f.quantity_received, oil_extracted: +(f.oil_extracted || 0), oil_cake_produced: +(f.oil_cake_produced || 0), charge: +(f.charge || 0), payment_method: f.payment_method, retained_oil: +(f.retained_oil || 0), retained_cake: +(f.retained_cake || 0), payment_status: f.payment_status };
-    if (editingId) { await api.put(`/oil/${editingId}`, body); toast.success("Order updated"); }
-    else { await api.post("/oil", body); toast.success("Oil extraction order recorded"); }
+    const body = { date: f.date, customer_name: f.customer_name, seed_type: f.seed_type, quantity_received: +f.quantity_received, oil_extracted: +(f.oil_extracted || 0), oil_cake_produced: +(f.oil_cake_produced || 0), charge: +(f.charge || 0), payment_method: f.payment_method, retained_oil: +(f.retained_oil || 0), retained_cake: +(f.retained_cake || 0), cake_sold_to_shop: +(f.cake_sold_to_shop || 0), cake_rate: +(f.cake_rate || 0), payment_status: f.payment_status };
+    if (!editingId) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
+    try {
+      if (editingId) { await api.put(`/oil/${editingId}`, body); toast.success("Order updated"); }
+      else { await api.post("/oil", body); toast.success("Oil extraction order recorded"); }
+    } catch (err) {
+      return toast.error(err.response?.data?.detail || "Failed to save");
+    }
     setOpen(false); setEditingId(null); setF(empty);
     oil.load();
   };
 
-  const markPaid = async (o) => { await api.patch(`/oil/${o.id}/pay`, { payment_method: o.payment_method || "Cash" }); toast.success("Marked as paid"); oil.load(); };
+  const cakeValue = (+f.cake_sold_to_shop || 0) * (+f.cake_rate || 0);
+  const netPayable = (+f.charge || 0) - cakeValue;
+  const cakeOver = (+f.retained_cake || 0) + (+f.cake_sold_to_shop || 0) > (+f.oil_cake_produced || 0) + 0.009;
+
+
 
   return (
     <div>
@@ -91,11 +102,36 @@ export default function OilExtraction() {
               {f.payment_method === "Oil" && <div><Label>Oil kept (L)</Label><Input type="number" value={f.retained_oil} onChange={(e) => setF({ ...f, retained_oil: e.target.value })} className="h-11 mt-1" data-testid="oil-retained-oil" /></div>}
               {f.payment_method === "Cake" && <div><Label>Cake kept (kg)</Label><Input type="number" value={f.retained_cake} onChange={(e) => setF({ ...f, retained_cake: e.target.value })} className="h-11 mt-1" data-testid="oil-retained-cake" /></div>}
             </div>
-            <div><Label>Payment Status</Label>
+            <div className="rounded-lg border border-border/60 p-3 space-y-3">
+              <p className="text-sm font-medium">Customer sells cake to the shop</p>
+              <div className="grid grid-cols-2 gap-4">
+                <div><Label>Cake bought (kg)</Label><Input type="number" value={f.cake_sold_to_shop} onChange={(e) => setF({ ...f, cake_sold_to_shop: e.target.value })} className="h-11 mt-1" data-testid="oil-cake-sold" /></div>
+                <div><Label>Rate ₹/kg</Label><Input type="number" value={f.cake_rate} onChange={(e) => setF({ ...f, cake_rate: e.target.value })} className="h-11 mt-1" data-testid="oil-cake-rate" /></div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Charge {money(+f.charge || 0)} − cake {money(cakeValue)} ={" "}
+                <b className={netPayable < 0 ? "text-destructive" : "text-foreground"} data-testid="oil-net">{money(netPayable)}</b>
+                {netPayable < 0 && " — the shop owes the customer this amount"}
+                {cakeOver && <span className="text-destructive"> · only {f.oil_cake_produced || 0} kg of cake was produced</span>}
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Payment Status</Label>
               <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
-                <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
-                <SelectContent><SelectItem value="Paid">Paid</SelectItem><SelectItem value="Pending">Pending</SelectItem></SelectContent>
+                <SelectTrigger className="h-11 mt-1" data-testid="oil-payment-status"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="Paid">Paid in full</SelectItem>
+                  <SelectItem value="Partial">Part payment</SelectItem>
+                  <SelectItem value="Pending">Nothing paid yet</SelectItem>
+                </SelectContent>
               </Select>
+              </div>
+              {!editingId && f.payment_status === "Partial" && (
+                <div><Label>Amount received</Label>
+                  <Input type="number" value={f.amount_paid} onChange={(e) => setF({ ...f, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="oil-amount-paid" />
+                  <p className="text-xs text-muted-foreground mt-1">Balance {money(Math.max(netPayable - (+f.amount_paid || 0), 0))}</p>
+                </div>
+              )}
             </div>
           </div>
           <DialogFooter><Button onClick={save} data-testid="save-oil-btn">{editingId ? "Update" : "Save"} Order</Button></DialogFooter>
@@ -103,6 +139,8 @@ export default function OilExtraction() {
       </Dialog>
 
       <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4 bg-muted/50 rounded-lg p-3"><Info className="h-4 w-4" /> Customer-owned seeds — only retained oil/cake affects shop inventory.</div>
+      <PaymentDialog open={!!payFor} onOpenChange={(o) => !o && setPayFor(null)} record={payFor} path="oil" onDone={() => oil.load()} />
+
       <Card className="border-border/60">
         <Table>
           <TableHeader><TableRow>
@@ -117,9 +155,11 @@ export default function OilExtraction() {
                 <TableCell className="font-medium">{o.customer_name}</TableCell><TableCell>{o.seed_type}</TableCell>
                 <TableCell className="text-right">{o.oil_extracted} L</TableCell><TableCell className="text-right">{o.oil_cake_produced || 0} kg</TableCell>
                 <TableCell><Badge variant="outline">{o.payment_method || "Cash"}</Badge></TableCell>
-                <TableCell className="text-right font-medium">{money(o.charge)}</TableCell><TableCell><StatusBadge status={o.payment_status} /></TableCell>
+                <TableCell className="text-right font-medium">{money(o.total ?? o.charge)}
+                  {o.cake_sold_to_shop > 0 && <span className="block text-[10px] text-muted-foreground">{money(o.charge)} − cake {money(o.cake_value || 0)}</span>}
+                </TableCell><TableCell><StatusBadge status={o.payment_status} balance={o.balance_due} /></TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
-                  {o.payment_status === "Pending" && <Button variant="ghost" size="icon" onClick={() => markPaid(o)} data-testid={`pay-oil-${o.id}`}><CheckCircle2 className="h-4 w-4 text-secondary" /></Button>}
+                  {o.payment_status !== "Paid" && <Button variant="ghost" size="icon" onClick={() => setPayFor(o)} data-testid={`pay-oil-${o.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(o)} data-testid={`edit-oil-${o.id}`}><Pencil className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => downloadFile(`/invoices/${o.id}/pdf`, `${o.invoice_number}.pdf`)} data-testid={`pdf-oil-${o.id}`}><Download className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => oil.remove(o.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>

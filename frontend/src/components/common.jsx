@@ -40,17 +40,21 @@ export function useList(path) {
   return { items, loading, load, create, remove, setItems };
 }
 
-export function StatusBadge({ status }) {
-  const paid = status === "Paid";
+const STATUS_STYLES = {
+  Paid: "bg-secondary/15 text-secondary border-secondary/30 hover:bg-secondary/15",
+  // Amber: part paid is neither settled nor untouched.
+  Partial: "bg-amber-500/15 text-amber-600 border-amber-500/30 hover:bg-amber-500/15 dark:text-amber-400",
+  Pending: "bg-destructive/10 text-destructive border-destructive/30 hover:bg-destructive/10",
+};
+
+export function StatusBadge({ status, balance }) {
   return (
     <Badge
       data-testid={`status-${status}`}
-      className={paid
-        ? "bg-secondary/15 text-secondary border-secondary/30 hover:bg-secondary/15"
-        : "bg-destructive/10 text-destructive border-destructive/30 hover:bg-destructive/10"}
+      className={STATUS_STYLES[status] || STATUS_STYLES.Pending}
       variant="outline"
     >
-      {status}
+      {status === "Partial" && balance != null ? `Partial · ₹${Number(balance).toLocaleString("en-IN")} due` : status}
     </Badge>
   );
 }

@@ -17,7 +17,7 @@ import { toast } from "sonner";
 // Must cover every category the seeded catalogue uses, or those products cannot
 // be created from this form. "Wheat Crop" is the raw grain; "Wheat" was a stale
 // label that matched nothing in the data.
-const CATEGORIES = ["Wheat Crop", "Flour", "Bran", "Oil Seeds", "Edible Oil", "Oil Cake", "Packing", "Other"];
+const CATEGORIES = ["Wheat Crop", "Flour", "Bran", "Oil Seeds", "Edible Oil", "Oil Cake", "Masala", "Packing", "Other"];
 
 // "pcs" and "bag" both appear on packing items — bags bought loose are counted
 // in pieces, bags sold by size are priced per bag.
@@ -25,7 +25,7 @@ const UNITS = ["kg", "litre", "quintal", "bag", "pcs"];
 
 const BLANK_PRODUCT = { name: "", category: "Flour", unit: "kg", current_stock: 0, rate: 0, low_stock_threshold: 50 };
 
-const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid" });
+const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid", amount_paid: "" });
 
 export default function Inventory() {
   const products = useList("/products");
@@ -97,13 +97,14 @@ export default function Inventory() {
 
   const [purOpen, setPurOpen] = useState(false);
   const [editingPurchase, setEditingPurchase] = useState(null);
+  const [payFor, setPayFor] = useState(null);
   const [buf, setBuf] = useState(blankPurchase());
 
   const openNewPurchase = () => { setEditingPurchase(null); setBuf(blankPurchase()); setPurOpen(true); };
   const openEditPurchase = (p) => {
     setEditingPurchase(p.id);
     setBuf({ date: p.date, supplier_name: p.supplier_name, product_id: p.product_id,
-             quantity: String(p.quantity), rate: String(p.rate), payment_status: p.payment_status });
+             quantity: String(p.quantity), rate: String(p.rate), payment_status: p.payment_status, amount_paid: "" });
     setPurOpen(true);
   };
 
@@ -114,6 +115,7 @@ export default function Inventory() {
       date: buf.date, supplier_name: buf.supplier_name, product_id: prod.id, product_name: prod.name,
       quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status,
     };
+    if (!editingPurchase) body.amount_paid = buf.payment_status === "Paid" ? null : (buf.payment_status === "Partial" ? +buf.amount_paid || 0 : 0);
     if (editingPurchase) {
       await api.put(`/purchases/${editingPurchase}`, body);
       toast.success("Purchase updated, stock adjusted");
@@ -232,6 +234,7 @@ export default function Inventory() {
         </TabsContent>
 
         <TabsContent value="purchases">
+          <PaymentDialog open={!!payFor} onOpenChange={(o) => !o && setPayFor(null)} record={payFor} path="purchases" onDone={() => { purchases.load(); }} />
           <div className="flex justify-between items-center mb-4">
             <Input value={pq} onChange={(e) => setPq(e.target.value)} placeholder="Search purchases..." className="h-11 max-w-xs" data-testid="search-purchases" />
             <Button className="h-11 active:scale-95 transition-transform" onClick={openNewPurchase} data-testid="add-purchase-btn"><Plus className="h-4 w-4 mr-1" /> Record Purchase</Button>
@@ -259,11 +262,23 @@ export default function Inventory() {
                     <div><Label>Quantity ({purchaseUnit})</Label><Input type="number" value={buf.quantity} onChange={(e) => setBuf({ ...buf, quantity: e.target.value })} className="h-11 mt-1" data-testid="purchase-qty" /></div>
                     <div><Label>Rate ₹/{purchaseUnit}</Label><Input type="number" value={buf.rate} onChange={(e) => setBuf({ ...buf, rate: e.target.value })} className="h-11 mt-1" data-testid="purchase-rate" /></div>
                   </div>
-                  <div><Label>Payment</Label>
-                    <Select value={buf.payment_status} onValueChange={(v) => setBuf({ ...buf, payment_status: v })}>
-                      <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
-                      <SelectContent><SelectItem value="Paid">Paid</SelectItem><SelectItem value="Pending">Pending</SelectItem></SelectContent>
-                    </Select>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div><Label>Payment</Label>
+                      <Select value={buf.payment_status} onValueChange={(v) => setBuf({ ...buf, payment_status: v })}>
+                        <SelectTrigger className="h-11 mt-1" data-testid="purchase-payment"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="Paid">Paid in full</SelectItem>
+                          <SelectItem value="Partial">Part payment</SelectItem>
+                          <SelectItem value="Pending">Nothing paid yet</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    {!editingPurchase && buf.payment_status === "Partial" && (
+                      <div><Label>Amount paid</Label>
+                        <Input type="number" value={buf.amount_paid} onChange={(e) => setBuf({ ...buf, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="purchase-amount-paid" />
+                        <p className="text-xs text-muted-foreground mt-1">Balance {money(Math.max((+buf.quantity || 0) * (+buf.rate || 0) - (+buf.amount_paid || 0), 0))}</p>
+                      </div>
+                    )}
                   </div>
                   <p className="text-sm text-muted-foreground">Total: <span className="font-bold text-foreground">{money((+buf.quantity || 0) * (+buf.rate || 0))}</span></p>
                 </div>
@@ -283,8 +298,9 @@ export default function Inventory() {
                   <TableRow key={p.id} className="hover:bg-muted/50">
                     <TableCell>{p.date}</TableCell><TableCell>{p.supplier_name}</TableCell><TableCell>{p.product_name}</TableCell>
                     <TableCell className="text-right">{p.quantity} {unitOf(p.product_id)}</TableCell><TableCell className="text-right">{money(p.rate)}</TableCell>
-                    <TableCell className="text-right font-medium">{money(p.total)}</TableCell><TableCell><StatusBadge status={p.payment_status} /></TableCell>
+                    <TableCell className="text-right font-medium">{money(p.total)}</TableCell><TableCell><StatusBadge status={p.payment_status} balance={p.balance_due} /></TableCell>
                     <TableCell className="text-right flex gap-1 justify-end">
+                      {p.payment_status !== "Paid" && <Button variant="ghost" size="icon" onClick={() => setPayFor(p)} data-testid={`pay-purchase-${p.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                       <Button variant="ghost" size="icon" onClick={() => openEditPurchase(p)} data-testid={`edit-purchase-${p.id}`}><Pencil className="h-4 w-4" /></Button>
                       <Button variant="ghost" size="icon" onClick={() => purchases.remove(p.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                     </TableCell>

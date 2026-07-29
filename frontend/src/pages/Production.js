@@ -12,10 +12,14 @@ import { Badge } from "@/components/ui/badge";
 import { Plus, Trash2, ArrowRight, Pencil } from "lucide-react";
 import { toast } from "sonner";
 
+// Each mill names its input and outputs; applyMill resolves them against the
+// product catalogue, so every name here must exist as a product.
 const MILL_CONFIG = {
   Flour: { input: "Wheat Crop", outputs: ["Atta", "Wheat Bran"] },
   Oil: { input: "Mustard Seeds", outputs: ["Mustard Oil", "Mustard Oil Cake"] },
   Sattu: { input: "Wheat Crop", outputs: ["Sattu"] },
+  Besan: { input: "Gram (Chana)", outputs: ["Besan"] },
+  Masala: { input: "Whole Spices", outputs: ["Masala"] },
 };
 
 export default function Production() {
