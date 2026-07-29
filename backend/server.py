@@ -512,6 +512,7 @@ class PurchaseBody(BaseModel):
     payment_status: str = "Paid"
     # Blank means "settled in full"; any number records a part payment.
     amount_paid: Optional[float] = None
+    payment_mode: str = "Cash"
     # Only used when a purchase creates the product.
     unit: Optional[str] = None
     category: Optional[str] = None
@@ -561,7 +562,7 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
     await db.purchases.insert_one(doc)
     await add_stock_with_cost(prod["id"], body.quantity, total)
     received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
-    await add_credit("supplier", body.supplier_name, min(received, total), body.date, doc["id"], f"Purchase {body.product_name}")
+    await add_credit("supplier", body.supplier_name, min(received, total), body.date, doc["id"], f"Purchase {body.product_name}", mode=body.payment_mode)
     await sync_payment_state("purchases", doc["id"])
     doc = await db.purchases.find_one({"id": doc["id"]})
     await log_audit(user, "Created purchase", f'{body.supplier_name} · {prod["name"]} {body.quantity} {prod.get("unit", "kg")} · Rs {total}')
@@ -606,6 +607,7 @@ class SaleBody(BaseModel):
     price: float
     payment_status: str = "Paid"
     amount_paid: Optional[float] = None
+    payment_mode: str = "Cash"
 
 async def product_cost(product_id: str) -> float:
     p = await db.products.find_one({"id": product_id})
@@ -645,7 +647,7 @@ async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
         "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
         "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
     received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
-    await add_credit("customer", body.customer_name, min(received, total), body.date, doc["id"], f"Cash sale {inv}")
+    await add_credit("customer", body.customer_name, min(received, total), body.date, doc["id"], f"Sale {inv}", mode=body.payment_mode)
     await sync_payment_state("sales", doc["id"])
     doc = await db.sales.find_one({"id": doc["id"]})
     await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
@@ -680,6 +682,7 @@ class GrindingBody(BaseModel):
     grain_fee_kg: float = 0
     payment_status: str = "Pending"
     amount_paid: Optional[float] = None
+    payment_mode: str = "Cash"
 
 @api_router.get("/grinding")
 async def get_grinding(user: dict = Depends(get_current_user)):
@@ -695,7 +698,7 @@ async def create_grinding(body: GrindingBody, user: dict = Depends(get_current_u
         "total": doc["total_charge"], "payment_status": doc["payment_status"], "created_at": now_iso()})
     charge = doc["total_charge"]
     received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
-    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}")
+    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}", mode=body.payment_mode)
     await sync_payment_state("grinding", doc["id"])
     doc = await db.grinding.find_one({"id": doc["id"]})
     return clean(doc)
@@ -732,6 +735,7 @@ class OilBody(BaseModel):
     cake_rate: float = 0
     payment_status: str = "Pending"
     amount_paid: Optional[float] = None
+    payment_mode: str = "Cash"
 
 @api_router.get("/oil")
 async def get_oil(user: dict = Depends(get_current_user)):
@@ -746,8 +750,14 @@ async def create_oil(body: OilBody, user: dict = Depends(get_current_user)):
         "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
         "total": doc["total"], "payment_status": doc["payment_status"], "created_at": now_iso()})
     charge = doc["total"]
-    received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
-    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Oil {doc['invoice_number']}")
+    if charge < 0:
+        # The cake is worth more than the grinding: hand the difference over.
+        # Recorded at once, because the customer leaves with the cash.
+        await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
+                         f"Paid to customer · Oil {doc['invoice_number']}", kind="refund", mode=body.payment_mode)
+    else:
+        received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
+        await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Oil {doc['invoice_number']}", mode=body.payment_mode)
     await sync_payment_state("oil", doc["id"])
     doc = await db.oil.find_one({"id": doc["id"]})
     return clean(doc)
@@ -995,14 +1005,20 @@ async def dashboard(user: dict = Depends(get_current_user)):
     # what is still owed. Records written before part payment existed have no
     # balance_due, so fall back to the total when the status is not Paid.
     def owed(d, field):
+        # A negative settlement is money the shop paid out, not a receivable.
+        # max(...,0) keeps it out of Pending in both directions: it neither adds
+        # to the figure nor quietly cancels a genuine debt from another bill.
+        if (d.get(field, 0) or 0) < 0:
+            return 0
         if d.get("balance_due") is not None:
-            return d.get("balance_due", 0)
-        return 0 if d.get("payment_status") == "Paid" else d.get(field, 0)
+            return max(d.get("balance_due", 0), 0)
+        return 0 if d.get("payment_status") == "Paid" else max(d.get(field, 0), 0)
 
     pending_customer = 0.0
     for coll, field in [(sales, "total"), (grinding, "total_charge"), (oil, "total")]:
         pending_customer += sum(owed(d, field) for d in coll)
     supplier_dues = sum(owed(p, "total") for p in purchases)
+    paid_to_customers = round(sum(abs(d.get("total", 0)) for d in oil if (d.get("total", 0) or 0) < 0), 2)
 
     low_stock = [{"name": p["name"], "stock": p.get("current_stock", 0), "threshold": p.get("low_stock_threshold", 0), "unit": p.get("unit", "kg")}
                  for p in products if p.get("current_stock", 0) <= p.get("low_stock_threshold", 0)]
@@ -1034,6 +1050,8 @@ async def dashboard(user: dict = Depends(get_current_user)):
         "monthly_income": round(monthly_income, 2),
         "pending_customer": round(pending_customer, 2),
         "supplier_dues": round(supplier_dues, 2),
+        # Money handed back to customers when a by-product outweighed the charge.
+        "paid_to_customers": paid_to_customers,
         "inventory_count": len(products),
         "total_stock": round(sum(p.get("current_stock", 0) for p in products), 2),
         "low_stock": low_stock,
@@ -1057,6 +1075,7 @@ async def notifications(user: dict = Depends(get_current_user)):
                           "message": f'Low stock: {p["name"]} ({p.get("current_stock",0)} {p.get("unit","kg")} left)'})
     for coll, field, label in [("sales", "total", "sale"), ("grinding", "total_charge", "grinding"), ("oil", "total", "oil extraction")]:
         docs = await db[coll].find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000)
+        docs = [d for d in docs if (d.get(field, 0) or 0) > 0]
         for d in docs:
             due = d.get("balance_due", d.get(field, 0))
             part = " (part paid)" if d.get("payment_status") == "Partial" else ""
@@ -1571,7 +1590,7 @@ async def take_payment(coll, rid, method, amount=None, date=None, party="custome
     if amt > balance + 0.009:
         raise HTTPException(status_code=400, detail=f"Balance is only Rs {balance:.2f}")
     await add_credit(party, doc.get(party_field), amt, date or doc.get("date"), rid,
-                     f"Payment {doc.get('invoice_number', '')}".strip())
+                     f"Payment {doc.get('invoice_number', '')}".strip(), mode=method)
     await db[coll].update_one({"id": rid}, {"$set": {"payment_method": method}})
     return await sync_payment_state(coll, rid)
 
@@ -1750,11 +1769,33 @@ async def costing(user: dict = Depends(get_current_user)):
 
 # ==================== Ledger, Cash Book, Analytics, Audit ====================
 
-async def add_credit(party_type, name, amount, date, ref_id=None, note=""):
+# How the money moved. Only Cash touches the drawer; UPI and Bank settle into
+# the account, so the cash book has to tell them apart or Cash in Hand drifts
+# up by every digital payment ever taken.
+PAYMENT_MODES = ("Cash", "UPI", "Bank")
+
+def clean_mode(mode) -> str:
+    m = (mode or "Cash").strip().title()
+    if m.upper() == "UPI":
+        return "UPI"
+    return m if m in PAYMENT_MODES else "Cash"
+
+async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind="receipt", mode="Cash"):
+    """Record money moving against a party.
+
+    A negative amount on a customer is money paid out to them, which keeps the
+    ledger arithmetic honest: outstanding is debits minus credits, so a -138
+    credit against a -138 bill settles to zero. `kind` marks it as a refund so
+    the cash book can report it as an outflow rather than negative income.
+
+    `mode` is stored per payment, not per bill: a customer can settle half in
+    cash today and half by UPI next week, and the cash book needs both.
+    """
     if not amount:
         return
     await db.payments.insert_one({"id": str(uuid.uuid4()), "party_type": party_type, "party_name": name,
-        "amount": round(amount, 2), "date": date, "note": note, "ref_id": ref_id, "created_at": now_iso()})
+        "amount": round(amount, 2), "date": date, "note": note, "ref_id": ref_id,
+        "kind": kind, "payment_mode": clean_mode(mode), "created_at": now_iso()})
 
 # ---------------- Part payment ----------------
 # A bill can be settled over several visits. The payments collection is the
@@ -1765,6 +1806,11 @@ async def add_credit(party_type, name, amount, date, ref_id=None, note=""):
 TOTAL_FIELD = {"sales": "total", "grinding": "total_charge", "oil": "total", "purchases": "total"}
 
 def payment_state(total: float, paid: float) -> str:
+    # A negative total means the by-product the customer sold us is worth more
+    # than the service charge, so the shop hands cash over instead of taking it.
+    # That is not a debt owed to us and must never read Pending.
+    if (total or 0) < 0:
+        return "Paid to Customer"
     if paid <= 0:
         return "Pending"
     if paid + 0.009 >= (total or 0):
@@ -1783,11 +1829,17 @@ async def sync_payment_state(coll: str, rid: str) -> dict:
     total = doc.get(TOTAL_FIELD.get(coll, "total"), 0) or 0
     paid = await paid_against(rid)
     status = payment_state(total, paid)
-    await db[coll].update_one({"id": rid}, {"$set": {
-        "amount_paid": paid, "balance_due": round(max(total - paid, 0), 2), "payment_status": status}})
-    await db.invoices.update_one({"ref_id": rid}, {"$set": {
-        "amount_paid": paid, "balance_due": round(max(total - paid, 0), 2), "payment_status": status}})
-    return {"amount_paid": paid, "balance_due": round(max(total - paid, 0), 2), "payment_status": status}
+    # paid_to_customer carries the amount owed the other way, so the UI has a
+    # positive figure to show and nothing has to infer it from a negative total.
+    state = {
+        "amount_paid": paid,
+        "balance_due": round(max(total - paid, 0), 2) if total >= 0 else 0.0,
+        "paid_to_customer": round(abs(total), 2) if total < 0 else 0.0,
+        "payment_status": status,
+    }
+    await db[coll].update_one({"id": rid}, {"$set": state})
+    await db.invoices.update_one({"ref_id": rid}, {"$set": state})
+    return state
 
 async def log_audit(user, action, detail=""):
     u = user or {}
@@ -1866,18 +1918,28 @@ async def cashbook(date: str, user: dict = Depends(get_current_user)):
     starting = settings.get("starting_cash", 0) or 0
     payments = await db.payments.find().to_list(20000)
     expenses = await db.expenses.find().to_list(20000)
-    cust_in = [p for p in payments if p.get("party_type") == "customer"]
+    # Customer rows with a negative amount are cash handed back, so split them
+    # out rather than letting them net against receipts and read as less income.
+    cust_rows = [p for p in payments if p.get("party_type") == "customer"]
+    cust_in = [p for p in cust_rows if p.get("amount", 0) >= 0]
+    cust_refund = [p for p in cust_rows if p.get("amount", 0) < 0]
     supp_out = [p for p in payments if p.get("party_type") == "supplier"]
     def before(items):
         return [i for i in items if str(i.get("date", "")) < date]
     def on(items):
         return [i for i in items if str(i.get("date", "")) == date]
-    opening = starting + sum(p["amount"] for p in before(cust_in)) - sum(p["amount"] for p in before(supp_out)) - sum(e.get("amount", 0) for e in before(expenses))
+    opening = (starting
+               + sum(p["amount"] for p in before(cust_in))
+               - sum(abs(p["amount"]) for p in before(cust_refund))
+               - sum(p["amount"] for p in before(supp_out))
+               - sum(e.get("amount", 0) for e in before(expenses)))
     in_today = sum(p["amount"] for p in on(cust_in))
+    refund_today = sum(abs(p["amount"]) for p in on(cust_refund))
     supp_today = sum(p["amount"] for p in on(supp_out))
     exp_today = sum(e.get("amount", 0) for e in on(expenses))
-    closing = opening + in_today - supp_today - exp_today
+    closing = opening + in_today - refund_today - supp_today - exp_today
     return {"date": date, "opening": round(opening, 2), "payments_received": round(in_today, 2),
+            "paid_to_customers": round(refund_today, 2),
             "supplier_payments": round(supp_today, 2), "expenses": round(exp_today, 2), "closing": round(closing, 2)}
 
 @api_router.get("/sales-analytics")

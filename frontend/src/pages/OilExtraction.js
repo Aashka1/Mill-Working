@@ -117,24 +117,38 @@ export default function OilExtraction() {
                 {cakeOver && <span className="text-destructive"> · only {f.oil_cake_produced || 0} kg of cake was produced</span>}
               </p>
             </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div><Label>Payment Status</Label>
-              <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
-                <SelectTrigger className="h-11 mt-1" data-testid="oil-payment-status"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Paid">Paid in full</SelectItem>
-                  <SelectItem value="Partial">Part payment</SelectItem>
-                  <SelectItem value="Pending">Nothing paid yet</SelectItem>
-                </SelectContent>
-              </Select>
+            {netPayable < 0 ? (
+              // Nothing to collect: the cake outweighed the charge, so the shop
+              // pays out. Offering Paid/Partial/Pending here would be nonsense.
+              <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3" data-testid="oil-payout-notice">
+                <p className="text-sm font-semibold text-blue-600 dark:text-blue-400">
+                  Paid to Customer · {money(Math.abs(netPayable))}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  The cake is worth more than the grinding, so this leaves the cash drawer.
+                  It is recorded as money paid out, not as anything owed to the shop.
+                </p>
               </div>
-              {!editingId && f.payment_status === "Partial" && (
-                <div><Label>Amount received</Label>
-                  <Input type="number" value={f.amount_paid} onChange={(e) => setF({ ...f, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="oil-amount-paid" />
-                  <p className="text-xs text-muted-foreground mt-1">Balance {money(Math.max(netPayable - (+f.amount_paid || 0), 0))}</p>
+            ) : (
+              <div className="grid grid-cols-2 gap-4">
+                <div><Label>Payment Status</Label>
+                <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
+                  <SelectTrigger className="h-11 mt-1" data-testid="oil-payment-status"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="Paid">Paid in full</SelectItem>
+                    <SelectItem value="Partial">Part payment</SelectItem>
+                    <SelectItem value="Pending">Nothing paid yet</SelectItem>
+                  </SelectContent>
+                </Select>
                 </div>
-              )}
-            </div>
+                {!editingId && f.payment_status === "Partial" && (
+                  <div><Label>Amount received</Label>
+                    <Input type="number" value={f.amount_paid} onChange={(e) => setF({ ...f, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="oil-amount-paid" />
+                    <p className="text-xs text-muted-foreground mt-1">Balance {money(Math.max(netPayable - (+f.amount_paid || 0), 0))}</p>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
           <DialogFooter><Button onClick={save} data-testid="save-oil-btn">{editingId ? "Update" : "Save"} Order</Button></DialogFooter>
         </DialogContent>
@@ -159,9 +173,9 @@ export default function OilExtraction() {
                 <TableCell><Badge variant="outline">{o.payment_method || "Cash"}</Badge></TableCell>
                 <TableCell className="text-right font-medium">{money(o.total ?? o.charge)}
                   {o.cake_sold_to_shop > 0 && <span className="block text-[10px] text-muted-foreground">{money(o.charge)} − cake {money(o.cake_value || 0)}</span>}
-                </TableCell><TableCell><StatusBadge status={o.payment_status} balance={o.balance_due} /></TableCell>
+                </TableCell><TableCell><StatusBadge status={o.payment_status} balance={o.balance_due} paidToCustomer={o.paid_to_customer} /></TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
-                  {o.payment_status !== "Paid" && <Button variant="ghost" size="icon" onClick={() => setPayFor(o)} data-testid={`pay-oil-${o.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
+                  {o.payment_status !== "Paid" && o.payment_status !== "Paid to Customer" && <Button variant="ghost" size="icon" onClick={() => setPayFor(o)} data-testid={`pay-oil-${o.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(o)} data-testid={`edit-oil-${o.id}`}><Pencil className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => downloadFile(`/invoices/${o.id}/pdf`, `${o.invoice_number}.pdf`)} data-testid={`pdf-oil-${o.id}`}><Download className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => oil.remove(o.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>

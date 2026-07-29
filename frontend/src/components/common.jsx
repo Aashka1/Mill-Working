@@ -45,16 +45,23 @@ const STATUS_STYLES = {
   // Amber: part paid is neither settled nor untouched.
   Partial: "bg-amber-500/15 text-amber-600 border-amber-500/30 hover:bg-amber-500/15 dark:text-amber-400",
   Pending: "bg-destructive/10 text-destructive border-destructive/30 hover:bg-destructive/10",
+  // Blue, deliberately not red: cash went out, but nothing is owed or overdue.
+  "Paid to Customer": "bg-blue-500/15 text-blue-600 border-blue-500/30 hover:bg-blue-500/15 dark:text-blue-400",
 };
 
-export function StatusBadge({ status, balance }) {
+const inr = (n) => `₹${Number(n).toLocaleString("en-IN")}`;
+
+export function StatusBadge({ status, balance, paidToCustomer }) {
+  let label = status;
+  if (status === "Partial" && balance != null) label = `Partial · ${inr(balance)} due`;
+  if (status === "Paid to Customer" && paidToCustomer) label = `Paid to Customer · ${inr(paidToCustomer)}`;
   return (
     <Badge
       data-testid={`status-${status}`}
       className={STATUS_STYLES[status] || STATUS_STYLES.Pending}
       variant="outline"
     >
-      {status === "Partial" && balance != null ? `Partial · ₹${Number(balance).toLocaleString("en-IN")} due` : status}
+      {label}
     </Badge>
   );
 }
