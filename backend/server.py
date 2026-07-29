@@ -503,13 +503,48 @@ class PurchaseBody(BaseModel):
     date: str
     supplier_id: Optional[str] = None
     supplier_name: str
-    product_id: str
+    # Blank when buying something not yet in the catalogue; the product is then
+    # resolved (or created) from product_name.
+    product_id: str = ""
     product_name: str
     quantity: float
     rate: float
     payment_status: str = "Paid"
     # Blank means "settled in full"; any number records a part payment.
     amount_paid: Optional[float] = None
+    # Only used when a purchase creates the product.
+    unit: Optional[str] = None
+    category: Optional[str] = None
+
+
+async def resolve_purchase_product(body: "PurchaseBody") -> dict:
+    """The product a purchase stocks, creating it when the item is new.
+
+    Buying something always has to land somewhere. Matching on id alone meant a
+    stale or merged-away id silently moved no stock at all — the purchase was
+    recorded and the shelf figure never changed. So fall back to the name, and
+    if the mill has genuinely bought something new, add it to the catalogue with
+    this quantity rather than dropping it.
+    """
+    if body.product_id:
+        p = await db.products.find_one({"id": body.product_id})
+        if p:
+            return p
+    name = (body.product_name or "").strip()
+    key = product_key(name)
+    if not key:
+        raise HTTPException(status_code=400, detail="Select a product or enter a name for it")
+    p = await db.products.find_one({"name_key": key})
+    if p:
+        return p
+    doc = {"id": str(uuid.uuid4()), "name": name, "name_key": key,
+           "category": (body.category or "Other").strip() or "Other",
+           "unit": (body.unit or "kg").strip() or "kg",
+           "current_stock": 0, "cost_per_unit": 0, "rate": 0,
+           "low_stock_threshold": 0, "created_at": now_iso()}
+    await db.products.insert_one(doc)
+    logger.info("Purchase created new product %r", name)
+    return doc
 
 @api_router.get("/purchases")
 async def get_purchases(user: dict = Depends(get_current_user)):
@@ -518,14 +553,18 @@ async def get_purchases(user: dict = Depends(get_current_user)):
 @api_router.post("/purchases")
 async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_user)):
     total = round(body.quantity * body.rate, 2)
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "created_at": now_iso()}
+    prod = await resolve_purchase_product(body)
+    fields = body.model_dump(exclude={"unit", "category"})
+    # Store the resolved ids so the row always points at the product it stocked.
+    fields.update({"product_id": prod["id"], "product_name": prod["name"]})
+    doc = {"id": str(uuid.uuid4()), **fields, "total": total, "created_at": now_iso()}
     await db.purchases.insert_one(doc)
-    await add_stock_with_cost(body.product_id, body.quantity, total)
+    await add_stock_with_cost(prod["id"], body.quantity, total)
     received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
     await add_credit("supplier", body.supplier_name, min(received, total), body.date, doc["id"], f"Purchase {body.product_name}")
     await sync_payment_state("purchases", doc["id"])
     doc = await db.purchases.find_one({"id": doc["id"]})
-    await log_audit(user, "Created purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
+    await log_audit(user, "Created purchase", f'{body.supplier_name} · {prod["name"]} {body.quantity} {prod.get("unit", "kg")} · Rs {total}')
     return clean(doc)
 
 @api_router.put("/purchases/{pid}")
@@ -537,10 +576,13 @@ async def edit_purchase(pid: str, body: PurchaseBody, user: dict = Depends(get_c
     # editing a purchase cannot double-count or strand stock on the old product.
     await add_stock_with_cost(old["product_id"], -old["quantity"], -old.get("total", 0))
     total = round(body.quantity * body.rate, 2)
-    await db.purchases.update_one({"id": pid}, {"$set": {**body.model_dump(), "total": total}})
-    await add_stock_with_cost(body.product_id, body.quantity, total)
+    prod = await resolve_purchase_product(body)
+    fields = body.model_dump(exclude={"unit", "category"})
+    fields.update({"product_id": prod["id"], "product_name": prod["name"]})
+    await db.purchases.update_one({"id": pid}, {"$set": {**fields, "total": total}})
+    await add_stock_with_cost(prod["id"], body.quantity, total)
     await sync_payment_state("purchases", pid)
-    await log_audit(user, "Edited purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
+    await log_audit(user, "Edited purchase", f'{body.supplier_name} · {prod["name"]} {body.quantity} {prod.get("unit", "kg")} · Rs {total}')
     return clean(await db.purchases.find_one({"id": pid}))
 
 @api_router.delete("/purchases/{pid}")
@@ -1243,6 +1285,10 @@ async def add_stock_by_name_with_cost(name, qty, total_cost):
 async def add_stock_with_cost(pid, qty, total_cost):
     p = await db.products.find_one({"id": pid})
     if not p:
+        # Returning quietly here is how a purchase could be recorded against a
+        # stale id while the shelf figure never moved. Callers resolve the
+        # product first; this is the last line of defence and must be visible.
+        logger.warning("Stock move of %s skipped: no product with id %r", qty, pid)
         return
     old_stock = p.get("current_stock", 0)
     old_cost = p.get("cost_per_unit", 0)

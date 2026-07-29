@@ -25,7 +25,10 @@ const UNITS = ["kg", "litre", "quintal", "bag", "pcs"];
 
 const BLANK_PRODUCT = { name: "", category: "Flour", unit: "kg", current_stock: 0, rate: 0, low_stock_threshold: 50 };
 
-const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid", amount_paid: "" });
+// Sentinel for the "buying something new" row in the product dropdown.
+const NEW_PRODUCT = "__new_product__";
+
+const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid", amount_paid: "", new_name: "", new_category: "Other", new_unit: "kg" });
 
 export default function Inventory() {
   const products = useList("/products");
@@ -100,6 +103,8 @@ export default function Inventory() {
   const [payFor, setPayFor] = useState(null);
   const [buf, setBuf] = useState(blankPurchase());
 
+  const buyingNew = buf.product_id === NEW_PRODUCT;
+
   const openNewPurchase = () => { setEditingPurchase(null); setBuf(blankPurchase()); setPurOpen(true); };
   const openEditPurchase = (p) => {
     setEditingPurchase(p.id);
@@ -110,11 +115,15 @@ export default function Inventory() {
 
   const savePurchase = async () => {
     const prod = products.items.find((p) => p.id === buf.product_id);
-    if (!prod || !buf.supplier_name || !buf.quantity || !buf.rate) return toast.error("Fill all fields");
-    const body = {
-      date: buf.date, supplier_name: buf.supplier_name, product_id: prod.id, product_name: prod.name,
-      quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status,
-    };
+    if (!buf.supplier_name || !buf.quantity || !buf.rate) return toast.error("Fill all fields");
+    if (!prod && !buyingNew) return toast.error("Select a product");
+    if (buyingNew && !buf.new_name.trim()) return toast.error("Enter a name for the new item");
+    const body = buyingNew
+      ? { date: buf.date, supplier_name: buf.supplier_name, product_id: "", product_name: buf.new_name.trim(),
+          unit: buf.new_unit, category: buf.new_category,
+          quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status }
+      : { date: buf.date, supplier_name: buf.supplier_name, product_id: prod.id, product_name: prod.name,
+          quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status };
     if (!editingPurchase) body.amount_paid = buf.payment_status === "Paid" ? null : (buf.payment_status === "Partial" ? +buf.amount_paid || 0 : 0);
     if (editingPurchase) {
       await api.put(`/purchases/${editingPurchase}`, body);
@@ -129,7 +138,7 @@ export default function Inventory() {
     products.load(); purchases.load();
   };
 
-  const purchaseUnit = unitOf(buf.product_id, "unit");
+  const purchaseUnit = buyingNew ? buf.new_unit : unitOf(buf.product_id, "unit");
 
   return (
     <div>
@@ -255,8 +264,32 @@ export default function Inventory() {
                   <div><Label>Product</Label>
                     <Select value={buf.product_id} onValueChange={(v) => setBuf({ ...buf, product_id: v })}>
                       <SelectTrigger className="h-11 mt-1" data-testid="purchase-product"><SelectValue placeholder="Select product" /></SelectTrigger>
-                      <SelectContent>{products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}</SelectContent>
+                      <SelectContent>
+                        {products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}
+                        {/* Last in the list, so the catalogue stays on top. */}
+                        <SelectItem value={NEW_PRODUCT}>＋ Buying something new…</SelectItem>
+                      </SelectContent>
                     </Select>
+                    {buyingNew && (
+                      <div className="mt-3 rounded-lg border border-border/60 p-3 space-y-3">
+                        <p className="text-xs text-muted-foreground">It is added to Current Stock with this quantity.</p>
+                        <div className="grid grid-cols-3 gap-3">
+                          <div><Label>Item name</Label><Input value={buf.new_name} onChange={(e) => setBuf({ ...buf, new_name: e.target.value })} className="h-11 mt-1" data-testid="purchase-new-name" /></div>
+                          <div><Label>Category</Label>
+                            <Select value={buf.new_category} onValueChange={(v) => setBuf({ ...buf, new_category: v })}>
+                              <SelectTrigger className="h-11 mt-1" data-testid="purchase-new-category"><SelectValue /></SelectTrigger>
+                              <SelectContent>{CATEGORIES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                            </Select>
+                          </div>
+                          <div><Label>Unit</Label>
+                            <Select value={buf.new_unit} onValueChange={(v) => setBuf({ ...buf, new_unit: v })}>
+                              <SelectTrigger className="h-11 mt-1" data-testid="purchase-new-unit"><SelectValue /></SelectTrigger>
+                              <SelectContent>{UNITS.map((u) => <SelectItem key={u} value={u}>{u}</SelectItem>)}</SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <div><Label>Quantity ({purchaseUnit})</Label><Input type="number" value={buf.quantity} onChange={(e) => setBuf({ ...buf, quantity: e.target.value })} className="h-11 mt-1" data-testid="purchase-qty" /></div>
