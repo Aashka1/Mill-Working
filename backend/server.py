@@ -12,7 +12,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -1177,6 +1178,10 @@ async def sales_analytics(user: dict = Depends(get_current_user)):
             "total_profit": round(sum(r["profit"] for r in rows), 2),
             "by_product": rows, "top": rows[:5], "least": rows[-5:][::-1] if rows else []}
 
+@api_router.get("/health")
+async def health():
+    return {"status": "ok"}
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -1186,6 +1191,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------- Static frontend ----------------
+# In production the React build is copied to backend/static. Serving it from this
+# same process keeps the app single-origin, which matters because auth is
+# cookie-only: on a split frontend/backend deploy the auth cookie would be a
+# third-party cookie and Safari would drop it. No-op in local dev, where CRA
+# serves the frontend on :3000 and the block below is skipped.
+STATIC_DIR = ROOT_DIR / "static"
+
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR / "static"), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # Unmatched /api paths are a 404, not the SPA shell.
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        index = STATIC_DIR / "index.html"
+        if full_path:
+            candidate = (STATIC_DIR / full_path).resolve()
+            # Keep path traversal (../../etc/passwd) inside the build directory.
+            if candidate.is_file() and candidate.is_relative_to(STATIC_DIR.resolve()):
+                return FileResponse(candidate)
+        return FileResponse(index)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

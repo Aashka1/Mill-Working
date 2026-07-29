@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: agrimill
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Paste your MongoDB Atlas SRV string. Must include a database name and
+      # retryWrites=true&w=majority.
+      - key: MONGO_URL
+        sync: false
+      - key: DB_NAME
+        value: agrimill
+      # Generated once by Render and kept stable across deploys. Changing it
+      # invalidates every issued session token.
+      - key: JWT_SECRET
+        generateValue: true
+      # First-boot admin account. Set a real password — the app is public and
+      # the code falls back to admin@agrimill.com / admin123 if these are unset.
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
