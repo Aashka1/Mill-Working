@@ -1,0 +1,121 @@
+{
+  "theme": "hybrid_fullstack",
+  "project_name": "AgriMill Hub",
+  "design_philosophy": "Earthy & Organic Dashboard (Archetype 1) meets High-Density SaaS SaaSFrame patterns. The interface must feel tactile, grounded, and highly legible, avoiding the cold 'generic tech SaaS' look. Color is used for meaning (status, hierarchy) rather than pure ornament. Sharp contrasts, generous padding, and modular grid logic dictate the layout.",
+  "typography": {
+    "headings": {
+      "family": "'Cabinet Grotesk', sans-serif",
+      "import_url": "https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@800,500,700,400,900&display=swap",
+      "usage_rules": "Use for all H1-H4. Must use tracking-tight (tight letter spacing). Never center by default."
+    },
+    "body": {
+      "family": "'Figtree', sans-serif",
+      "import_url": "https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;500;600;700&display=swap",
+      "usage_rules": "Clean, highly legible geometric body text. Use for tables, forms, and paragraphs. Set leading-relaxed for body, leading-none for headers."
+    }
+  },
+  "colors": {
+    "light": {
+      "background": "40 20% 98%", 
+      "foreground": "35 12% 15%", 
+      "card": "0 0% 100%",
+      "card_foreground": "35 12% 15%",
+      "popover": "0 0% 100%",
+      "popover_foreground": "35 12% 15%",
+      "primary": "38 92% 37%",
+      "primary_foreground": "0 0% 100%",
+      "secondary": "84 79% 27%",
+      "secondary_foreground": "0 0% 100%",
+      "muted": "40 25% 93%",
+      "muted_foreground": "35 12% 45%",
+      "accent": "40 25% 93%",
+      "accent_foreground": "35 12% 15%",
+      "destructive": "0 84.2% 60.2%",
+      "destructive_foreground": "0 0% 100%",
+      "border": "40 20% 88%",
+      "input": "40 20% 88%",
+      "ring": "38 92% 37%"
+    },
+    "dark": {
+      "background": "35 13% 9%", 
+      "foreground": "40 20% 98%", 
+      "card": "35 11% 13%",
+      "card_foreground": "40 20% 98%",
+      "popover": "35 11% 13%",
+      "popover_foreground": "40 20% 98%",
+      "primary": "38 92% 44%",
+      "primary_foreground": "35 13% 9%",
+      "secondary": "84 75% 55%",
+      "secondary_foreground": "35 13% 9%",
+      "muted": "35 11% 17%",
+      "muted_foreground": "40 20% 65%",
+      "accent": "35 11% 17%",
+      "accent_foreground": "40 20% 98%",
+      "destructive": "0 62.8% 30.6%",
+      "destructive_foreground": "0 0% 100%",
+      "border": "35 11% 17%",
+      "input": "35 11% 17%",
+      "ring": "38 92% 44%"
+    },
+    "usage_rules": "Primary is 'Wheat Gold'. Secondary is 'Olive/Sage Green' for success/growth metrics. Do NOT use standard Tailwind blue. Update `/app/frontend/src/index.css` with these HSL values."
+  },
+  "layouts": {
+    "strategy": "Mode B: High Density Grid (For Dashboards/Data)",
+    "spacing": "Generous Spacing Philosophy. Padding inside cards should be p-6 or p-8. Grid gaps should be gap-6.",
+    "dashboard_grid": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4. Widgets must have h-full to stretch seamlessly. Top-left card is the 'North Star' metric.",
+    "components": {
+      "buttons": "Large tap targets (h-12, px-6) for quick data entry on the mill floor. Pill-shaped or soft-rounded (rounded-lg or rounded-full).",
+      "cards": "Subtle border (border-border/40), solid earthy backgrounds (no glassmorphism for clinical/admin data). Flat, crisp edges.",
+      "inputs": "High contrast borders, h-12 for accessibility and fast entry. Rely heavily on Shadcn Select/Command dropdowns to minimize typing.",
+      "tables": "Density controls, distinct row hovers (hover:bg-muted/50), left-aligned data, right-aligned currency."
+    }
+  },
+  "visual_enhancers": {
+    "surfaces": "Neumorphic subtle lifts for primary action cards. Use 'Grid Borders' style for data-heavy sections (visible skeletons).",
+    "motion": "Fast, snappy feedback. active:scale-95 on all buttons. transition-transform 0.2s ease, opacity 0.2s ease (Never use transition-all). Staggered fade-ins for list items.",
+    "icons": "Use @phosphor-icons/react for dense, premium dashboard iconography. (Run: yarn add @phosphor-icons/react). If unavailable, fallback to lucide-react."
+  },
+  "accessibility": {
+    "contrast": "Ensure minimum 4.5:1 ratio. Text colors MUST be explicitly defined on hover (e.g., hover:bg-primary hover:text-primary-foreground).",
+    "testing": "All interactive elements MUST have a data-testid attribute (e.g., data-testid='login-submit-button', data-testid='inventory-add-btn')."
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://images.pexels.com/photos/723498/pexels-photo-723498.jpeg",
+        "category": "login_background",
+        "description": "Backlit wheat field at sunset. Use as the left/right split panel background for the login screen. Add a bg-black/40 overlay so text is readable."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1768689033119-c3ac1e437d20",
+        "category": "service_oil",
+        "description": "Golden oil pouring from metal spout. Use for the 'Oil Extraction Service' card or hero banner in the services section."
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1749169439872-7cee08d9a71b",
+        "category": "service_wheat",
+        "description": "Flour texture. Use for 'Wheat Grinding Service' section visual."
+      }
+    ],
+    "rules": "Images must have max-h-[80vh] on mobile. Never use placeholder images. Overlays must not exceed 50% opacity."
+  },
+  "component_guidelines": {
+    "navigation": "Sidebar or top nav with clear hierarchy. Active state should use the primary wheat gold color.",
+    "data_entry": "Forms must use Shadcn. Minimize typing using dropdowns (Select), Combo boxes (Command), and Date pickers (Calendar).",
+    "charts": "Use Shadcn charts (Recharts). Stick to the earthy palette (Gold, Olive, Clay) for bar/line charts.",
+    "toasts": "Use Sonner for notifications (low stock, pending payments). Import from /components/ui/sonner."
+  },
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Do NOT center align the app container. No `.App { text-align: center; }`.",
+    "Do NOT use `transition: all`. Target specific properties like `transition-colors` or `transition-transform`.",
+    "Do NOT use complete transparent backgrounds for overlays, headers, or dropdowns. Always use solid or heavily blurred (backdrop-blur-xl bg-background/80) backgrounds.",
+    "Implement Dark and Light mode toggle.",
+    "Use 2-3x more spacing (p-6, p-8) than typical tight dashboards to give an airy, premium feel.",
+    "Use currency ₹ Rupees and units in 'kg' where applicable.",
+    "All interactive elements MUST include a data-testid attribute.",
+    "Prioritize Shadcn UI components for dropdowns, tabs, dialogs, calendars, and tables. Heavily customize their Tailwind classes to match the 'Earthy' theme.",
+    "Remove any default Vercel/Stripe aesthetic. Replace with the warm agricultural palette.",
+    "Always update index.css and tailwind.config.js to include the defined fonts and HSL color variables."
+  ],
+  "instructions_to_main_agent": "Read this JSON fully. Begin by updating the tailwind config and index.css with the exact HSL variables and font imports provided. Create a layout with a Sidebar and a Top Header. The application needs distinct modules: Dashboard, Inventory, Sales, Grinding, Oil Extraction, Expenses, Customers, and Suppliers. Focus heavily on a tabular but spacious interface using the 'bento' grid principles. Install 'lucide-react' or '@phosphor-icons/react', 'recharts' for charts, and 'sonner' for toasts before building. Remember: earthy vibes, large buttons, minimalistic data entry."
+}
