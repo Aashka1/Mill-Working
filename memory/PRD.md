@@ -34,3 +34,14 @@ Inventory (products + purchases, auto stock), Sales (auto stock deduct + invoice
 ## Next Tasks
 - Add maintenance schedule module for reminders.
 - Add edit capability to transactional records.
+
+## Update (2026-07-29) — Mill Production & Advanced Logic
+- Renamed brand to **Gangotri Flour & Oil Mill**; theme shifted to yellow-orange primary with olive-green accents on white.
+- Default products auto-seeded: Wheat Crop, Atta, Wheat Bran, Sattu, Mustard Seeds, Mustard Oil, Mustard Oil Cake (with weighted-avg cost_per_unit).
+- **Production** module: converts raw stock into finished goods + by-products (Wheat Crop→Atta+Bran, Mustard Seeds→Oil+Cake), decrements input / increments outputs, allocates production cost from purchase price.
+- **Grinding** enhanced: washed toggle + configurable loss % (settings: washed 2.5% / unwashed 5%), auto atta output & loss, payment method Cash or Grain (shop-retained atta added to inventory).
+- **Oil extraction** enhanced: oil cake output, payment Cash / retain Oil / retain Cake (retained added to shop inventory).
+- **Exchange** module: customer trades wheat crop for atta (Wheat Crop +=, Atta -=, with stock guard).
+- **Mark-as-Paid** one-tap on sales/grinding/oil; **Edit** for sales/grinding/oil (reverse+reapply inventory).
+- **Daily Summary** (daybook) card on dashboard: income billed, collected, pending, expenses, net cash, orders.
+- Tested: 28/28 backend pass, 100% of frontend flows.

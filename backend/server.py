@@ -819,6 +819,9 @@ async def get_exchanges(user: dict = Depends(get_current_user)):
 
 @api_router.post("/exchanges")
 async def create_exchange(body: ExchangeBody, user: dict = Depends(get_current_user)):
+    atta = await db.products.find_one({"name": "Atta"})
+    if atta and body.atta_given > atta.get("current_stock", 0):
+        raise HTTPException(status_code=400, detail=f"Not enough Atta stock (have {atta.get('current_stock',0)} kg)")
     doc = {"id": str(uuid.uuid4()), **body.model_dump(),
            "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2), "created_at": now_iso()}
     await db.exchanges.insert_one(doc)
