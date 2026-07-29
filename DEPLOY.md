@@ -62,10 +62,47 @@ for a demo or light real use; neither expires.
 
 `backend/server.py` seeds an admin account on every startup and **falls back to
 `admin@agrimill.com` / `admin123` when `ADMIN_EMAIL` / `ADMIN_PASSWORD` are
-unset**. It also *resets* the stored password to match `ADMIN_PASSWORD` on each
-boot. Deploying without setting these publishes an app whose credentials are in
-this repo. There is also a seeded `staff@agrimill.com` / `staff123` account —
-delete it from **Settings** after your first login.
+unset**. It also *re-syncs* the stored password to match `ADMIN_PASSWORD` on each
+boot — but only until the admin changes their own password via the reset flow,
+after which the env var is ignored for that account. Deploying without setting
+these publishes an app whose credentials are in this repo.
+
+No other account is seeded. There is no public sign-up: the admin adds staff
+from **Settings → Users**, which is also where accounts get removed.
+
+---
+
+## Password reset email (optional)
+
+The "Forgot password?" flow works with no configuration: the reset link is
+written to the service log instead of being emailed, and you read it from
+**Render → Logs** and pass it to whoever needs it. Look for:
+
+```
+SMTP not configured. Password reset link for someone@example.com: https://...
+```
+
+To send real emails, add all three of these in **Render → Environment**:
+
+| Variable    | Example                     |
+| ----------- | --------------------------- |
+| `SMTP_HOST` | `smtp.gmail.com`            |
+| `SMTP_USER` | `you@gmail.com`             |
+| `SMTP_PASS` | a Gmail **app password**    |
+
+Optional: `SMTP_PORT` (defaults to `587`; use `465` for implicit TLS) and
+`SMTP_FROM` (defaults to `SMTP_USER`). Gmail needs an app password rather than
+your account password, and delivery from a free `onrender.com` host often lands
+in spam — check there before assuming it failed.
+
+Reset links expire after 30 minutes, are single-use, and requesting a new one
+invalidates the previous link. Requests are capped at 5 per hour per IP+email.
+The endpoint returns the same response whether or not the address exists, so it
+cannot be used to discover which emails have accounts.
+
+Also optional: `PUBLIC_URL`, only needed if you put a custom domain in front of
+Render. Links otherwise use the incoming request's host, which is already
+correct.
 
 ---
 

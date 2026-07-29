@@ -4,6 +4,8 @@ import { Toaster } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
+import ForgotPassword from "@/pages/ForgotPassword";
+import ResetPassword from "@/pages/ResetPassword";
 import Dashboard from "@/pages/Dashboard";
 import Inventory from "@/pages/Inventory";
 import Sales from "@/pages/Sales";
@@ -36,6 +38,10 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={user ? <Navigate to="/" replace /> : <Login />} />
+          <Route path="/forgot-password" element={user ? <Navigate to="/" replace /> : <ForgotPassword />} />
+          {/* Reachable while signed in too — a reset link may be opened in a
+              browser that still holds a session for another account. */}
+          <Route path="/reset-password" element={<ResetPassword />} />
           <Route
             path="/"
             element={<Protected><Layout /></Protected>}

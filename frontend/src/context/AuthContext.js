@@ -23,16 +23,11 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
-  const register = async (name, email, password, role) => {
-    setError("");
-    try {
-      const { data } = await api.post("/auth/register", { name, email, password, role });
-      setUser(data);
-      return true;
-    } catch (e) {
-      setError(formatApiErrorDetail(e.response?.data?.detail) || e.message);
-      return false;
-    }
+  // Admin-only staff onboarding, called from Settings. Does not change who is
+  // signed in — the endpoint issues no cookies.
+  const createUser = async (name, email, password, role) => {
+    const { data } = await api.post("/auth/register", { name, email, password, role });
+    return data;
   };
 
   const logout = async () => {
@@ -41,7 +36,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, setUser, login, register, logout, error, setError }}>
+    <AuthContext.Provider value={{ user, setUser, login, createUser, logout, error, setError }}>
       {children}
     </AuthContext.Provider>
   );

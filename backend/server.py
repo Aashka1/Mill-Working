@@ -5,10 +5,15 @@ load_dotenv(ROOT_DIR / '.env')
 
 import os
 import io
+import re
 import jwt
 import bcrypt
 import secrets
+import asyncio
+import hashlib
 import logging
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends
@@ -107,17 +112,23 @@ class LoginBody(BaseModel):
 # ---------------- Auth endpoints ----------------
 
 @api_router.post("/auth/register")
-async def register(body: RegisterBody, response: Response):
+async def register(body: RegisterBody, admin: dict = Depends(require_admin)):
+    """Create a user. Admin-only: this is staff onboarding, not public sign-up.
+
+    Deliberately does not issue cookies — the calling admin stays signed in as
+    themselves rather than being swapped into the account they just created.
+    """
     email = body.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
     role = body.role if body.role in ("admin", "staff") else "staff"
     doc = {"email": email, "password_hash": hash_password(body.password), "name": body.name,
            "role": role, "created_at": datetime.now(timezone.utc).isoformat()}
     res = await db.users.insert_one(doc)
-    uid = str(res.inserted_id)
-    set_auth_cookies(response, create_access_token(uid, email), create_refresh_token(uid))
-    return {"id": uid, "email": email, "name": body.name, "role": role}
+    await log_audit(admin, "Created user", f"{body.name} <{email}> · {role}")
+    return {"id": str(res.inserted_id), "email": email, "name": body.name, "role": role}
 
 @api_router.post("/auth/login")
 async def login(body: LoginBody, request: Request, response: Response):
@@ -168,12 +179,188 @@ async def refresh(request: Request, response: Response):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+# ---------------- Password reset ----------------
+
+RESET_TOKEN_TTL_MINUTES = 30
+RESET_MAX_REQUESTS = 5
+RESET_WINDOW_MINUTES = 60
+
+# Deliberately identical whether or not the address exists, so this endpoint
+# cannot be used to enumerate which emails have accounts.
+RESET_GENERIC_REPLY = {"message": "If that email is registered, a reset link has been sent."}
+
+class ForgotPasswordBody(BaseModel):
+    email: EmailStr
+
+class ResetPasswordBody(BaseModel):
+    token: str
+    password: str
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Mongo hands back naive datetimes; comparing those to an aware `now`
+    raises TypeError. Normalise before any comparison."""
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+def hash_reset_token(token: str) -> str:
+    """Store only a digest, so a leaked database dump yields no usable tokens.
+
+    Plain SHA-256 rather than bcrypt: the token is 32 bytes of CSPRNG output,
+    so there is no low-entropy secret for an attacker to grind against.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def smtp_settings() -> Optional[dict]:
+    """SMTP config, or None when it is not fully configured."""
+    host = os.environ.get("SMTP_HOST")
+    user = os.environ.get("SMTP_USER")
+    password = os.environ.get("SMTP_PASS")
+    if not (host and user and password):
+        return None
+    return {"host": host, "port": int(os.environ.get("SMTP_PORT", "587")), "user": user,
+            "password": password, "sender": os.environ.get("SMTP_FROM", user)}
+
+def send_email_blocking(cfg: dict, to: str, subject: str, body: str):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg["sender"]
+    msg["To"] = to
+    msg.set_content(body)
+    if cfg["port"] == 465:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20) as smtp:
+            smtp.login(cfg["user"], cfg["password"])
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=20) as smtp:
+            smtp.starttls()
+            smtp.login(cfg["user"], cfg["password"])
+            smtp.send_message(msg)
+
+def public_base_url(request: Request) -> str:
+    """Origin to build reset links from, honouring the proxy Render sits behind."""
+    configured = os.environ.get("PUBLIC_URL") or os.environ.get("FRONTEND_URL")
+    if configured:
+        return configured.rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(body: ForgotPasswordBody, request: Request):
+    email = body.email.lower()
+    ip = request.client.host if request.client else "unknown"
+    identifier = f"{ip}:{email}"
+    now = datetime.now(timezone.utc)
+
+    # Throttle per IP+email. Kept separate from login_attempts so that asking
+    # for a reset can never lock someone out of signing in normally.
+    attempt = await db.reset_attempts.find_one({"identifier": identifier})
+    if attempt:
+        window_start = as_utc(attempt.get("window_start"))
+        if window_start and window_start > now - timedelta(minutes=RESET_WINDOW_MINUTES):
+            if attempt.get("count", 0) >= RESET_MAX_REQUESTS:
+                raise HTTPException(status_code=429, detail="Too many reset requests. Try again later.")
+            await db.reset_attempts.update_one({"identifier": identifier}, {"$inc": {"count": 1}})
+        else:
+            await db.reset_attempts.update_one({"identifier": identifier},
+                {"$set": {"count": 1, "window_start": now}})
+    else:
+        await db.reset_attempts.insert_one({"identifier": identifier, "count": 1, "window_start": now})
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        return RESET_GENERIC_REPLY
+
+    # One live token per user: issuing a new link retires any earlier one.
+    await db.password_resets.delete_many({"user_id": str(user["_id"])})
+    token = secrets.token_urlsafe(32)
+    await db.password_resets.insert_one({
+        "token_hash": hash_reset_token(token),
+        "user_id": str(user["_id"]),
+        "email": email,
+        "expires_at": now + timedelta(minutes=RESET_TOKEN_TTL_MINUTES),
+        "created_at": now,
+    })
+
+    link = f"{public_base_url(request)}/reset-password?token={token}"
+    cfg = smtp_settings()
+    if cfg:
+        try:
+            await asyncio.to_thread(
+                send_email_blocking, cfg, email, "Reset your AgriMill password",
+                f"Hello {user.get('name', '')},\n\n"
+                f"Use the link below to set a new AgriMill password. "
+                f"It expires in {RESET_TOKEN_TTL_MINUTES} minutes and can only be used once.\n\n"
+                f"{link}\n\n"
+                f"If you did not request this, ignore this email — your password stays unchanged.\n")
+        except Exception:
+            # Never surface delivery failures: doing so would confirm the
+            # address exists. Logged for the operator instead.
+            logger.exception("Failed to send password reset email to %s", email)
+    else:
+        # No SMTP configured: the operator reads the link from the service logs
+        # and passes it on. See DEPLOY.md.
+        logger.warning("SMTP not configured. Password reset link for %s: %s", email, link)
+
+    return RESET_GENERIC_REPLY
+
+@api_router.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordBody):
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    record = await db.password_resets.find_one({"token_hash": hash_reset_token(body.token)})
+    if not record:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has already been used")
+    expires_at = as_utc(record.get("expires_at"))
+    if expires_at and expires_at < datetime.now(timezone.utc):
+        await db.password_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(status_code=400, detail="This reset link has expired. Request a new one.")
+    try:
+        oid = ObjectId(record["user_id"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has already been used")
+    user = await db.users.find_one({"_id": oid})
+    if not user:
+        await db.password_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has already been used")
+
+    await db.users.update_one({"_id": oid}, {"$set": {
+        "password_hash": hash_password(body.password),
+        # Stops the startup admin re-seed from reverting this password on the
+        # next boot. See the startup() comment.
+        "password_self_managed": True,
+    }})
+    # Single use, and clear any lockout the forgotten password caused.
+    await db.password_resets.delete_many({"user_id": record["user_id"]})
+    await db.login_attempts.delete_many({"identifier": {"$regex": f":{re.escape(user['email'])}$"}})
+    await log_audit(None, "Password reset", user["email"])
+    return {"message": "Password updated. You can sign in now."}
+
 @api_router.get("/users")
 async def list_users(user: dict = Depends(require_admin)):
     users = await db.users.find({}, {"password_hash": 0}).to_list(1000)
     for u in users:
         u["id"] = str(u["_id"]); u.pop("_id", None)
     return users
+
+@api_router.delete("/users/{uid}")
+async def delete_user(uid: str, admin: dict = Depends(require_admin)):
+    try:
+        oid = ObjectId(uid)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user id")
+    if uid == admin["id"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+    target = await db.users.find_one({"_id": oid})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Never leave the mill without an admin who can add users back.
+    if target.get("role") == "admin" and await db.users.count_documents({"role": "admin"}) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the last admin")
+    await db.users.delete_one({"_id": oid})
+    await log_audit(admin, "Deleted user", f'{target.get("name")} <{target.get("email")}>')
+    return {"message": "deleted"}
 
 # ---------------- Generic helpers ----------------
 
@@ -684,18 +871,24 @@ async def export_excel(kind: str, request: Request):
 async def startup():
     await db.users.create_index("email", unique=True)
     await db.login_attempts.create_index("identifier")
+    await db.password_resets.create_index("token_hash", unique=True)
+    # Mongo drops expired reset records on its own; the endpoint also checks.
+    await db.password_resets.create_index("expires_at", expireAfterSeconds=0)
+    await db.reset_attempts.create_index("identifier")
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@agrimill.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
     if existing is None:
         await db.users.insert_one({"email": admin_email, "password_hash": hash_password(admin_password),
             "name": "Admin", "role": "admin", "created_at": now_iso()})
-    elif not verify_password(admin_password, existing["password_hash"]):
+    elif not existing.get("password_self_managed") and not verify_password(admin_password, existing["password_hash"]):
+        # Re-sync from ADMIN_PASSWORD only while the admin has never changed it
+        # themselves. Without this guard, startup runs on every wake from idle
+        # and would silently revert a password set via the reset flow.
         await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
-    # seed staff test user
-    if await db.users.find_one({"email": "staff@agrimill.com"}) is None:
-        await db.users.insert_one({"email": "staff@agrimill.com", "password_hash": hash_password("staff123"),
-            "name": "Staff Member", "role": "staff", "created_at": now_iso()})
+    # No demo staff account is seeded. Startup runs on every wake from idle, so
+    # a seeded account would keep reappearing after being deleted. Admins add
+    # staff from Settings instead.
     await seed_products()
     await get_settings_doc()
 
