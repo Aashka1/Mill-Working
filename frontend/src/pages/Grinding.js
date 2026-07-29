@@ -129,7 +129,12 @@ export default function Grinding() {
                 <TableCell className="text-right">{g.output_atta ?? "—"} kg</TableCell>
                 <TableCell><Badge variant="outline">{g.payment_method || "Cash"}{g.payment_method === "Grain" && g.grain_fee_kg ? ` (${g.grain_fee_kg}kg)` : ""}</Badge></TableCell>
                 <TableCell className="text-right font-medium">{money(g.total_charge)}</TableCell>
-                <TableCell><StatusBadge status={g.payment_status} /></TableCell>
+                <TableCell
+                  className={g.payment_status === "Pending" ? "cursor-pointer" : ""}
+                  onClick={() => g.payment_status === "Pending" && markPaid(g)}
+                  title={g.payment_status === "Pending" ? "Click to mark as paid" : ""}
+                  data-testid={`grinding-status-${g.id}`}
+                ><StatusBadge status={g.payment_status} /></TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   {g.payment_status === "Pending" && <Button variant="ghost" size="icon" onClick={() => markPaid(g)} data-testid={`pay-grinding-${g.id}`}><CheckCircle2 className="h-4 w-4 text-secondary" /></Button>}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(g)} data-testid={`edit-grinding-${g.id}`}><Pencil className="h-4 w-4" /></Button>

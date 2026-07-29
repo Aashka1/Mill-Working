@@ -35,6 +35,17 @@ Inventory (products + purchases, auto stock), Sales (auto stock deduct + invoice
 - Add maintenance schedule module for reminders.
 - Add edit capability to transactional records.
 
+## Update (2026-07-29) — ERP Expansion (Ledgers, Cash Book, Reports, Audit, Theme)
+- New theme: Forest Green primary (#2E7D32), Golden Wheat secondary (#D4A017), Inter font, #F8F9FA light / #121212 dark.
+- Seeded flour types: Fine/Medium/Coarse/Multigrain Atta, Besan, Makka Atta, Bajra Atta, Sattu + Packing Bags — each priced & sellable.
+- Customer & Supplier ledgers with partial payments (`/api/payments`, `/customers|suppliers/{id}/ledger`); outstanding = debits − credits; Paid transactions & Mark-Paid auto-credit.
+- Daily Cash Book (`/api/cashbook`): opening + received − supplier paid − expenses = closing (starting cash in Settings).
+- Reports page: sales today/month/year, revenue-by-product bar chart, top & least sellers, profit; Cash Book card.
+- Audit Log (`/api/audit`) capturing stock changes, sales, purchases, production, payments — shown in Settings.
+- Settings page: configurable grinding loss % and starting cash.
+- Grinding status cell is click-to-pay (pending→paid).
+- Tested: backend 11/11 iteration-4 pass (100%), frontend 100%.
+
 ## Update (2026-07-29) — Mill Production & Advanced Logic
 - Renamed brand to **Gangotri Flour & Oil Mill**; theme shifted to yellow-orange primary with olive-green accents on white.
 - Default products auto-seeded: Wheat Crop, Atta, Wheat Bran, Sattu, Mustard Seeds, Mustard Oil, Mustard Oil Cake (with weighted-avg cost_per_unit).

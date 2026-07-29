@@ -18,8 +18,6 @@ export default function Customers() {
   const filtered = useFilter(customers.items, q, ["name", "phone", "address"]);
   const [open, setOpen] = useState(false);
   const [f, setF] = useState({ name: "", phone: "", address: "" });
-  const [hist, setHist] = useState(null);
-  const [histName, setHistName] = useState("");
   const [ledgerFor, setLedgerFor] = useState(null);
 
   const save = async () => {
@@ -27,12 +25,6 @@ export default function Customers() {
     await customers.create(f);
     setOpen(false);
     setF({ name: "", phone: "", address: "" });
-  };
-
-  const showHistory = async (c) => {
-    setHistName(c.name);
-    const { data } = await api.get(`/customers/${c.id}/history`);
-    setHist(data);
   };
 
   return (
