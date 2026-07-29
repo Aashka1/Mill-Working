@@ -95,9 +95,14 @@ export default function Grinding() {
       />
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-lg">
+        {/* Capped height with the fields scrolling: the form grows with the
+            item selector's inline "add new" panel and the part-payment field,
+            and an uncapped dialog pushes Save Order below the fold. Header and
+            footer stay pinned via explicit grid rows; minmax(0,1fr) lets the
+            middle row shrink below its content so it can actually overflow. */}
+        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "New"} Grinding Order</DialogTitle></DialogHeader>
-          <div className="space-y-4">
+          <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">
               <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
               <div><Label>Customer</Label>

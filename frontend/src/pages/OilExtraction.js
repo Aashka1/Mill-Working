@@ -67,9 +67,11 @@ export default function OilExtraction() {
       />
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-lg">
+        {/* See Grinding.js: same capped-height layout, needed here too now the
+            form carries the cake-purchase and part-payment fields. */}
+        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "New"} Oil Extraction Order</DialogTitle></DialogHeader>
-          <div className="space-y-4">
+          <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">
               <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
               <div><Label>Customer</Label>
