@@ -1,6 +1,7 @@
 import axios from "axios";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+// Empty/unset means same-origin: the FastAPI server also serves this build.
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const api = axios.create({ baseURL: API, withCredentials: true });
 
