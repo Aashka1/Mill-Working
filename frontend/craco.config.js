@@ -72,10 +72,18 @@ if (config.enableHealthCheck) {
 let webpackConfig = {
   eslint: {
     configure: {
+      // `extends` replaces create-react-app's default config rather than adding
+      // to it, so anything not listed here is simply off. jsx-no-undef and
+      // no-undef are the ones that matter: without them a component used
+      // without its import compiles clean and blanks the page at runtime.
       extends: ["plugin:react-hooks/recommended"],
+      plugins: ["react"],
+      env: { browser: true, node: true, es2021: true },
       rules: {
         "react-hooks/rules-of-hooks": "error",
         "react-hooks/exhaustive-deps": "warn",
+        "react/jsx-no-undef": "error",
+        "no-undef": "error",
       },
     },
   },
