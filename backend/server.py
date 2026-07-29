@@ -452,9 +452,42 @@ async def update_product(pid: str, body: ProductBody, user: dict = Depends(get_c
     clash = await db.products.find_one({"name_key": key, "id": {"$ne": pid}})
     if clash:
         raise HTTPException(status_code=400, detail=f'Another product is already named "{clash["name"]}"')
-    await db.products.update_one({"id": pid}, {"$set": {**body.model_dump(), "name_key": key}})
-    if old.get("current_stock") != body.current_stock:
-        await log_audit(user, "Changed stock", f"{body.name}: {old.get('current_stock')} → {body.current_stock} {body.unit}")
+    # Never write stock or cost from this endpoint. Both are running totals that
+    # sales, purchases, grinding, exchange and production move with $inc; an
+    # absolute $set here would erase any of their updates that landed while the
+    # edit form was open. cost_per_unit is the worse of the two — the form does
+    # not send it, so the model default of 0 would wipe the cost basis that
+    # profit reporting depends on. Stock corrections go through /adjust.
+    fields = body.model_dump(exclude={"current_stock", "cost_per_unit"})
+    await db.products.update_one({"id": pid}, {"$set": {**fields, "name_key": key}})
+    await log_audit(user, "Edited product", f'{body.name} ({body.category}, {body.unit}, Rs {body.rate}/{body.unit})')
+    return clean(await db.products.find_one({"id": pid}))
+
+class StockAdjustBody(BaseModel):
+    delta: float
+    reason: str = ""
+
+@api_router.post("/products/{pid}/adjust")
+async def adjust_product_stock(pid: str, body: StockAdjustBody, user: dict = Depends(get_current_user)):
+    """Relative stock correction — spillage, recount, damage.
+
+    Relative rather than absolute so a concurrent sale or purchase is added to
+    rather than overwritten, and always audited so a manual correction is
+    distinguishable from a sale in the trail.
+    """
+    p = await db.products.find_one({"id": pid})
+    if not p:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not body.delta:
+        raise HTTPException(status_code=400, detail="Enter a non-zero amount")
+    new_stock = round(p.get("current_stock", 0) + body.delta, 3)
+    if new_stock < 0:
+        raise HTTPException(status_code=400, detail=(
+            f'Only {p.get("current_stock", 0)} {p.get("unit")} in stock — cannot remove {abs(body.delta)}'))
+    await db.products.update_one({"id": pid}, {"$inc": {"current_stock": body.delta}})
+    await log_audit(user, "Adjusted stock", (
+        f'{p["name"]}: {p.get("current_stock", 0)} → {new_stock} {p.get("unit")} '
+        f'({body.delta:+g}){" · " + body.reason if body.reason else ""}'))
     return clean(await db.products.find_one({"id": pid}))
 
 @api_router.delete("/products/{pid}")
@@ -490,6 +523,20 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
         await add_credit("supplier", body.supplier_name, total, body.date, doc["id"], f"Purchase {body.product_name}")
     await log_audit(user, "Created purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
     return clean(doc)
+
+@api_router.put("/purchases/{pid}")
+async def edit_purchase(pid: str, body: PurchaseBody, user: dict = Depends(get_current_user)):
+    old = await db.purchases.find_one({"id": pid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Reverse the original stock movement before applying the corrected one, so
+    # editing a purchase cannot double-count or strand stock on the old product.
+    await add_stock_with_cost(old["product_id"], -old["quantity"], -old.get("total", 0))
+    total = round(body.quantity * body.rate, 2)
+    await db.purchases.update_one({"id": pid}, {"$set": {**body.model_dump(), "total": total}})
+    await add_stock_with_cost(body.product_id, body.quantity, total)
+    await log_audit(user, "Edited purchase", f"{body.supplier_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
+    return clean(await db.purchases.find_one({"id": pid}))
 
 @api_router.delete("/purchases/{pid}")
 async def delete_purchase(pid: str, user: dict = Depends(require_admin)):
@@ -1130,6 +1177,36 @@ class ProductionBody(BaseModel):
 async def get_production(user: dict = Depends(get_current_user)):
     return [clean(p) for p in await db.production.find().sort("date", -1).to_list(2000)]
 
+async def build_production_doc(body: ProductionBody) -> dict:
+    """Cost the run and shape the stored record. Applies no stock changes."""
+    inp = await db.products.find_one({"id": body.input_product_id})
+    input_cost = round(body.input_quantity * (inp or {}).get("cost_per_unit", 0), 2)
+    total_out = sum(o.quantity for o in body.outputs) or 1
+    out_records = []
+    for o in body.outputs:
+        allocated = round(input_cost * (o.quantity / total_out), 2)
+        # product_id is persisted so a later edit or delete can reverse the exact
+        # rows this run touched, rather than guessing from the name.
+        out_records.append({"product_id": o.product_id, "product_name": o.product_name,
+                            "quantity": o.quantity, "cost": allocated,
+                            "cost_per_unit": round(allocated / o.quantity, 3) if o.quantity else 0})
+    return {"id": str(uuid.uuid4()), "date": body.date, "mill": body.mill,
+            "input_product_id": body.input_product_id,
+            "input_product_name": body.input_product_name, "input_quantity": body.input_quantity,
+            "input_cost": input_cost, "outputs": out_records, "created_at": now_iso()}
+
+async def apply_production_effects(doc: dict):
+    """Consume the input and bank the outputs, carrying cost across."""
+    if doc.get("input_product_id"):
+        await add_stock_with_cost(doc["input_product_id"], -doc.get("input_quantity", 0), -doc.get("input_cost", 0))
+    else:
+        await adjust_stock_by_name(doc.get("input_product_name", ""), -doc.get("input_quantity", 0))
+    for o in doc.get("outputs", []):
+        if o.get("product_id"):
+            await add_stock_with_cost(o["product_id"], o.get("quantity", 0), o.get("cost", 0))
+        else:
+            await adjust_stock_by_name(o.get("product_name", ""), o.get("quantity", 0))
+
 @api_router.post("/production")
 async def create_production(body: ProductionBody, user: dict = Depends(get_current_user)):
     inp = await db.products.find_one({"id": body.input_product_id})
@@ -1137,25 +1214,54 @@ async def create_production(body: ProductionBody, user: dict = Depends(get_curre
         raise HTTPException(status_code=404, detail="Input product not found")
     if body.input_quantity > inp.get("current_stock", 0):
         raise HTTPException(status_code=400, detail=f"Not enough stock (have {inp.get('current_stock',0)})")
-    input_cost = round(body.input_quantity * inp.get("cost_per_unit", 0), 2)
-    total_out = sum(o.quantity for o in body.outputs) or 1
-    await db.products.update_one({"id": body.input_product_id}, {"$inc": {"current_stock": -body.input_quantity}})
-    out_records = []
-    for o in body.outputs:
-        allocated = round(input_cost * (o.quantity / total_out), 2)
-        await add_stock_with_cost(o.product_id, o.quantity, allocated)
-        out_records.append({"product_name": o.product_name, "quantity": o.quantity,
-                            "cost": allocated, "cost_per_unit": round(allocated / o.quantity, 3) if o.quantity else 0})
-    doc = {"id": str(uuid.uuid4()), "date": body.date, "mill": body.mill,
-           "input_product_name": body.input_product_name, "input_quantity": body.input_quantity,
-           "input_cost": input_cost, "outputs": out_records, "created_at": now_iso()}
+    doc = await build_production_doc(body)
+    await apply_production_effects(doc)
     await db.production.insert_one(doc)
     await log_audit(user, "Production run", f"{body.mill}: {body.input_quantity} {body.input_product_name} → " + ", ".join(f"{o.quantity} {o.product_name}" for o in body.outputs))
     return clean(doc)
 
+async def reverse_production_effects(doc: dict):
+    """Undo a production run's stock movements: return the input, remove the outputs."""
+    if doc.get("input_product_id"):
+        await add_stock_with_cost(doc["input_product_id"], doc.get("input_quantity", 0), doc.get("input_cost", 0))
+    else:
+        await adjust_stock_by_name(doc.get("input_product_name", ""), doc.get("input_quantity", 0))
+    for o in doc.get("outputs", []):
+        if o.get("product_id"):
+            await add_stock_with_cost(o["product_id"], -o.get("quantity", 0), -o.get("cost", 0))
+        else:
+            await adjust_stock_by_name(o.get("product_name", ""), -o.get("quantity", 0))
+
+@api_router.put("/production/{pid}")
+async def edit_production(pid: str, body: ProductionBody, user: dict = Depends(get_current_user)):
+    old = await db.production.find_one({"id": pid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    await reverse_production_effects(old)
+    inp = await db.products.find_one({"id": body.input_product_id})
+    if not inp:
+        # Put the original movements back rather than leaving the run half-undone.
+        await apply_production_effects(old)
+        raise HTTPException(status_code=404, detail="Input product not found")
+    if body.input_quantity > inp.get("current_stock", 0):
+        await apply_production_effects(old)
+        raise HTTPException(status_code=400, detail=f"Not enough stock (have {inp.get('current_stock',0)})")
+    doc = await build_production_doc(body)
+    doc["id"] = pid
+    doc["created_at"] = old.get("created_at", now_iso())
+    await apply_production_effects(doc)
+    await db.production.replace_one({"id": pid}, doc)
+    await log_audit(user, "Edited production run", f'{body.mill}: {body.input_quantity} {body.input_product_name}')
+    return clean(doc)
+
 @api_router.delete("/production/{pid}")
 async def delete_production(pid: str, user: dict = Depends(require_admin)):
-    await db.production.delete_one({"id": pid})
+    doc = await db.production.find_one({"id": pid})
+    if doc:
+        # Previously this deleted the record but left its stock movements in
+        # place, so the flour it produced stayed on the books forever.
+        await reverse_production_effects(doc)
+        await db.production.delete_one({"id": pid})
     return {"message": "deleted"}
 
 # ---- Exchange (wheat crop for atta) ----
@@ -1181,6 +1287,27 @@ async def create_exchange(body: ExchangeBody, user: dict = Depends(get_current_u
     await db.exchanges.insert_one(doc)
     await adjust_stock_by_name("Wheat Crop", body.wheat_qty)
     await adjust_stock_by_name("Atta", -body.atta_given)
+    return clean(doc)
+
+@api_router.put("/exchanges/{eid}")
+async def edit_exchange(eid: str, body: ExchangeBody, user: dict = Depends(get_current_user)):
+    old = await db.exchanges.find_one({"id": eid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Undo the original swap first, so the stock check below sees the atta that
+    # this very exchange had taken out.
+    await adjust_stock_by_name("Wheat Crop", -old["wheat_qty"])
+    await adjust_stock_by_name("Atta", old["atta_given"])
+    atta = await db.products.find_one({"name_key": product_key("Atta")})
+    if atta and body.atta_given > atta.get("current_stock", 0):
+        await adjust_stock_by_name("Wheat Crop", old["wheat_qty"])
+        await adjust_stock_by_name("Atta", -old["atta_given"])
+        raise HTTPException(status_code=400, detail=f"Not enough Atta stock (have {atta.get('current_stock',0)} kg)")
+    doc = {**old, **body.model_dump(), "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2)}
+    await db.exchanges.replace_one({"id": eid}, doc)
+    await adjust_stock_by_name("Wheat Crop", body.wheat_qty)
+    await adjust_stock_by_name("Atta", -body.atta_given)
+    await log_audit(user, "Edited exchange", f'{body.customer_name}: {body.wheat_qty} kg wheat → {body.atta_given} kg atta')
     return clean(doc)
 
 @api_router.delete("/exchanges/{eid}")

@@ -9,7 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, ArrowRight } from "lucide-react";
+import { Plus, Trash2, ArrowRight, Pencil } from "lucide-react";
 import { toast } from "sonner";
 
 const MILL_CONFIG = {
@@ -29,6 +29,7 @@ export default function Production() {
   const [inputId, setInputId] = useState("");
   const [inputQty, setInputQty] = useState("");
   const [outs, setOuts] = useState([]);
+  const [editingId, setEditingId] = useState(null);
 
   const byName = (n) => products.items.find((p) => p.name === n);
   const inputProduct = products.items.find((p) => p.id === inputId);
@@ -40,7 +41,21 @@ export default function Production() {
     setOuts(cfg.outputs.map((n) => ({ product_id: byName(n)?.id || "", quantity: "" })));
   };
 
-  const openNew = () => { applyMill(mill); setDate(today()); setInputQty(""); setOpen(true); };
+  const openNew = () => { setEditingId(null); applyMill(mill); setDate(today()); setInputQty(""); setOpen(true); };
+
+  const openEdit = (run) => {
+    setEditingId(run.id);
+    setMill(run.mill);
+    setDate(run.date);
+    // Older runs predate product_id being stored, so fall back to the name.
+    setInputId(run.input_product_id || byName(run.input_product_name)?.id || "");
+    setInputQty(String(run.input_quantity));
+    setOuts((run.outputs || []).map((o) => ({
+      product_id: o.product_id || byName(o.product_name)?.id || "",
+      quantity: String(o.quantity),
+    })));
+    setOpen(true);
+  };
 
   const setOut = (i, key, val) => setOuts(outs.map((o, idx) => (idx === i ? { ...o, [key]: val } : o)));
 
@@ -48,14 +63,21 @@ export default function Production() {
     if (!inputId || !inputQty) return toast.error("Select input and quantity");
     const validOuts = outs.filter((o) => o.product_id && +o.quantity > 0);
     if (validOuts.length === 0) return toast.error("Add at least one output");
+    const body = {
+      date, mill, input_product_id: inputId, input_product_name: inputProduct?.name,
+      input_quantity: +inputQty,
+      outputs: validOuts.map((o) => ({ product_id: o.product_id, product_name: products.items.find((p) => p.id === o.product_id)?.name, quantity: +o.quantity })),
+    };
     try {
-      await api.post("/production", {
-        date, mill, input_product_id: inputId, input_product_name: inputProduct?.name,
-        input_quantity: +inputQty,
-        outputs: validOuts.map((o) => ({ product_id: o.product_id, product_name: products.items.find((p) => p.id === o.product_id)?.name, quantity: +o.quantity })),
-      });
-      toast.success("Production recorded, inventory updated");
+      if (editingId) {
+        await api.put(`/production/${editingId}`, body);
+        toast.success("Production run updated, inventory adjusted");
+      } else {
+        await api.post("/production", body);
+        toast.success("Production recorded, inventory updated");
+      }
       setOpen(false);
+      setEditingId(null);
       production.load(); products.load();
     } catch (e) {
       toast.error(e.response?.data?.detail || "Failed");
@@ -72,9 +94,9 @@ export default function Production() {
         actions={<Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-production-btn"><Plus className="h-4 w-4 mr-1" /> New Production Run</Button>}
       />
 
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setEditingId(null); }}>
         <DialogContent className="max-w-lg">
-          <DialogHeader><DialogTitle>Record Production Run</DialogTitle></DialogHeader>
+          <DialogHeader><DialogTitle>{editingId ? "Edit" : "Record"} Production Run</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-4">
               <div><Label>Mill</Label>
@@ -127,7 +149,10 @@ export default function Production() {
                 <TableCell className="font-medium">{p.input_quantity} × {p.input_product_name}</TableCell>
                 <TableCell>{p.outputs.map((o, i) => <span key={i} className="block text-sm">{o.quantity} {o.product_name} <span className="text-muted-foreground">({money(o.cost)})</span></span>)}</TableCell>
                 <TableCell className="text-right font-medium">{money(p.input_cost)}</TableCell>
-                <TableCell className="text-right"><Button variant="ghost" size="icon" onClick={() => production.remove(p.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                <TableCell className="text-right flex gap-1 justify-end">
+                  <Button variant="ghost" size="icon" onClick={() => openEdit(p)} data-testid={`edit-production-${p.id}`}><Pencil className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => production.remove(p.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button>
+                </TableCell>
               </TableRow>
             ))}
             {filtered.length === 0 && <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground py-8">No production runs yet.</TableCell></TableRow>}

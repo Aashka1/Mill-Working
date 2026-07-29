@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useList, useFilter, PageToolbar } from "@/components/common";
-import { money } from "@/lib/api";
+import api, { money } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -8,23 +8,40 @@ import { Card } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Phone, MapPin, History } from "lucide-react";
+import { Plus, Trash2, Phone, MapPin, History, Pencil } from "lucide-react";
 import { toast } from "sonner";
 import { LedgerDialog } from "@/components/LedgerDialog";
+
+const BLANK = { name: "", phone: "", address: "" };
 
 export default function Suppliers() {
   const suppliers = useList("/suppliers");
   const [q, setQ] = useState("");
   const filtered = useFilter(suppliers.items, q, ["name", "phone", "address"]);
   const [open, setOpen] = useState(false);
-  const [f, setF] = useState({ name: "", phone: "", address: "" });
+  const [editingId, setEditingId] = useState(null);
+  const [f, setF] = useState(BLANK);
   const [ledgerFor, setLedgerFor] = useState(null);
+
+  const openNew = () => { setEditingId(null); setF(BLANK); setOpen(true); };
+  const openEdit = (s) => {
+    setEditingId(s.id);
+    setF({ name: s.name || "", phone: s.phone || "", address: s.address || "" });
+    setOpen(true);
+  };
 
   const save = async () => {
     if (!f.name) return toast.error("Enter name");
-    await suppliers.create(f);
+    if (editingId) {
+      await api.put(`/suppliers/${editingId}`, f);
+      toast.success("Supplier updated");
+      suppliers.load();
+    } else {
+      await suppliers.create(f);
+    }
     setOpen(false);
-    setF({ name: "", phone: "", address: "" });
+    setEditingId(null);
+    setF(BLANK);
   };
 
   return (
@@ -33,10 +50,10 @@ export default function Suppliers() {
         title="Suppliers" subtitle="Contacts, purchase history & dues"
         search={q} setSearch={setQ} searchTestid="search-suppliers"
         actions={
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" data-testid="add-supplier-btn"><Plus className="h-4 w-4 mr-1" /> Add Supplier</Button></DialogTrigger>
+          <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setEditingId(null); }}>
+            <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-supplier-btn"><Plus className="h-4 w-4 mr-1" /> Add Supplier</Button></DialogTrigger>
             <DialogContent>
-              <DialogHeader><DialogTitle>Add Supplier</DialogTitle></DialogHeader>
+              <DialogHeader><DialogTitle>{editingId ? "Edit" : "Add"} Supplier</DialogTitle></DialogHeader>
               <div className="space-y-4">
                 <div><Label>Name</Label><Input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className="h-11 mt-1" data-testid="supplier-name" /></div>
                 <div><Label>Phone</Label><Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="h-11 mt-1" data-testid="supplier-phone" /></div>
@@ -62,6 +79,7 @@ export default function Suppliers() {
                 <TableCell className="text-right">{s.outstanding > 0 ? <Badge variant="outline" className="text-destructive border-destructive/30">{money(s.outstanding)}</Badge> : <Badge variant="outline" className="text-secondary border-secondary/30">Clear</Badge>}</TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   <Button variant="ghost" size="icon" onClick={() => setLedgerFor(s)} data-testid={`ledger-supplier-${s.id}`}><History className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => openEdit(s)} data-testid={`edit-supplier-${s.id}`}><Pencil className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => suppliers.remove(s.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                 </TableCell>
               </TableRow>

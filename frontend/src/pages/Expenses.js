@@ -9,17 +9,20 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, FileDown, Receipt, CalendarDays, CalendarRange } from "lucide-react";
+import { Plus, Trash2, FileDown, Receipt, CalendarDays, CalendarRange, Pencil } from "lucide-react";
 import { toast } from "sonner";
 
 const CATS = ["Electricity", "Labour", "Machine Maintenance", "Transportation", "Packaging", "Miscellaneous"];
+
+const blank = () => ({ date: today(), category: "Electricity", description: "", amount: "" });
 
 export default function Expenses() {
   const expenses = useList("/expenses");
   const [q, setQ] = useState("");
   const filtered = useFilter(expenses.items, q, ["category", "description", "date"]);
   const [open, setOpen] = useState(false);
-  const [f, setF] = useState({ date: today(), category: "Electricity", description: "", amount: "" });
+  const [editingId, setEditingId] = useState(null);
+  const [f, setF] = useState(blank());
 
   const summary = useMemo(() => {
     const now = new Date();
@@ -35,11 +38,26 @@ export default function Expenses() {
     return { daily, weekly, monthly };
   }, [expenses.items]);
 
+  const openNew = () => { setEditingId(null); setF(blank()); setOpen(true); };
+  const openEdit = (e) => {
+    setEditingId(e.id);
+    setF({ date: e.date, category: e.category, description: e.description || "", amount: String(e.amount) });
+    setOpen(true);
+  };
+
   const save = async () => {
     if (!f.amount) return toast.error("Enter amount");
-    await expenses.create({ ...f, amount: +f.amount });
+    const body = { ...f, amount: +f.amount };
+    if (editingId) {
+      await api.put(`/expenses/${editingId}`, body);
+      toast.success("Expense updated");
+      expenses.load();
+    } else {
+      await expenses.create(body);
+    }
     setOpen(false);
-    setF({ date: today(), category: "Electricity", description: "", amount: "" });
+    setEditingId(null);
+    setF(blank());
   };
 
   return (
@@ -50,10 +68,10 @@ export default function Expenses() {
         actions={
           <>
             <Button variant="outline" className="h-11" onClick={() => downloadFile("/export/expenses", "expenses_report.xlsx")} data-testid="export-expenses-btn"><FileDown className="h-4 w-4 mr-1" /> Excel</Button>
-            <Dialog open={open} onOpenChange={setOpen}>
-              <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" data-testid="add-expense-btn"><Plus className="h-4 w-4 mr-1" /> Add Expense</Button></DialogTrigger>
+            <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setEditingId(null); }}>
+              <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-expense-btn"><Plus className="h-4 w-4 mr-1" /> Add Expense</Button></DialogTrigger>
               <DialogContent>
-                <DialogHeader><DialogTitle>Add Expense</DialogTitle></DialogHeader>
+                <DialogHeader><DialogTitle>{editingId ? "Edit" : "Add"} Expense</DialogTitle></DialogHeader>
                 <div className="space-y-4">
                   <div className="grid grid-cols-2 gap-4">
                     <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
@@ -89,7 +107,10 @@ export default function Expenses() {
               <TableRow key={e.id} className="hover:bg-muted/50" data-testid={`expense-row-${e.id}`}>
                 <TableCell>{e.date}</TableCell><TableCell><Badge variant="outline">{e.category}</Badge></TableCell>
                 <TableCell>{e.description || "—"}</TableCell><TableCell className="text-right font-medium">{money(e.amount)}</TableCell>
-                <TableCell className="text-right"><Button variant="ghost" size="icon" onClick={() => expenses.remove(e.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                <TableCell className="text-right flex gap-1 justify-end">
+                  <Button variant="ghost" size="icon" onClick={() => openEdit(e)} data-testid={`edit-expense-${e.id}`}><Pencil className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => expenses.remove(e.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
+                </TableCell>
               </TableRow>
             ))}
             {filtered.length === 0 && <TableRow><TableCell colSpan={5} className="text-center text-muted-foreground py-8">No expenses yet.</TableCell></TableRow>}

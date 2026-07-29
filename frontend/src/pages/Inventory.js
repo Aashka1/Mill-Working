@@ -11,7 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Pencil } from "lucide-react";
+import { Plus, Trash2, Pencil, Scale } from "lucide-react";
 import { toast } from "sonner";
 
 // Must cover every category the seeded catalogue uses, or those products cannot
@@ -24,6 +24,8 @@ const CATEGORIES = ["Wheat Crop", "Flour", "Bran", "Oil Seeds", "Edible Oil", "O
 const UNITS = ["kg", "litre", "quintal", "bag", "pcs"];
 
 const BLANK_PRODUCT = { name: "", category: "Flour", unit: "kg", current_stock: 0, rate: 0, low_stock_threshold: 50 };
+
+const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid" });
 
 export default function Inventory() {
   const products = useList("/products");
@@ -43,6 +45,23 @@ export default function Inventory() {
     setEditingProduct(p.id);
     setPf({ name: p.name, category: p.category, unit: p.unit, current_stock: p.current_stock, rate: p.rate, low_stock_threshold: p.low_stock_threshold });
     setProdOpen(true);
+  };
+
+  // Stock corrections are relative and audited, kept apart from editing the
+  // product's details. Typing an absolute figure into the edit form would
+  // overwrite whatever a sale or purchase changed in the meantime.
+  const [adjust, setAdjust] = useState(null); // { product, delta, reason }
+  const openAdjust = (p) => setAdjust({ product: p, delta: "", reason: "" });
+  const saveAdjust = async () => {
+    if (!+adjust.delta) return toast.error("Enter a non-zero amount");
+    try {
+      const { data } = await api.post(`/products/${adjust.product.id}/adjust`, { delta: +adjust.delta, reason: adjust.reason });
+      toast.success(`${data.name} is now ${data.current_stock} ${data.unit}`);
+    } catch (err) {
+      return toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
+    }
+    setAdjust(null);
+    products.load();
   };
 
   const saveProduct = async () => {
@@ -77,17 +96,34 @@ export default function Inventory() {
   const unitOf = (productId, fallback = "") => products.items.find((p) => p.id === productId)?.unit || fallback;
 
   const [purOpen, setPurOpen] = useState(false);
-  const [buf, setBuf] = useState({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid" });
+  const [editingPurchase, setEditingPurchase] = useState(null);
+  const [buf, setBuf] = useState(blankPurchase());
+
+  const openNewPurchase = () => { setEditingPurchase(null); setBuf(blankPurchase()); setPurOpen(true); };
+  const openEditPurchase = (p) => {
+    setEditingPurchase(p.id);
+    setBuf({ date: p.date, supplier_name: p.supplier_name, product_id: p.product_id,
+             quantity: String(p.quantity), rate: String(p.rate), payment_status: p.payment_status });
+    setPurOpen(true);
+  };
+
   const savePurchase = async () => {
     const prod = products.items.find((p) => p.id === buf.product_id);
     if (!prod || !buf.supplier_name || !buf.quantity || !buf.rate) return toast.error("Fill all fields");
-    await api.post("/purchases", {
+    const body = {
       date: buf.date, supplier_name: buf.supplier_name, product_id: prod.id, product_name: prod.name,
       quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status,
-    });
-    toast.success("Purchase recorded, stock updated");
+    };
+    if (editingPurchase) {
+      await api.put(`/purchases/${editingPurchase}`, body);
+      toast.success("Purchase updated, stock adjusted");
+    } else {
+      await api.post("/purchases", body);
+      toast.success("Purchase recorded, stock updated");
+    }
     setPurOpen(false);
-    setBuf({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid" });
+    setEditingPurchase(null);
+    setBuf(blankPurchase());
     products.load(); purchases.load();
   };
 
@@ -125,13 +161,43 @@ export default function Inventory() {
                       </Select>
                     </div>
                   </div>
-                  <div className="grid grid-cols-3 gap-4">
-                    <div><Label>{editingProduct ? "Stock" : "Opening Stock"} ({pf.unit})</Label><Input type="number" value={pf.current_stock} onChange={(e) => setPf({ ...pf, current_stock: e.target.value })} className="h-11 mt-1" data-testid="product-stock" /></div>
+                  <div className={`grid gap-4 ${editingProduct ? "grid-cols-2" : "grid-cols-3"}`}>
+                    {!editingProduct && <div><Label>Opening Stock ({pf.unit})</Label><Input type="number" value={pf.current_stock} onChange={(e) => setPf({ ...pf, current_stock: e.target.value })} className="h-11 mt-1" data-testid="product-stock" /></div>}
                     <div><Label>Rate ₹/{pf.unit}</Label><Input type="number" value={pf.rate} onChange={(e) => setPf({ ...pf, rate: e.target.value })} className="h-11 mt-1" /></div>
                     <div><Label>Low Alert</Label><Input type="number" value={pf.low_stock_threshold} onChange={(e) => setPf({ ...pf, low_stock_threshold: e.target.value })} className="h-11 mt-1" /></div>
                   </div>
+                  {editingProduct && (
+                    <p className="text-xs text-muted-foreground">
+                      Stock is not editable here — use <span className="font-medium text-foreground">Adjust stock</span> on the row,
+                      so the correction is recorded and cannot overwrite a sale made while this was open.
+                    </p>
+                  )}
                 </div>
                 <DialogFooter><Button onClick={saveProduct} data-testid="save-product-btn">Save</Button></DialogFooter>
+              </DialogContent>
+            </Dialog>
+
+            <Dialog open={!!adjust} onOpenChange={(o) => !o && setAdjust(null)}>
+              <DialogContent>
+                <DialogHeader><DialogTitle>Adjust stock — {adjust?.product?.name}</DialogTitle></DialogHeader>
+                <div className="space-y-4">
+                  <p className="text-sm text-muted-foreground">
+                    Currently <span className="font-medium text-foreground">{adjust?.product?.current_stock} {adjust?.product?.unit}</span>.
+                    Enter the change, not the new total — use a minus sign to remove.
+                  </p>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div><Label>Change ({adjust?.product?.unit})</Label>
+                      <Input type="number" value={adjust?.delta ?? ""} placeholder="e.g. -5"
+                        onChange={(e) => setAdjust({ ...adjust, delta: e.target.value })} className="h-11 mt-1" data-testid="adjust-delta" /></div>
+                    <div><Label>New total</Label>
+                      <Input value={adjust ? Math.round(((+adjust.product.current_stock || 0) + (+adjust.delta || 0)) * 1000) / 1000 : ""}
+                        readOnly disabled className="h-11 mt-1" /></div>
+                  </div>
+                  <div><Label>Reason</Label>
+                    <Input value={adjust?.reason ?? ""} placeholder="spillage, recount, damage"
+                      onChange={(e) => setAdjust({ ...adjust, reason: e.target.value })} className="h-11 mt-1" data-testid="adjust-reason" /></div>
+                </div>
+                <DialogFooter><Button onClick={saveAdjust} data-testid="save-adjust-btn">Save Adjustment</Button></DialogFooter>
               </DialogContent>
             </Dialog>
           </div>
@@ -152,7 +218,8 @@ export default function Inventory() {
                       <TableCell className="text-right">{money(p.rate)}</TableCell>
                       <TableCell>{low ? <Badge variant="outline" className="text-destructive border-destructive/30">Low</Badge> : <Badge variant="outline" className="text-secondary border-secondary/30">OK</Badge>}</TableCell>
                       <TableCell className="text-right flex gap-1 justify-end">
-                        <Button variant="ghost" size="icon" onClick={() => openEditProduct(p)} data-testid={`edit-product-${p.id}`}><Pencil className="h-4 w-4" /></Button>
+                        <Button variant="ghost" size="icon" title="Adjust stock" onClick={() => openAdjust(p)} data-testid={`adjust-product-${p.id}`}><Scale className="h-4 w-4" /></Button>
+                        <Button variant="ghost" size="icon" title="Edit details" onClick={() => openEditProduct(p)} data-testid={`edit-product-${p.id}`}><Pencil className="h-4 w-4" /></Button>
                         <Button variant="ghost" size="icon" onClick={() => products.remove(p.id)} data-testid={`del-product-${p.id}`}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                       </TableCell>
                     </TableRow>
@@ -167,12 +234,10 @@ export default function Inventory() {
         <TabsContent value="purchases">
           <div className="flex justify-between items-center mb-4">
             <Input value={pq} onChange={(e) => setPq(e.target.value)} placeholder="Search purchases..." className="h-11 max-w-xs" data-testid="search-purchases" />
-            <Dialog open={purOpen} onOpenChange={setPurOpen}>
-              <DialogTrigger asChild>
-                <Button className="h-11 active:scale-95 transition-transform" data-testid="add-purchase-btn"><Plus className="h-4 w-4 mr-1" /> Record Purchase</Button>
-              </DialogTrigger>
+            <Button className="h-11 active:scale-95 transition-transform" onClick={openNewPurchase} data-testid="add-purchase-btn"><Plus className="h-4 w-4 mr-1" /> Record Purchase</Button>
+            <Dialog open={purOpen} onOpenChange={(o) => { setPurOpen(o); if (!o) setEditingPurchase(null); }}>
               <DialogContent>
-                <DialogHeader><DialogTitle>Record Purchase</DialogTitle></DialogHeader>
+                <DialogHeader><DialogTitle>{editingPurchase ? "Edit" : "Record"} Purchase</DialogTitle></DialogHeader>
                 <div className="space-y-4">
                   <div className="grid grid-cols-2 gap-4">
                     <div><Label>Date</Label><Input type="date" value={buf.date} onChange={(e) => setBuf({ ...buf, date: e.target.value })} className="h-11 mt-1" /></div>
@@ -202,7 +267,7 @@ export default function Inventory() {
                   </div>
                   <p className="text-sm text-muted-foreground">Total: <span className="font-bold text-foreground">{money((+buf.quantity || 0) * (+buf.rate || 0))}</span></p>
                 </div>
-                <DialogFooter><Button onClick={savePurchase} data-testid="save-purchase-btn">Save Purchase</Button></DialogFooter>
+                <DialogFooter><Button onClick={savePurchase} data-testid="save-purchase-btn">{editingPurchase ? "Update" : "Save"} Purchase</Button></DialogFooter>
               </DialogContent>
             </Dialog>
           </div>
@@ -219,7 +284,10 @@ export default function Inventory() {
                     <TableCell>{p.date}</TableCell><TableCell>{p.supplier_name}</TableCell><TableCell>{p.product_name}</TableCell>
                     <TableCell className="text-right">{p.quantity} {unitOf(p.product_id)}</TableCell><TableCell className="text-right">{money(p.rate)}</TableCell>
                     <TableCell className="text-right font-medium">{money(p.total)}</TableCell><TableCell><StatusBadge status={p.payment_status} /></TableCell>
-                    <TableCell className="text-right"><Button variant="ghost" size="icon" onClick={() => purchases.remove(p.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                    <TableCell className="text-right flex gap-1 justify-end">
+                      <Button variant="ghost" size="icon" onClick={() => openEditPurchase(p)} data-testid={`edit-purchase-${p.id}`}><Pencil className="h-4 w-4" /></Button>
+                      <Button variant="ghost" size="icon" onClick={() => purchases.remove(p.id).then(() => products.load())}><Trash2 className="h-4 w-4 text-destructive" /></Button>
+                    </TableCell>
                   </TableRow>
                 ))}
                 {fPurch.length === 0 && <TableRow><TableCell colSpan={8} className="text-center text-muted-foreground py-8">No purchases yet.</TableCell></TableRow>}

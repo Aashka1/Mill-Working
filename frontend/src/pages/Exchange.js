@@ -10,7 +10,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, ArrowLeftRight, Info } from "lucide-react";
+import { Plus, Trash2, ArrowLeftRight, Info, Pencil } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Exchange() {
@@ -20,6 +20,7 @@ export default function Exchange() {
   const [q, setQ] = useState("");
   const filtered = useFilter(exchanges.items, q, ["customer_name", "date"]);
   const [open, setOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null);
   const [f, setF] = useState({ date: today(), customer_name: "", wheat_qty: "", washed: true, loss_percent: "2.5", atta_given: "" });
 
   useEffect(() => { api.get("/settings").then((r) => setSettings(r.data)).catch(() => {}); }, []);
@@ -27,13 +28,34 @@ export default function Exchange() {
   const autoAtta = (+f.wheat_qty || 0) * (1 - (+f.loss_percent || 0) / 100);
   const setWashed = (w) => setF({ ...f, washed: w, loss_percent: String(w ? settings.washed_loss : settings.unwashed_loss) });
 
+  const blank = () => ({ date: today(), customer_name: "", wheat_qty: "", washed: true, loss_percent: String(settings.washed_loss), atta_given: "" });
+
+  const openNew = () => { setEditingId(null); setF(blank()); setOpen(true); };
+  const openEdit = (e) => {
+    setEditingId(e.id);
+    setF({ date: e.date, customer_name: e.customer_name, wheat_qty: String(e.wheat_qty),
+           washed: e.washed, loss_percent: String(e.loss_percent), atta_given: String(e.atta_given) });
+    setOpen(true);
+  };
+
   const save = async () => {
     if (!f.customer_name || !f.wheat_qty) return toast.error("Fill all fields");
     const atta = f.atta_given ? +f.atta_given : +autoAtta.toFixed(2);
-    await api.post("/exchanges", { date: f.date, customer_name: f.customer_name, wheat_qty: +f.wheat_qty, washed: f.washed, loss_percent: +f.loss_percent, atta_given: atta });
-    toast.success("Exchange recorded, inventory updated");
+    const body = { date: f.date, customer_name: f.customer_name, wheat_qty: +f.wheat_qty, washed: f.washed, loss_percent: +f.loss_percent, atta_given: atta };
+    try {
+      if (editingId) {
+        await api.put(`/exchanges/${editingId}`, body);
+        toast.success("Exchange updated, inventory adjusted");
+      } else {
+        await api.post("/exchanges", body);
+        toast.success("Exchange recorded, inventory updated");
+      }
+    } catch (err) {
+      return toast.error(err.response?.data?.detail || "Failed");
+    }
     setOpen(false);
-    setF({ date: today(), customer_name: "", wheat_qty: "", washed: true, loss_percent: String(settings.washed_loss), atta_given: "" });
+    setEditingId(null);
+    setF(blank());
     exchanges.load();
   };
 
@@ -43,10 +65,10 @@ export default function Exchange() {
         title="Exchange" subtitle="Customer trades wheat crop for ready atta"
         search={q} setSearch={setQ} searchTestid="search-exchange"
         actions={
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" data-testid="add-exchange-btn"><Plus className="h-4 w-4 mr-1" /> New Exchange</Button></DialogTrigger>
+          <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setEditingId(null); }}>
+            <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-exchange-btn"><Plus className="h-4 w-4 mr-1" /> New Exchange</Button></DialogTrigger>
             <DialogContent>
-              <DialogHeader><DialogTitle>Record Exchange</DialogTitle></DialogHeader>
+              <DialogHeader><DialogTitle>{editingId ? "Edit" : "Record"} Exchange</DialogTitle></DialogHeader>
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-4">
                   <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
@@ -91,7 +113,10 @@ export default function Exchange() {
                 <TableCell><Badge variant="outline">{e.washed ? "Washed" : "Unwashed"}</Badge></TableCell>
                 <TableCell className="text-right">{e.wheat_qty}</TableCell><TableCell className="text-right text-destructive">{e.loss_kg}</TableCell>
                 <TableCell className="text-right font-medium">{e.atta_given}</TableCell>
-                <TableCell className="text-right"><Button variant="ghost" size="icon" onClick={() => exchanges.remove(e.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
+                <TableCell className="text-right flex gap-1 justify-end">
+                  <Button variant="ghost" size="icon" onClick={() => openEdit(e)} data-testid={`edit-exchange-${e.id}`}><Pencil className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" onClick={() => exchanges.remove(e.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
+                </TableCell>
               </TableRow>
             ))}
             {filtered.length === 0 && <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground py-8">No exchanges yet.</TableCell></TableRow>}
