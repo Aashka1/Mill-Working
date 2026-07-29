@@ -25,7 +25,7 @@ def test_seeded_products_include_new_types(sess):
     r = sess.get(f"{API}/products")
     assert r.status_code == 200
     names = {p["name"] for p in r.json()}
-    for n in ["Fine Atta", "Medium Atta", "Coarse Atta", "Multigrain Atta",
+    for n in ["Multigrain Atta",
               "Besan", "Makka Atta", "Bajra Atta", "Sattu", "Packing Bags",
               "Wheat Bran", "Mustard Oil Cake"]:
         assert n in names, f"missing seed: {n}"

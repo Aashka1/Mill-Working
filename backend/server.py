@@ -1133,9 +1133,6 @@ async def startup():
 DEFAULT_PRODUCTS = [
     {"name": "Wheat Crop", "category": "Wheat Crop", "unit": "kg", "low_stock_threshold": 100},
     {"name": "Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
-    {"name": "Fine Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
-    {"name": "Medium Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
-    {"name": "Coarse Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 50},
     {"name": "Multigrain Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
     {"name": "Besan", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
     {"name": "Makka Atta", "category": "Flour", "unit": "kg", "low_stock_threshold": 30},
@@ -1204,10 +1201,27 @@ async def consolidate_products():
     await db.products.create_index("name_key", unique=True)
 
 async def seed_products():
-    for p in DEFAULT_PRODUCTS:
-        if await db.products.find_one({"name_key": product_key(p["name"])}) is None:
+    """Populate the catalogue once, on a brand new database only.
+
+    This used to top the catalogue up on every boot, re-inserting any default
+    product that was missing. Startup runs again each time Render's free tier
+    wakes from idle, so a product the mill deleted reappeared within the hour as
+    a blank row — and it looked random, because it came back on the next wake
+    rather than straight after the delete. Deleting is the operator's decision;
+    seeding is only for giving an empty database somewhere to start.
+    """
+    settings = await db.settings.find_one({"id": "config"}) or {}
+    if settings.get("catalogue_seeded"):
+        return
+
+    # An existing database already has whatever catalogue the mill wants,
+    # including the deliberate absences. Adopt it rather than topping it up.
+    if await db.products.count_documents({}) == 0:
+        for p in DEFAULT_PRODUCTS:
             await db.products.insert_one({"id": str(uuid.uuid4()), **p, "name_key": product_key(p["name"]),
                 "current_stock": 0, "rate": 0, "cost_per_unit": 0, "created_at": now_iso()})
+
+    await db.settings.update_one({"id": "config"}, {"$set": {"catalogue_seeded": True}}, upsert=True)
 
 # What the mill will grind, and what each item yields. The operator can add to
 # this from the grinding form — masala, a new millet — without a code change.
