@@ -11,6 +11,8 @@ import Grinding from "@/pages/Grinding";
 import OilExtraction from "@/pages/OilExtraction";
 import Production from "@/pages/Production";
 import Exchange from "@/pages/Exchange";
+import Costing from "@/pages/Costing";
+import Maintenance from "@/pages/Maintenance";
 import Expenses from "@/pages/Expenses";
 import Customers from "@/pages/Customers";
 import Suppliers from "@/pages/Suppliers";
@@ -43,6 +45,8 @@ function App() {
             <Route path="oil" element={<OilExtraction />} />
             <Route path="production" element={<Production />} />
             <Route path="exchange" element={<Exchange />} />
+            <Route path="costing" element={<Costing />} />
+            <Route path="maintenance" element={<Maintenance />} />
             <Route path="expenses" element={<Expenses />} />
             <Route path="customers" element={<Customers />} />
             <Route path="suppliers" element={<Suppliers />} />

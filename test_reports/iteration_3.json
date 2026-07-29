@@ -1,0 +1,27 @@
+{
+  "summary": "Iteration 3 tested end-to-end: Costing endpoint & UI (edit selling price -> margin recalculation), Sattu workflow (seed product, production Wheat Crop -> Sattu, Sattu sale), Maintenance CRUD with next_due computation, PATCH serviced, notifications for overdue/upcoming schedules, and role-based delete. Backend: 14/14 pytest passing. Frontend: sidebar shows Costing & Maintenance, Costing edit + Save works with toast, Maintenance add/mark-serviced works and shows Next Due + status badge, Production dialog Mill dropdown includes Sattu and auto-fills Wheat Crop input & Sattu output. Notification bell shows badge count including maintenance reminders.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iteration3.py",
+    "/app/test_reports/pytest/iteration3.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is 1000+ lines — consider splitting into routers per resource (auth, products, sales, maintenance, costing) for maintainability.",
+    "compute_next_due parses last_service_date with datetime.fromisoformat then adds interval_days — works for YYYY-MM-DD strings but silently falls back to now() on parse error; consider raising 400 for invalid dates.",
+    "Costing endpoint recomputes margin_pct as margin/rate, but if rate < cost gives negative margin_pct — that is fine but Costing.js caps display to 0.0% when rate==0 while still rendering negative pct when rate>0 (Sattu row visible: shows 0.0% but margin=-26.52 because rate=0). The margin_pct formula in backend: pct=round(margin/rate*100,1) if rate else 0 — matches UI. OK.",
+    "No pagination on lists (products/maintenance/sales) — .to_list(1000/2000) will silently truncate at scale.",
+    "add_stock_with_cost weighted-average cost uses only positive quantity increments; production allocation splits input_cost proportionally by quantity which is a simple heuristic but acceptable."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration3.py (new)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "Admin: admin@agrimill.com/admin123, Staff: staff@agrimill.com/staff123 (from /app/memory/test_credentials.md if available; validated at login)",
+  "seed_data_creation": "Tests created ephemeral TEST_ prefixed maintenance schedules, one TEST_Supplier purchase for wheat, and a Sattu production run + sale. UI test created 'UI_TestMachine' schedule and updated Atta price to 45 & 55 during editing tests. No cleanup performed for UI-created maintenance row; main agent may remove.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 3 features (Costing, Sattu workflow, Maintenance) fully verified backend + UI. All data-testids from spec present and functional. test_iteration3.py is the regression file for these features. Previous regression suites (test_agrimill.py, test_mill_expansion.py) not re-run this iteration.",
+  "rca of the issue": "No issues found."
+}

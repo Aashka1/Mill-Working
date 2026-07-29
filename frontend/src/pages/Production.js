@@ -15,6 +15,7 @@ import { toast } from "sonner";
 const MILL_CONFIG = {
   Flour: { input: "Wheat Crop", outputs: ["Atta", "Wheat Bran"] },
   Oil: { input: "Mustard Seeds", outputs: ["Mustard Oil", "Mustard Oil Cake"] },
+  Sattu: { input: "Wheat Crop", outputs: ["Sattu"] },
 };
 
 export default function Production() {
@@ -79,7 +80,7 @@ export default function Production() {
               <div><Label>Mill</Label>
                 <Select value={mill} onValueChange={applyMill}>
                   <SelectTrigger className="h-11 mt-1" data-testid="production-mill"><SelectValue /></SelectTrigger>
-                  <SelectContent><SelectItem value="Flour">Flour Mill</SelectItem><SelectItem value="Oil">Oil Mill</SelectItem></SelectContent>
+                  <SelectContent><SelectItem value="Flour">Flour Mill</SelectItem><SelectItem value="Oil">Oil Mill</SelectItem><SelectItem value="Sattu">Sattu</SelectItem></SelectContent>
                 </Select>
               </div>
               <div><Label>Date</Label><Input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="h-11 mt-1" /></div>

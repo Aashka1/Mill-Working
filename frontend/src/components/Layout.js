@@ -6,7 +6,7 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   LayoutDashboard, Package, ShoppingCart, Wheat, Droplets, Receipt,
-  Users, Truck, FileText, Sun, Moon, LogOut, Bell, Menu, X, Factory, ArrowLeftRight
+  Users, Truck, FileText, Sun, Moon, LogOut, Bell, Menu, X, Factory, ArrowLeftRight, Wrench, Calculator
 } from "lucide-react";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuLabel, DropdownMenuSeparator,
@@ -25,6 +25,8 @@ const NAV = [
   { to: "/customers", label: "Customers", icon: Users },
   { to: "/suppliers", label: "Suppliers", icon: Truck },
   { to: "/invoices", label: "Invoices", icon: FileText },
+  { to: "/costing", label: "Costing", icon: Calculator },
+  { to: "/maintenance", label: "Maintenance", icon: Wrench },
 ];
 
 export default function Layout() {

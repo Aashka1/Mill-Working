@@ -623,6 +623,14 @@ async def notifications(user: dict = Depends(get_current_user)):
     for p in await db.purchases.find({"payment_status": "Pending"}).to_list(1000):
         notes.append({"type": "supplier_due", "level": "info",
                       "message": f'Supplier due: {p.get("supplier_name","?")} - Rs {p.get("total",0):.0f}'})
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    soon = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    for m in await db.maintenance.find().to_list(1000):
+        nd = m.get("next_due_date", "")
+        if nd and nd <= soon:
+            overdue = nd < today_str
+            notes.append({"type": "maintenance", "level": "warning" if overdue else "info",
+                          "message": f'{"OVERDUE" if overdue else "Upcoming"} maintenance: {m.get("machine","?")} — {m.get("task","service")} (due {nd})'})
     return notes
 
 @api_router.get("/export/{kind}")
@@ -939,6 +947,69 @@ async def daybook(date: str, user: dict = Depends(get_current_user)):
             "purchases": round(sum(p.get("total", 0) for p in purchases), 2),
             "net": round(collected - exp_total, 2),
             "counts": {"sales": len(sales), "grinding": len(grinding), "oil": len(oil), "expenses": len(expenses)}}
+
+# ==================== Maintenance & Costing ====================
+
+def compute_next_due(last_date, interval_days):
+    try:
+        d = datetime.fromisoformat(last_date)
+    except Exception:
+        d = datetime.now(timezone.utc)
+    return (d + timedelta(days=int(interval_days))).strftime("%Y-%m-%d")
+
+class MaintenanceBody(BaseModel):
+    machine: str
+    task: str
+    last_service_date: str
+    interval_days: int
+    notes: str = ""
+
+@api_router.get("/maintenance")
+async def get_maintenance(user: dict = Depends(get_current_user)):
+    return [clean(m) for m in await db.maintenance.find().sort("next_due_date", 1).to_list(1000)]
+
+@api_router.post("/maintenance")
+async def create_maintenance(body: MaintenanceBody, user: dict = Depends(get_current_user)):
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(),
+           "next_due_date": compute_next_due(body.last_service_date, body.interval_days), "created_at": now_iso()}
+    await db.maintenance.insert_one(doc)
+    return clean(doc)
+
+@api_router.put("/maintenance/{mid}")
+async def update_maintenance(mid: str, body: MaintenanceBody, user: dict = Depends(get_current_user)):
+    await db.maintenance.update_one({"id": mid}, {"$set": {**body.model_dump(),
+        "next_due_date": compute_next_due(body.last_service_date, body.interval_days)}})
+    return clean(await db.maintenance.find_one({"id": mid}))
+
+@api_router.patch("/maintenance/{mid}/serviced")
+async def mark_serviced(mid: str, user: dict = Depends(get_current_user)):
+    m = await db.maintenance.find_one({"id": mid})
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    await db.maintenance.update_one({"id": mid}, {"$set": {"last_service_date": today_str,
+        "next_due_date": compute_next_due(today_str, m["interval_days"])}})
+    return clean(await db.maintenance.find_one({"id": mid}))
+
+@api_router.delete("/maintenance/{mid}")
+async def delete_maintenance(mid: str, user: dict = Depends(require_admin)):
+    await db.maintenance.delete_one({"id": mid})
+    return {"message": "deleted"}
+
+@api_router.get("/costing")
+async def costing(user: dict = Depends(get_current_user)):
+    finished = {"Flour", "Bran", "Edible Oil", "Oil Cake"}
+    rows = []
+    for p in await db.products.find().sort("name", 1).to_list(1000):
+        if p.get("category") in finished:
+            cost = round(p.get("cost_per_unit", 0), 2)
+            rate = round(p.get("rate", 0), 2)
+            margin = round(rate - cost, 2)
+            pct = round((margin / rate * 100), 1) if rate else 0
+            rows.append({"id": p["id"], "name": p["name"], "category": p["category"], "unit": p.get("unit", "kg"),
+                         "current_stock": p.get("current_stock", 0), "cost_per_unit": cost,
+                         "rate": rate, "margin": margin, "margin_pct": pct})
+    return rows
 
 app.include_router(api_router)
 
