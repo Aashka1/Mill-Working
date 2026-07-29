@@ -1,0 +1,50 @@
+{
+  "summary": "Comprehensive backend + frontend E2E testing for AgriMill Hub. 21/21 backend pytest cases pass covering auth (cookies, invalid, logout), products/inventory (create/list/purchase-increments/sale-decrements), sales (invoice auto-gen + PDF + Excel export), grinding (no stock impact), oil (no stock impact), expenses, customers (outstanding aggregation, history), suppliers (outstanding), dashboard (all keys + 6-month trend + revenue_breakdown), notifications (low_stock/pending_payment/supplier_due), invoices list, and RBAC (staff blocked from DELETE product with 403, admin allowed). Frontend Playwright E2E validated login as admin, all 9 sidebar nav items present, product & purchase creation with stock update (stock went from 0 to 100 kg for UI_Wheat), sale, grinding, oil, expense, customer and supplier creation flows, invoices page shows INV- numbers, dashboard renders all metric cards + Income vs Expenses bar chart + Revenue Breakdown pie chart + Low Stock/Dues Summary, notification bell badge shows 6, theme toggle button responds, and logout returns to /login.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/expenses/{eid} DELETE", "issue": "Uses get_current_user instead of require_admin — inconsistent with delete pattern used for products/purchases/sales/grinding/oil (all admin-only). Staff can delete expenses currently."},
+      {"endpoint": "startup CORS", "issue": "CORSMiddleware allow_origins uses FRONTEND_URL only; env has CORS_ORIGINS='*' which is unused. With allow_credentials=True and single explicit origin this works but CORS_ORIGINS env is dead code."},
+      {"endpoint": "/api/dashboard trend", "issue": "6-month trend built via `datetime.now().replace(day=1) - timedelta(days=i*30)` — inaccurate for month boundaries (30-day approximation can duplicate/skip months in Feb/long months). Prefer proper month arithmetic."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Dev overlay (webpack-dev-server)", "issue": "A benign 'ResizeObserver loop completed with undelivered notifications' warning triggers the CRA red overlay iframe which intercepts pointer events and blocks all clicks. Repro: open app, add a product, then click Tabs trigger — click is blocked. Only present in dev build (react-scripts). Recommend adding a ResizeObserver error swallower in index.js or upgrading to Vite/silencing the warning.", "selector": "#webpack-dev-server-client-overlay", "priority": "MEDIUM"},
+      {"component": "DialogContent (all modals)", "issue": "Console warning: 'Missing Description or aria-describedby={undefined} for DialogContent' — Radix a11y warning; add DialogDescription to each dialog.", "selector": "[role=dialog]", "priority": "LOW"}
+    ],
+    "integration_issues": [
+      {"flow": "Sales creation via UI", "issue": "When no customers exist, sale-customer dropdown only offers 'Walk-in' fallback but selecting it did not populate f.customer_name in one run, resulting in toast 'Fill all fields'. Second attempt worked. Verify Walk-in fallback SelectItem value is a non-empty string and sets f.customer_name reliably.", "affected_selectors": ["[data-testid=sale-customer]", "[data-testid=save-sale-btn]"]}
+    ],
+    "design_issues": [
+      {"screen": "Dashboard", "issues": ["Warm earthy theme applied correctly, charts render with brand color #B8860B, contrast is good in light mode. Consider showing empty-state placeholder in Revenue Breakdown pie when values are 0."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_agrimill.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Consider tightening RBAC on DELETE /api/expenses to admin-only for consistency.",
+    "Silence ResizeObserver warning in frontend (index.js) so CRA dev overlay does not block interactions.",
+    "Add DialogDescription to shadcn Dialog components to remove Radix a11y warning.",
+    "Confirm Walk-in fallback on Sales/Grinding/Oil customer selects sets f.customer_name properly.",
+    "Optional: Fix 6-month trend month arithmetic in /api/dashboard (use relativedelta or manual month math)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 669 lines — approaching the 700-line threshold; consider splitting into modules (auth, products, sales, services, reports).",
+    "DELETE /api/expenses uses get_current_user (any authenticated user) whereas all other DELETE endpoints require admin. Inconsistent RBAC.",
+    "hash_password/verify_password use bcrypt correctly ($2b$ hash) and admin seed idempotently rehashes if password changed — good.",
+    "httpOnly cookies with samesite=none + secure=true correctly set for cross-site frontend; matches spec.",
+    "Brute force lockout after 5 attempts + 15-min lockout implemented correctly.",
+    "MongoDB _id properly stripped via clean() helper before returning to client.",
+    "CORS: allow_credentials=True with explicit FRONTEND_URL origin — correct for cookie auth.",
+    "Purchase/Sale DELETE endpoints correctly reverse the stock adjustment before deletion — good data-integrity.",
+    "Frontend axios uses withCredentials via /lib/api.js — cookies work across preview domain.",
+    "All interactive elements have data-testid attributes — excellent testability."
+  ],
+  "updated_files": ["/app/backend/tests/test_agrimill.py"],
+  "success_rate": {"backend": "100% (21/21)", "frontend": "~90% (all critical flows work; minor dev-overlay pointer-event issue)"},
+  "test_credentials": "Admin: admin@agrimill.com/admin123, Staff: staff@agrimill.com/staff123 (verified working; seed_admin re-hashes if password changed)",
+  "seed_data_creation": "Backend tests create TEST_ prefixed products/customers/suppliers/sales/grinding/oil/expenses. Cleanup fixture removes TEST_ prefixed products/customers/suppliers via admin session. Sales/grinding/oil/purchases/expenses/invoices remain in DB — recommend broader cleanup in future iterations.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend test file at /app/backend/tests/test_agrimill.py uses -n 0 (serial) via `python -m pytest -n 0` because tests share state (product_id/sale_id via pytest module attributes). pytest.ini forces `-n 2 --dist loadscope` which runs classes in parallel and breaks the ordering — always pass `-n 0` on the CLI. External URL used from REACT_APP_BACKEND_URL. Dashboard currently shows leftover test data (₹1600 sales, 2 grinding, 2 oil, 6 notifications) — subsequent runs should clear collections if needed. All data-testids match those in review request."
+}
