@@ -369,7 +369,7 @@ async def create_expense(body: ExpenseBody, user: dict = Depends(get_current_use
     return clean(doc)
 
 @api_router.delete("/expenses/{eid}")
-async def delete_expense(eid: str, user: dict = Depends(get_current_user)):
+async def delete_expense(eid: str, user: dict = Depends(require_admin)):
     await db.expenses.delete_one({"id": eid})
     return {"message": "deleted"}
 
