@@ -513,6 +513,7 @@ class PurchaseBody(BaseModel):
     # Blank means "settled in full"; any number records a part payment.
     amount_paid: Optional[float] = None
     payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
     # Only used when a purchase creates the product.
     unit: Optional[str] = None
     category: Optional[str] = None
@@ -562,7 +563,7 @@ async def create_purchase(body: PurchaseBody, user: dict = Depends(get_current_u
     await db.purchases.insert_one(doc)
     await add_stock_with_cost(prod["id"], body.quantity, total)
     received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
-    await add_credit("supplier", body.supplier_name, min(received, total), body.date, doc["id"], f"Purchase {body.product_name}", mode=body.payment_mode)
+    await add_credit("supplier", body.supplier_name, min(received, total), body.date, doc["id"], f"Purchase {body.product_name}", mode=body.payment_mode, bank_id=body.bank_id)
     await sync_payment_state("purchases", doc["id"])
     doc = await db.purchases.find_one({"id": doc["id"]})
     await log_audit(user, "Created purchase", f'{body.supplier_name} · {prod["name"]} {body.quantity} {prod.get("unit", "kg")} · Rs {total}')
@@ -582,6 +583,7 @@ async def edit_purchase(pid: str, body: PurchaseBody, user: dict = Depends(get_c
     fields.update({"product_id": prod["id"], "product_name": prod["name"]})
     await db.purchases.update_one({"id": pid}, {"$set": {**fields, "total": total}})
     await add_stock_with_cost(prod["id"], body.quantity, total)
+    await retag_bill_payments(pid, body.payment_mode, body.bank_id)
     await sync_payment_state("purchases", pid)
     await log_audit(user, "Edited purchase", f'{body.supplier_name} · {prod["name"]} {body.quantity} {prod.get("unit", "kg")} · Rs {total}')
     return clean(await db.purchases.find_one({"id": pid}))
@@ -592,6 +594,8 @@ async def delete_purchase(pid: str, user: dict = Depends(require_admin)):
     if p:
         await db.products.update_one({"id": p["product_id"]}, {"$inc": {"current_stock": -p["quantity"]}})
         await db.purchases.delete_one({"id": pid})
+        for row in await db.payments.find({"ref_id": pid}).to_list(500):
+            await unpost_bank_txn(row["id"])
         await db.payments.delete_many({"ref_id": pid})
     return {"message": "deleted"}
 
@@ -608,6 +612,7 @@ class SaleBody(BaseModel):
     payment_status: str = "Paid"
     amount_paid: Optional[float] = None
     payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
 
 async def product_cost(product_id: str) -> float:
     p = await db.products.find_one({"id": product_id})
@@ -647,7 +652,7 @@ async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
         "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
         "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
     received = total if body.amount_paid is None and body.payment_status == "Paid" else (body.amount_paid or 0)
-    await add_credit("customer", body.customer_name, min(received, total), body.date, doc["id"], f"Sale {inv}", mode=body.payment_mode)
+    await add_credit("customer", body.customer_name, min(received, total), body.date, doc["id"], f"Sale {inv}", mode=body.payment_mode, bank_id=body.bank_id)
     await sync_payment_state("sales", doc["id"])
     doc = await db.sales.find_one({"id": doc["id"]})
     await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
@@ -660,6 +665,8 @@ async def delete_sale(sid: str, user: dict = Depends(require_admin)):
         await db.products.update_one({"id": s["product_id"]}, {"$inc": {"current_stock": s["quantity"]}})
         await db.sales.delete_one({"id": sid})
         await db.invoices.delete_one({"ref_id": sid})
+        for row in await db.payments.find({"ref_id": sid}).to_list(500):
+            await unpost_bank_txn(row["id"])
         await db.payments.delete_many({"ref_id": sid})
     return {"message": "deleted"}
 
@@ -683,6 +690,7 @@ class GrindingBody(BaseModel):
     payment_status: str = "Pending"
     amount_paid: Optional[float] = None
     payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
 
 @api_router.get("/grinding")
 async def get_grinding(user: dict = Depends(get_current_user)):
@@ -698,7 +706,7 @@ async def create_grinding(body: GrindingBody, user: dict = Depends(get_current_u
         "total": doc["total_charge"], "payment_status": doc["payment_status"], "created_at": now_iso()})
     charge = doc["total_charge"]
     received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
-    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}", mode=body.payment_mode)
+    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}", mode=body.payment_mode, bank_id=body.bank_id)
     await sync_payment_state("grinding", doc["id"])
     doc = await db.grinding.find_one({"id": doc["id"]})
     return clean(doc)
@@ -710,6 +718,8 @@ async def delete_grinding(gid: str, user: dict = Depends(require_admin)):
         await apply_grinding_effects(g, -1)
         await db.grinding.delete_one({"id": gid})
         await db.invoices.delete_one({"ref_id": gid})
+        for row in await db.payments.find({"ref_id": gid}).to_list(500):
+            await unpost_bank_txn(row["id"])
         await db.payments.delete_many({"ref_id": gid})
     return {"message": "deleted"}
 
@@ -736,6 +746,7 @@ class OilBody(BaseModel):
     payment_status: str = "Pending"
     amount_paid: Optional[float] = None
     payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
 
 @api_router.get("/oil")
 async def get_oil(user: dict = Depends(get_current_user)):
@@ -754,10 +765,10 @@ async def create_oil(body: OilBody, user: dict = Depends(get_current_user)):
         # The cake is worth more than the grinding: hand the difference over.
         # Recorded at once, because the customer leaves with the cash.
         await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
-                         f"Paid to customer · Oil {doc['invoice_number']}", kind="refund", mode=body.payment_mode)
+                         f"Paid to customer · Oil {doc['invoice_number']}", kind="refund", mode=body.payment_mode, bank_id=body.bank_id)
     else:
         received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
-        await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Oil {doc['invoice_number']}", mode=body.payment_mode)
+        await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Oil {doc['invoice_number']}", mode=body.payment_mode, bank_id=body.bank_id)
     await sync_payment_state("oil", doc["id"])
     doc = await db.oil.find_one({"id": doc["id"]})
     return clean(doc)
@@ -769,6 +780,8 @@ async def delete_oil(oid: str, user: dict = Depends(require_admin)):
         await apply_oil_effects(o, -1)
         await db.oil.delete_one({"id": oid})
         await db.invoices.delete_one({"ref_id": oid})
+        for row in await db.payments.find({"ref_id": oid}).to_list(500):
+            await unpost_bank_txn(row["id"])
         await db.payments.delete_many({"ref_id": oid})
     return {"message": "deleted"}
 
@@ -1129,6 +1142,23 @@ async def startup():
     # Mongo drops expired reset records on its own; the endpoint also checks.
     await db.password_resets.create_index("expires_at", expireAfterSeconds=0)
     await db.reset_attempts.create_index("identifier")
+    # One automatic posting per source, enforced by the database rather than by
+    # every caller remembering to check first.
+    # Partial rather than sparse: sparse only skips documents missing the field,
+    # so any row storing an explicit null would still collide with the others.
+    await db.bank_txns.create_index("source_ref", unique=True,
+                                    partialFilterExpression={"source_ref": {"$type": "string"}})
+    await db.bank_txns.create_index([("bank_id", 1), ("date", -1)])
+    await db.bank_txns.create_index("reconciled")
+    await db.bank_accounts.create_index("account_digits", sparse=True)
+    # The ledger and search paths scan these on every customer and supplier row;
+    # unindexed they are full collection scans that grow with total sales.
+    for coll, field in (("sales", "customer_name"), ("grinding", "customer_name"),
+                        ("oil", "customer_name"), ("purchases", "supplier_name"),
+                        ("payments", "party_name")):
+        await db[coll].create_index(field)
+    for coll in ("sales", "purchases", "grinding", "oil", "expenses", "payments"):
+        await db[coll].create_index("date")
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@agrimill.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
@@ -1570,12 +1600,16 @@ async def delete_exchange(eid: str, user: dict = Depends(require_admin)):
 # ---- Record a payment ----
 class PayBody(BaseModel):
     payment_method: str = "Cash"
+    # How the money moved, and into which account if it was a bank mode.
+    payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
+    reference: str = ""
     # Omitted means "settle the whole balance", preserving the original
     # mark-as-paid behaviour for callers that do not send an amount.
     amount: Optional[float] = None
     date: Optional[str] = None
 
-async def take_payment(coll, rid, method, amount=None, date=None, party="customer", party_field="customer_name"):
+async def take_payment(coll, rid, method, amount=None, date=None, party="customer", party_field="customer_name", mode="Cash", bank_id=None):
     doc = await db[coll].find_one({"id": rid})
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
@@ -1599,26 +1633,27 @@ async def mark_paid(coll, rid, method):
 
 @api_router.patch("/sales/{rid}/pay")
 async def pay_sale(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    state = await take_payment("sales", rid, body.payment_method, body.amount, body.date)
+    state = await take_payment("sales", rid, body.payment_method, body.amount, body.date, mode=body.payment_mode, bank_id=body.bank_id)
     await log_audit(user, "Recorded payment", f'sales {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
     return state
 
 @api_router.patch("/grinding/{rid}/pay")
 async def pay_grinding(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    state = await take_payment("grinding", rid, body.payment_method, body.amount, body.date)
+    state = await take_payment("grinding", rid, body.payment_method, body.amount, body.date, mode=body.payment_mode, bank_id=body.bank_id)
     await log_audit(user, "Recorded payment", f'grinding {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
     return state
 
 @api_router.patch("/oil/{rid}/pay")
 async def pay_oil(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
-    state = await take_payment("oil", rid, body.payment_method, body.amount, body.date)
+    state = await take_payment("oil", rid, body.payment_method, body.amount, body.date, mode=body.payment_mode, bank_id=body.bank_id)
     await log_audit(user, "Recorded payment", f'oil {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
     return state
 
 @api_router.patch("/purchases/{rid}/pay")
 async def pay_purchase(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
     state = await take_payment("purchases", rid, body.payment_method, body.amount, body.date,
-                               party="supplier", party_field="supplier_name")
+                               party="supplier", party_field="supplier_name",
+                               mode=body.payment_mode, bank_id=body.bank_id)
     await log_audit(user, "Recorded payment", f'purchase {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
     return state
 
@@ -1634,6 +1669,7 @@ async def edit_sale(sid: str, body: SaleBody, user: dict = Depends(get_current_u
     await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": -body.quantity}})
     await db.invoices.update_one({"ref_id": sid}, {"$set": {"customer_name": body.customer_name,
         "date": body.date, "total": total}})
+    await retag_bill_payments(sid, body.payment_mode, body.bank_id)
     await sync_payment_state("sales", sid)
     return clean(await db.sales.find_one({"id": sid}))
 
@@ -1650,6 +1686,7 @@ async def edit_grinding(gid: str, body: GrindingBody, user: dict = Depends(get_c
     await apply_grinding_effects(doc, 1)
     await db.invoices.update_one({"ref_id": gid}, {"$set": {"customer_name": doc["customer_name"],
         "date": doc["date"], "total": doc["total_charge"]}})
+    await retag_bill_payments(gid, body.payment_mode, body.bank_id)
     await sync_payment_state("grinding", gid)
     return clean(await db.grinding.find_one({"id": gid}))
 
@@ -1666,6 +1703,7 @@ async def edit_oil(oid: str, body: OilBody, user: dict = Depends(get_current_use
     await apply_oil_effects(doc, 1)
     await db.invoices.update_one({"ref_id": oid}, {"$set": {"customer_name": doc["customer_name"],
         "date": doc["date"], "total": doc["total"]}})
+    await retag_bill_payments(oid, body.payment_mode, body.bank_id)
     await sync_payment_state("oil", oid)
     return clean(await db.oil.find_one({"id": oid}))
 
@@ -1769,27 +1807,41 @@ async def costing(user: dict = Depends(get_current_user)):
 
 # ==================== Ledger, Cash Book, Analytics, Audit ====================
 
-# How the money moved. Only Cash touches the drawer; Bank settles into the
-# account, so the cash book has to tell them apart or Cash in Hand drifts up by
-# every non-cash payment ever taken.
-PAYMENT_MODES = ("Cash", "Bank")
+# How the money moved, and therefore which ledger it lands in. Only Cash touches
+# the drawer; every bank mode settles into an account, so the cash book has to
+# tell them apart or Cash in Hand drifts up by every digital payment ever taken.
+BANK_MODES = ("Bank", "UPI", "NEFT", "RTGS", "IMPS", "Cheque")
 
-# Payments recorded while UPI was still offered. They settled into the account,
-# so they fold into Bank. Without this they would hit the default below and be
-# reclassified as Cash, inflating Cash in Hand by every past digital payment —
-# clean_mode runs on read as well as write, so it rewrites history, not just
-# new rows.
-LEGACY_MODES = {"UPI": "Bank"}
+# Paid in kind — flour kept back as the grinding fee, or grain handed over
+# instead of cash. Moves stock, never money, so it must reach neither ledger.
+MATERIAL_MODES = ("Grain", "Material")
+
+PAYMENT_MODES = ("Cash",) + BANK_MODES + MATERIAL_MODES
+
+# Written by the brief period when only Cash and Bank were offered, and by the
+# older free-text fields. Mapped rather than dropped because clean_mode runs on
+# read as well as write: an unrecognised value falls through to Cash, which
+# would silently reclassify past digital payments as drawer cash.
+MODE_ALIASES = {
+    "BANK TRANSFER": "Bank", "NET BANKING": "Bank", "NETBANKING": "Bank",
+    "CHECK": "Cheque", "CHQ": "Cheque", "DD": "Cheque",
+    "G-PAY": "UPI", "GPAY": "UPI", "PHONEPE": "UPI", "PAYTM": "UPI",
+}
+
+_MODE_LOOKUP = {m.upper(): m for m in PAYMENT_MODES}
 
 def clean_mode(mode) -> str:
     raw = (mode or "Cash").strip()
-    legacy = LEGACY_MODES.get(raw.upper())
-    if legacy:
-        return legacy
-    m = raw.title()
-    return m if m in PAYMENT_MODES else "Cash"
+    key = raw.upper()
+    return _MODE_LOOKUP.get(key) or MODE_ALIASES.get(key) or "Cash"
 
-async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind="receipt", mode="Cash"):
+def is_bank_mode(mode) -> bool:
+    return clean_mode(mode) in BANK_MODES
+
+def is_material_mode(mode) -> bool:
+    return clean_mode(mode) in MATERIAL_MODES
+
+async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind="receipt", mode="Cash", bank_id=None):
     """Record money moving against a party.
 
     A negative amount on a customer is money paid out to them, which keeps the
@@ -1802,9 +1854,62 @@ async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind=
     """
     if not amount:
         return
-    await db.payments.insert_one({"id": str(uuid.uuid4()), "party_type": party_type, "party_name": name,
+    resolved = clean_mode(mode)
+    pid = str(uuid.uuid4())
+    await db.payments.insert_one({"id": pid, "party_type": party_type, "party_name": name,
         "amount": round(amount, 2), "date": date, "note": note, "ref_id": ref_id,
-        "kind": kind, "payment_mode": clean_mode(mode), "created_at": now_iso()})
+        "kind": kind, "payment_mode": resolved, "bank_id": bank_id, "created_at": now_iso()})
+    await post_payment_to_bank(pid)
+    return pid
+
+async def retag_bill_payments(ref_id: str, mode, bank_id=None):
+    """Move a bill's own payments onto the mode it now says it was settled by.
+
+    Editing a bill from NEFT to Cash means the money did not come through the
+    bank after all. Without this the payment keeps its old mode and its bank row
+    survives, leaving the account permanently overstated.
+    """
+    resolved = clean_mode(mode)
+    rows = await db.payments.find({"ref_id": ref_id}).to_list(500)
+    for row in rows:
+        await db.payments.update_one({"id": row["id"]},
+                                     {"$set": {"payment_mode": resolved, "bank_id": bank_id}})
+        await post_payment_to_bank(row["id"])
+
+async def post_payment_to_bank(payment_id: str):
+    """Mirror a bank-mode payment into the bank ledger, exactly once.
+
+    This is what makes the posting automatic: nothing else in the app has to
+    remember to write a bank row. Keyed on the payment id, so re-running after
+    an edit updates the existing row rather than adding a second, and a payment
+    that changes from UPI to Cash has its bank row removed instead of stranded.
+    """
+    pay = await db.payments.find_one({"id": payment_id})
+    if not pay:
+        return
+    mode = clean_mode(pay.get("payment_mode"))
+    # Cash never reaches an account, and paying in flour or grain moves stock
+    # rather than money. Neither belongs in a bank ledger.
+    if mode not in BANK_MODES:
+        await unpost_bank_txn(payment_id)
+        return
+    bank_id = pay.get("bank_id") or await default_bank_id()
+    if not bank_id:
+        # Several accounts and none chosen: recording it against a guess would
+        # put money in the wrong ledger. The payment stands; the posting waits.
+        logger.warning("Payment %s is %s but no bank account was selected; not posted.", payment_id, mode)
+        return
+    amount = pay.get("amount", 0) or 0
+    party = pay.get("party_type")
+    # A positive customer row is money received; a negative one is a refund paid
+    # out. Supplier rows are always money leaving.
+    inflow = party == "customer" and amount >= 0
+    await post_bank_txn(
+        bank_id=bank_id, date=pay.get("date"),
+        txn_type="Bank Receipt" if inflow else "Bank Payment",
+        amount=abs(amount), mode=mode, party_name=pay.get("party_name", ""),
+        reference=pay.get("reference", ""), note=pay.get("note", ""),
+        source_ref=payment_id, source_kind="payment")
 
 # ---------------- Part payment ----------------
 # A bill can be settled over several visits. The payments collection is the
@@ -1865,6 +1970,9 @@ class PaymentBody(BaseModel):
     amount: float
     date: str
     note: str = ""
+    payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
+    reference: str = ""
 
 @api_router.get("/payments")
 async def list_payments(party_type: Optional[str] = None, party_name: Optional[str] = None, user: dict = Depends(get_current_user)):
@@ -1945,7 +2053,9 @@ async def cashbook(date: str, user: dict = Depends(get_current_user)):
         return [i for i in items if is_cash(i)]
 
     def digital(items):
-        return [i for i in items if not is_cash(i)]
+        # Bank modes only. Grain and flour settle in kind and never touch a
+        # money ledger, so they must not appear as bank movement either.
+        return [i for i in items if is_bank_mode(i.get("payment_mode"))]
 
     def before(items):
         return [i for i in items if str(i.get("date", "")) < date]
@@ -1985,6 +2095,287 @@ async def cashbook(date: str, user: dict = Depends(get_current_user)):
             "bank_received": round(bank_in_today, 2), "bank_paid": round(bank_out_today, 2),
             "received_by_mode": by_mode,
             "total_received": round(in_today + bank_in_today, 2)}
+
+# ==================== Bank Management ====================
+# Balances are always derived: opening_balance plus the sum of the account's
+# transactions. A stored running balance would drift the moment any transaction
+# was edited, deleted or posted out of order, and this ledger has to reconcile
+# against a real bank statement.
+
+ACCOUNT_TYPES = ("Savings", "Current", "Cash Credit")
+
+# Signed so the arithmetic is uniform: inflows add, outflows subtract, and a
+# balance is just a sum. Transfers are recorded as a pair.
+TXN_SIGN = {
+    "Deposit": 1, "Bank Receipt": 1, "Interest Credit": 1, "Transfer In": 1,
+    "Withdrawal": -1, "Bank Payment": -1, "Bank Charges": -1, "Transfer Out": -1,
+}
+
+class BankAccountBody(BaseModel):
+    bank_name: str
+    branch: str = ""
+    account_number: str = ""
+    ifsc: str = ""
+    holder_name: str = ""
+    opening_balance: float = 0
+    account_type: str = "Current"
+
+class BankTxnBody(BaseModel):
+    bank_id: str
+    date: str
+    txn_type: str
+    amount: float
+    mode: str = "Bank"
+    party_name: str = ""
+    reference: str = ""          # cheque number, UTR, UPI reference
+    note: str = ""
+
+class BankTransferBody(BaseModel):
+    from_bank_id: str
+    to_bank_id: str
+    date: str
+    amount: float
+    reference: str = ""
+    note: str = ""
+
+class ReconcileBody(BaseModel):
+    reconciled: bool = True
+    reconciled_date: Optional[str] = None
+
+def account_digits(acc: str) -> str:
+    return "".join(ch for ch in (acc or "") if ch.isdigit())
+
+async def bank_balance(bank_id: str) -> float:
+    acc = await db.bank_accounts.find_one({"id": bank_id})
+    if not acc:
+        return 0.0
+    rows = await db.bank_txns.find({"bank_id": bank_id}).to_list(50000)
+    return round((acc.get("opening_balance", 0) or 0) + sum(r.get("amount", 0) for r in rows), 2)
+
+async def default_bank_id() -> Optional[str]:
+    """The account to post to when a payment names a bank mode but no account.
+
+    With exactly one account there is no ambiguity, so posting is automatic as
+    the spec requires. With several, guessing would put money in the wrong
+    ledger, so the caller must choose; the payment is still recorded and the
+    posting is left for the operator to place.
+    """
+    accounts = await db.bank_accounts.find({"active": {"$ne": False}}).to_list(100)
+    if len(accounts) == 1:
+        return accounts[0]["id"]
+    marked = next((a for a in accounts if a.get("is_default")), None)
+    return marked["id"] if marked else None
+
+async def post_bank_txn(*, bank_id, date, txn_type, amount, mode="Bank", party_name="",
+                        reference="", note="", source_ref=None, source_kind=None):
+    """Write one bank transaction, at most once per source.
+
+    source_ref carries the id of whatever caused this posting — a payment, a
+    grinding bill. The unique index on it is what makes automatic posting safe
+    to re-run: an edit or a retry updates the existing row instead of adding a
+    second one, which is the "no duplicate ledger entries" requirement.
+    """
+    signed = round(abs(amount) * TXN_SIGN.get(txn_type, 1), 2)
+    doc = {"bank_id": bank_id, "date": date, "txn_type": txn_type, "amount": signed,
+           "mode": clean_mode(mode), "party_name": party_name, "reference": reference,
+           "note": note, "source_kind": source_kind,
+           "reconciled": False, "reconciled_date": None}
+    # Only set when there is a source. A stored null still counts as a value for
+    # the unique index, so every manual row would collide on null with the first.
+    if source_ref:
+        doc["source_ref"] = source_ref
+    if source_ref:
+        existing = await db.bank_txns.find_one({"source_ref": source_ref})
+        if existing:
+            # Keep the reconciliation marks; only the money details change.
+            doc["reconciled"] = existing.get("reconciled", False)
+            doc["reconciled_date"] = existing.get("reconciled_date")
+            await db.bank_txns.update_one({"id": existing["id"]}, {"$set": doc})
+            return existing["id"]
+    doc["id"] = str(uuid.uuid4())
+    doc["created_at"] = now_iso()
+    await db.bank_txns.insert_one(doc)
+    return doc["id"]
+
+async def unpost_bank_txn(source_ref: str):
+    """Remove an automatic posting when its source is deleted or turns cash."""
+    if source_ref:
+        await db.bank_txns.delete_many({"source_ref": source_ref})
+
+@api_router.get("/banks")
+async def list_banks(user: dict = Depends(get_current_user)):
+    accounts = [clean(a) for a in await db.bank_accounts.find().sort("bank_name", 1).to_list(200)]
+    for a in accounts:
+        a["balance"] = await bank_balance(a["id"])
+    return accounts
+
+@api_router.post("/banks")
+async def create_bank(body: BankAccountBody, user: dict = Depends(require_admin)):
+    if not body.bank_name.strip():
+        raise HTTPException(status_code=400, detail="Enter the bank name")
+    acc_type = body.account_type if body.account_type in ACCOUNT_TYPES else "Current"
+    digits = account_digits(body.account_number)
+    if digits and await db.bank_accounts.find_one({"account_digits": digits}):
+        raise HTTPException(status_code=400, detail="An account with that number already exists")
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "account_type": acc_type,
+           "account_digits": digits, "active": True, "created_at": now_iso()}
+    await db.bank_accounts.insert_one(doc)
+    await log_audit(user, "Added bank account", f'{body.bank_name} {body.account_number}')
+    out = clean(doc)
+    out["balance"] = round(body.opening_balance or 0, 2)
+    return out
+
+@api_router.put("/banks/{bid}")
+async def update_bank(bid: str, body: BankAccountBody, user: dict = Depends(require_admin)):
+    acc = await db.bank_accounts.find_one({"id": bid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Bank account not found")
+    acc_type = body.account_type if body.account_type in ACCOUNT_TYPES else "Current"
+    digits = account_digits(body.account_number)
+    clash = await db.bank_accounts.find_one({"account_digits": digits, "id": {"$ne": bid}}) if digits else None
+    if clash:
+        raise HTTPException(status_code=400, detail="An account with that number already exists")
+    await db.bank_accounts.update_one({"id": bid}, {"$set": {**body.model_dump(),
+        "account_type": acc_type, "account_digits": digits}})
+    await log_audit(user, "Edited bank account", body.bank_name)
+    out = clean(await db.bank_accounts.find_one({"id": bid}))
+    out["balance"] = await bank_balance(bid)
+    return out
+
+@api_router.delete("/banks/{bid}")
+async def delete_bank(bid: str, user: dict = Depends(require_admin)):
+    # Transactions are the audit trail for money that really moved, so an
+    # account carrying any is closed rather than erased.
+    if await db.bank_txns.count_documents({"bank_id": bid}):
+        await db.bank_accounts.update_one({"id": bid}, {"$set": {"active": False}})
+        await log_audit(user, "Closed bank account", bid)
+        return {"message": "closed", "detail": "Account has transactions, so it was closed rather than deleted."}
+    await db.bank_accounts.delete_one({"id": bid})
+    await log_audit(user, "Deleted bank account", bid)
+    return {"message": "deleted"}
+
+@api_router.get("/bank-transactions")
+async def list_bank_txns(bank_id: Optional[str] = None, start: Optional[str] = None,
+                         end: Optional[str] = None, mode: Optional[str] = None,
+                         txn_type: Optional[str] = None, reconciled: Optional[bool] = None,
+                         user: dict = Depends(get_current_user)):
+    q = {}
+    if bank_id: q["bank_id"] = bank_id
+    if mode: q["mode"] = clean_mode(mode)
+    if txn_type: q["txn_type"] = txn_type
+    if reconciled is not None: q["reconciled"] = reconciled
+    if start or end:
+        rng = {}
+        if start: rng["$gte"] = start
+        if end: rng["$lte"] = end
+        q["date"] = rng
+    rows = [clean(r) for r in await db.bank_txns.find(q).sort("date", -1).to_list(20000)]
+    names = {a["id"]: a.get("bank_name", "") for a in await db.bank_accounts.find().to_list(200)}
+    for r in rows:
+        r["bank_name"] = names.get(r.get("bank_id"), "")
+    return rows
+
+@api_router.post("/bank-transactions")
+async def create_bank_txn(body: BankTxnBody, user: dict = Depends(get_current_user)):
+    if body.txn_type not in TXN_SIGN:
+        raise HTTPException(status_code=400, detail=f"Unknown transaction type: {body.txn_type}")
+    if not await db.bank_accounts.find_one({"id": body.bank_id}):
+        raise HTTPException(status_code=404, detail="Bank account not found")
+    if abs(body.amount) <= 0:
+        raise HTTPException(status_code=400, detail="Enter an amount greater than zero")
+    tid = await post_bank_txn(bank_id=body.bank_id, date=body.date, txn_type=body.txn_type,
+                              amount=body.amount, mode=body.mode, party_name=body.party_name,
+                              reference=body.reference, note=body.note)
+    await log_audit(user, "Bank transaction", f'{body.txn_type} Rs {abs(body.amount)}')
+    row = clean(await db.bank_txns.find_one({"id": tid}))
+    row["balance"] = await bank_balance(body.bank_id)
+    return row
+
+@api_router.delete("/bank-transactions/{tid}")
+async def delete_bank_txn(tid: str, user: dict = Depends(require_admin)):
+    row = await db.bank_txns.find_one({"id": tid})
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if row.get("source_ref"):
+        raise HTTPException(status_code=400,
+            detail="This was posted automatically from a payment. Edit or delete that record instead.")
+    await db.bank_txns.delete_one({"id": tid})
+    await log_audit(user, "Deleted bank transaction", f'{row.get("txn_type")} Rs {abs(row.get("amount", 0))}')
+    return {"message": "deleted"}
+
+@api_router.post("/bank-transactions/transfer")
+async def bank_transfer(body: BankTransferBody, user: dict = Depends(get_current_user)):
+    if body.from_bank_id == body.to_bank_id:
+        raise HTTPException(status_code=400, detail="Choose two different accounts")
+    if abs(body.amount) <= 0:
+        raise HTTPException(status_code=400, detail="Enter an amount greater than zero")
+    src = await db.bank_accounts.find_one({"id": body.from_bank_id})
+    dst = await db.bank_accounts.find_one({"id": body.to_bank_id})
+    if not src or not dst:
+        raise HTTPException(status_code=404, detail="Bank account not found")
+    # Paired rows sharing a transfer_id, so a report can show one movement while
+    # each account's own balance stays a simple sum of its rows.
+    transfer_id = str(uuid.uuid4())
+    out_id = await post_bank_txn(bank_id=body.from_bank_id, date=body.date, txn_type="Transfer Out",
+                                 amount=body.amount, mode="Bank", party_name=dst.get("bank_name", ""),
+                                 reference=body.reference, note=body.note or f'Transfer to {dst.get("bank_name","")}')
+    in_id = await post_bank_txn(bank_id=body.to_bank_id, date=body.date, txn_type="Transfer In",
+                                amount=body.amount, mode="Bank", party_name=src.get("bank_name", ""),
+                                reference=body.reference, note=body.note or f'Transfer from {src.get("bank_name","")}')
+    await db.bank_txns.update_many({"id": {"$in": [out_id, in_id]}}, {"$set": {"transfer_id": transfer_id}})
+    await log_audit(user, "Bank transfer", f'{src.get("bank_name")} to {dst.get("bank_name")} Rs {abs(body.amount)}')
+    return {"transfer_id": transfer_id,
+            "from_balance": await bank_balance(body.from_bank_id),
+            "to_balance": await bank_balance(body.to_bank_id)}
+
+@api_router.patch("/bank-transactions/{tid}/reconcile")
+async def reconcile_txn(tid: str, body: ReconcileBody, user: dict = Depends(get_current_user)):
+    row = await db.bank_txns.find_one({"id": tid})
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    await db.bank_txns.update_one({"id": tid}, {"$set": {
+        "reconciled": body.reconciled,
+        "reconciled_date": (body.reconciled_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")) if body.reconciled else None}})
+    return clean(await db.bank_txns.find_one({"id": tid}))
+
+@api_router.get("/bank-reconciliation")
+async def bank_reconciliation(bank_id: str, as_of: Optional[str] = None,
+                              statement_balance: Optional[float] = None,
+                              user: dict = Depends(get_current_user)):
+    """Book balance against the statement, and what accounts for the gap."""
+    acc = await db.bank_accounts.find_one({"id": bank_id})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Bank account not found")
+    q = {"bank_id": bank_id}
+    if as_of:
+        q["date"] = {"$lte": as_of}
+    rows = [clean(r) for r in await db.bank_txns.find(q).sort("date", 1).to_list(20000)]
+    opening = acc.get("opening_balance", 0) or 0
+    book = round(opening + sum(r.get("amount", 0) for r in rows), 2)
+    unreconciled = [r for r in rows if not r.get("reconciled")]
+    # Cleared balance is what the bank should be showing: the book balance less
+    # anything not yet through, which is exactly the reconciling difference.
+    uncleared = round(sum(r.get("amount", 0) for r in unreconciled), 2)
+    cleared = round(book - uncleared, 2)
+    out = {"bank_id": bank_id, "bank_name": acc.get("bank_name"), "as_of": as_of,
+           "opening_balance": round(opening, 2), "book_balance": book,
+           "cleared_balance": cleared, "uncleared_total": uncleared,
+           "reconciled_count": len(rows) - len(unreconciled),
+           "unreconciled_count": len(unreconciled), "unreconciled": unreconciled}
+    if statement_balance is not None:
+        out["statement_balance"] = round(statement_balance, 2)
+        out["difference"] = round(statement_balance - cleared, 2)
+        out["matched"] = abs(out["difference"]) < 0.01
+    return out
+
+@api_router.get("/bank-summary")
+async def bank_summary(user: dict = Depends(get_current_user)):
+    accounts = [clean(a) for a in await db.bank_accounts.find().sort("bank_name", 1).to_list(200)]
+    for a in accounts:
+        a["balance"] = await bank_balance(a["id"])
+        a["unreconciled_count"] = await db.bank_txns.count_documents({"bank_id": a["id"], "reconciled": False})
+    return {"accounts": accounts,
+            "total_balance": round(sum(a["balance"] for a in accounts if a.get("active") is not False), 2)}
 
 @api_router.get("/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):
