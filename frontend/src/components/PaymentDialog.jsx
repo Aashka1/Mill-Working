@@ -26,7 +26,9 @@ export function PaymentDialog({ open, onOpenChange, record, path, totalField = "
   useEffect(() => {
     if (open) {
       setAmount(String(balance));
-      setMethod(record?.payment_method || "Cash");
+      // payment_mode is how money moved (Cash/Bank). Grinding and oil also
+      // carry payment_method, but that is Cash vs Grain — a different question.
+      setMethod(record?.payment_mode || "Cash");
       setDate(record?.date || today());
     }
     // Re-seed each time the dialog opens for a different bill.
@@ -65,13 +67,13 @@ export function PaymentDialog({ open, onOpenChange, record, path, totalField = "
 
           <div className="grid grid-cols-2 gap-4">
             <div><Label>Date</Label><Input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="h-11 mt-1" /></div>
-            <div><Label>Method</Label>
+            <div><Label>Paid by</Label>
               <Select value={method} onValueChange={setMethod}>
                 <SelectTrigger className="h-11 mt-1" data-testid="payment-method"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="Cash">Cash</SelectItem>
                   <SelectItem value="UPI">UPI</SelectItem>
-                  <SelectItem value="Bank">Bank</SelectItem>
+                  <SelectItem value="Bank">Bank transfer</SelectItem>
                 </SelectContent>
               </Select>
             </div>

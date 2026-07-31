@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -12,7 +13,7 @@ import { Plus, Trash2, Download, FileDown, Pencil, IndianRupee } from "lucide-re
 import { PaymentDialog } from "@/components/PaymentDialog";
 import { toast } from "sonner";
 
-const empty = { date: today(), customer_name: "", product_id: "", product_name: "", quantity: "", price: "", payment_status: "Paid", amount_paid: "" };
+const empty = { date: today(), customer_name: "", product_id: "", product_name: "", quantity: "", price: "", payment_status: "Paid", amount_paid: "", payment_mode: "Cash" };
 
 export default function Sales() {
   const sales = useList("/sales");
@@ -33,7 +34,7 @@ export default function Sales() {
   const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
   const openEdit = (s) => {
     setEditingId(s.id);
-    setF({ date: s.date, customer_name: s.customer_name, product_id: s.product_id, product_name: s.product_name, quantity: String(s.quantity), price: String(s.price), payment_status: s.payment_status, amount_paid: "" });
+    setF({ date: s.date, customer_name: s.customer_name, product_id: s.product_id, product_name: s.product_name, quantity: String(s.quantity), price: String(s.price), payment_status: s.payment_status, amount_paid: "", payment_mode: s.payment_mode || "Cash" });
     setOpen(true);
   };
 
@@ -43,7 +44,10 @@ export default function Sales() {
     if (!editingId && +f.quantity > prod.current_stock) return toast.error(`Only ${prod.current_stock} ${prod.unit} in stock`);
     const body = { date: f.date, customer_name: f.customer_name, product_id: prod.id, product_name: prod.name, quantity: +f.quantity, price: +f.price, payment_status: f.payment_status };
     // Only sent when creating: edits must not re-credit a bill that already has payments.
-    if (!editingId) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
+    if (!editingId) {
+      body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
+      body.payment_mode = f.payment_mode;
+    }
     if (editingId) { await api.put(`/sales/${editingId}`, body); toast.success("Sale updated"); }
     else { await api.post("/sales", body); toast.success("Sale recorded, stock deducted"); }
     setOpen(false); setEditingId(null); setF(empty);
@@ -105,6 +109,18 @@ export default function Sales() {
                   <Input type="number" value={f.amount_paid} onChange={(e) => setF({ ...f, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="sale-amount-paid" />
                 </div>
               )}
+              {/* Only ask how the money arrived when some of it actually did. */}
+              {!editingId && f.payment_status !== "Pending" && (
+                <div><Label>Paid by</Label>
+                  <Select value={f.payment_mode} onValueChange={(v) => setF({ ...f, payment_mode: v })}>
+                    <SelectTrigger className="h-11 mt-1" data-testid="sale-payment-mode"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="Cash">Cash</SelectItem>
+                      <SelectItem value="Bank">Bank transfer</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
             </div>
             <p className="text-sm text-muted-foreground">
               Total: <span className="font-bold text-foreground">{money(saleTotal)}</span>
@@ -132,7 +148,10 @@ export default function Sales() {
                 <TableCell className="font-mono text-xs">{s.invoice_number}</TableCell><TableCell>{s.date}</TableCell>
                 <TableCell className="font-medium">{s.customer_name}</TableCell><TableCell>{s.product_name}</TableCell>
                 <TableCell className="text-right">{s.quantity} {unitOf(s.product_id)}</TableCell><TableCell className="text-right font-medium">{money(s.total)}</TableCell>
-                <TableCell><StatusBadge status={s.payment_status} balance={s.balance_due} /></TableCell>
+                <TableCell className="space-x-1">
+                  <StatusBadge status={s.payment_status} balance={s.balance_due} />
+                  {s.payment_status !== "Pending" && s.payment_mode && <Badge variant="outline" className="text-[10px]">{s.payment_mode}</Badge>}
+                </TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   {s.payment_status !== "Paid" && <Button variant="ghost" size="icon" onClick={() => setPayFor(s)} data-testid={`pay-sale-${s.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(s)} data-testid={`edit-sale-${s.id}`}><Pencil className="h-4 w-4" /></Button>

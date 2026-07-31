@@ -16,7 +16,7 @@ import { toast } from "sonner";
 
 const ADD_NEW = "__add_new__";
 
-const empty = { date: today(), customer_name: "", grain_type: "Wheat", output_product: "Atta", wheat_weight: "", washed: true, loss_percent: "2.5", charge_per_kg: "2", payment_method: "Cash", grain_fee_kg: "", payment_status: "Pending", amount_paid: "" };
+const empty = { date: today(), customer_name: "", grain_type: "Wheat", output_product: "Atta", wheat_weight: "", washed: true, loss_percent: "2.5", charge_per_kg: "2", payment_method: "Cash", grain_fee_kg: "", payment_status: "Pending", amount_paid: "", payment_mode: "Cash" };
 
 export default function Grinding() {
   const grinding = useList("/grinding");
@@ -64,7 +64,7 @@ export default function Grinding() {
   const openNew = () => { setEditingId(null); setF({ ...empty, loss_percent: String(settings.washed_loss) }); setOpen(true); };
   const openEdit = (g) => {
     setEditingId(g.id);
-    setF({ date: g.date, customer_name: g.customer_name, grain_type: g.grain_type || "Wheat", output_product: g.output_product || "Atta", wheat_weight: String(g.wheat_weight), washed: g.washed, loss_percent: String(g.loss_percent), charge_per_kg: String(g.charge_per_kg), payment_method: g.payment_method || "Cash", grain_fee_kg: String(g.grain_fee_kg || ""), payment_status: g.payment_status, amount_paid: "" });
+    setF({ date: g.date, customer_name: g.customer_name, grain_type: g.grain_type || "Wheat", output_product: g.output_product || "Atta", wheat_weight: String(g.wheat_weight), washed: g.washed, loss_percent: String(g.loss_percent), charge_per_kg: String(g.charge_per_kg), payment_method: g.payment_method || "Cash", grain_fee_kg: String(g.grain_fee_kg || ""), payment_status: g.payment_status, amount_paid: "", payment_mode: g.payment_mode || "Cash" });
     setOpen(true);
   };
 
@@ -72,6 +72,7 @@ export default function Grinding() {
     if (!f.customer_name || !f.wheat_weight) return toast.error("Fill all fields");
     if (addingGrain) return toast.error("Add the new item first, or pick one from the list");
     const body = { date: f.date, customer_name: f.customer_name, grain_type: f.grain_type, output_product: f.output_product, wheat_weight: +f.wheat_weight, washed: f.washed, loss_percent: +f.loss_percent, charge_per_kg: +(f.charge_per_kg || 0), payment_method: f.payment_method, grain_fee_kg: +(f.grain_fee_kg || 0), payment_status: f.payment_status };
+    if (!editingId) body.payment_mode = f.payment_mode;
     if (!editingId) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
     if (editingId) { await api.put(`/grinding/${editingId}`, body); toast.success("Order updated"); }
     else { await api.post("/grinding", body); toast.success("Grinding order recorded"); }
@@ -174,6 +175,19 @@ export default function Grinding() {
                   </SelectContent>
                 </Select>
               </div>
+                {/* Separate from "Payment Method" above: that is Cash vs Grain,
+                    i.e. what settles the bill. This is how the money moved. */}
+                {f.payment_method === "Cash" && f.payment_status !== "Pending" && (
+                  <div><Label>Paid by</Label>
+                    <Select value={f.payment_mode} onValueChange={(v) => setF({ ...f, payment_mode: v })}>
+                      <SelectTrigger className="h-11 mt-1" data-testid="grinding-payment-mode"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="Cash">Cash</SelectItem>
+                        <SelectItem value="Bank">Bank transfer</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
               {!editingId && f.payment_status === "Partial" && (
                 <div><Label>Amount received</Label>
                   <Input type="number" value={f.amount_paid} onChange={(e) => setF({ ...f, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="grinding-amount-paid" />

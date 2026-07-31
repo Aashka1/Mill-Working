@@ -29,7 +29,7 @@ const BLANK_PRODUCT = { name: "", category: "Flour", unit: "kg", current_stock: 
 // Sentinel for the "buying something new" row in the product dropdown.
 const NEW_PRODUCT = "__new_product__";
 
-const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid", amount_paid: "", new_name: "", new_category: "Other", new_unit: "kg" });
+const blankPurchase = () => ({ date: today(), supplier_name: "", product_id: "", quantity: "", rate: "", payment_status: "Paid", amount_paid: "", payment_mode: "Cash", new_name: "", new_category: "Other", new_unit: "kg" });
 
 export default function Inventory() {
   const products = useList("/products");
@@ -110,7 +110,7 @@ export default function Inventory() {
   const openEditPurchase = (p) => {
     setEditingPurchase(p.id);
     setBuf({ date: p.date, supplier_name: p.supplier_name, product_id: p.product_id,
-             quantity: String(p.quantity), rate: String(p.rate), payment_status: p.payment_status, amount_paid: "" });
+             quantity: String(p.quantity), rate: String(p.rate), payment_status: p.payment_status, amount_paid: "", payment_mode: p.payment_mode || "Cash" });
     setPurOpen(true);
   };
 
@@ -125,7 +125,10 @@ export default function Inventory() {
           quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status }
       : { date: buf.date, supplier_name: buf.supplier_name, product_id: prod.id, product_name: prod.name,
           quantity: +buf.quantity, rate: +buf.rate, payment_status: buf.payment_status };
-    if (!editingPurchase) body.amount_paid = buf.payment_status === "Paid" ? null : (buf.payment_status === "Partial" ? +buf.amount_paid || 0 : 0);
+    if (!editingPurchase) {
+      body.amount_paid = buf.payment_status === "Paid" ? null : (buf.payment_status === "Partial" ? +buf.amount_paid || 0 : 0);
+      body.payment_mode = buf.payment_mode;
+    }
     if (editingPurchase) {
       await api.put(`/purchases/${editingPurchase}`, body);
       toast.success("Purchase updated, stock adjusted");
@@ -307,6 +310,15 @@ export default function Inventory() {
                         </SelectContent>
                       </Select>
                     </div>
+                    <div><Label>Paid by</Label>
+                      <Select value={buf.payment_mode} onValueChange={(v) => setBuf({ ...buf, payment_mode: v })}>
+                        <SelectTrigger className="h-11 mt-1" data-testid="purchase-payment-mode"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="Cash">Cash</SelectItem>
+                          <SelectItem value="Bank">Bank transfer</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
                     {!editingPurchase && buf.payment_status === "Partial" && (
                       <div><Label>Amount paid</Label>
                         <Input type="number" value={buf.amount_paid} onChange={(e) => setBuf({ ...buf, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="purchase-amount-paid" />
@@ -332,7 +344,7 @@ export default function Inventory() {
                   <TableRow key={p.id} className="hover:bg-muted/50">
                     <TableCell>{p.date}</TableCell><TableCell>{p.supplier_name}</TableCell><TableCell>{p.product_name}</TableCell>
                     <TableCell className="text-right">{p.quantity} {unitOf(p.product_id)}</TableCell><TableCell className="text-right">{money(p.rate)}</TableCell>
-                    <TableCell className="text-right font-medium">{money(p.total)}</TableCell><TableCell><StatusBadge status={p.payment_status} balance={p.balance_due} /></TableCell>
+                    <TableCell className="text-right font-medium">{money(p.total)}</TableCell><TableCell className="space-x-1"><StatusBadge status={p.payment_status} balance={p.balance_due} />{p.payment_status !== "Pending" && p.payment_mode && <Badge variant="outline" className="text-[10px]">{p.payment_mode}</Badge>}</TableCell>
                     <TableCell className="text-right flex gap-1 justify-end">
                       {p.payment_status !== "Paid" && <Button variant="ghost" size="icon" onClick={() => setPayFor(p)} data-testid={`pay-purchase-${p.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                       <Button variant="ghost" size="icon" onClick={() => openEditPurchase(p)} data-testid={`edit-purchase-${p.id}`}><Pencil className="h-4 w-4" /></Button>

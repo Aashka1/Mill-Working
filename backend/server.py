@@ -1769,15 +1769,24 @@ async def costing(user: dict = Depends(get_current_user)):
 
 # ==================== Ledger, Cash Book, Analytics, Audit ====================
 
-# How the money moved. Only Cash touches the drawer; UPI and Bank settle into
-# the account, so the cash book has to tell them apart or Cash in Hand drifts
-# up by every digital payment ever taken.
-PAYMENT_MODES = ("Cash", "UPI", "Bank")
+# How the money moved. Only Cash touches the drawer; Bank settles into the
+# account, so the cash book has to tell them apart or Cash in Hand drifts up by
+# every non-cash payment ever taken.
+PAYMENT_MODES = ("Cash", "Bank")
+
+# Payments recorded while UPI was still offered. They settled into the account,
+# so they fold into Bank. Without this they would hit the default below and be
+# reclassified as Cash, inflating Cash in Hand by every past digital payment —
+# clean_mode runs on read as well as write, so it rewrites history, not just
+# new rows.
+LEGACY_MODES = {"UPI": "Bank"}
 
 def clean_mode(mode) -> str:
-    m = (mode or "Cash").strip().title()
-    if m.upper() == "UPI":
-        return "UPI"
+    raw = (mode or "Cash").strip()
+    legacy = LEGACY_MODES.get(raw.upper())
+    if legacy:
+        return legacy
+    m = raw.title()
     return m if m in PAYMENT_MODES else "Cash"
 
 async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind="receipt", mode="Cash"):
@@ -1789,7 +1798,7 @@ async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind=
     the cash book can report it as an outflow rather than negative income.
 
     `mode` is stored per payment, not per bill: a customer can settle half in
-    cash today and half by UPI next week, and the cash book needs both.
+    cash today and half by bank transfer next week, and the cash book needs both.
     """
     if not amount:
         return
@@ -1924,23 +1933,58 @@ async def cashbook(date: str, user: dict = Depends(get_current_user)):
     cust_in = [p for p in cust_rows if p.get("amount", 0) >= 0]
     cust_refund = [p for p in cust_rows if p.get("amount", 0) < 0]
     supp_out = [p for p in payments if p.get("party_type") == "supplier"]
+
+    # Only notes and coins move the drawer. A bank transfer is real
+    # income but never reaches it, so counting it as cash would inflate Cash in
+    # Hand by every digital payment ever taken. Rows written before payment_mode
+    # existed are treated as cash, which is what they were assumed to be.
+    def is_cash(row):
+        return clean_mode(row.get("payment_mode")) == "Cash"
+
+    def cash(items):
+        return [i for i in items if is_cash(i)]
+
+    def digital(items):
+        return [i for i in items if not is_cash(i)]
+
     def before(items):
         return [i for i in items if str(i.get("date", "")) < date]
+
     def on(items):
         return [i for i in items if str(i.get("date", "")) == date]
+
+    def total(items):
+        return sum(abs(i.get("amount", 0)) for i in items)
+
     opening = (starting
-               + sum(p["amount"] for p in before(cust_in))
-               - sum(abs(p["amount"]) for p in before(cust_refund))
-               - sum(p["amount"] for p in before(supp_out))
+               + total(cash(before(cust_in)))
+               - total(cash(before(cust_refund)))
+               - total(cash(before(supp_out)))
                - sum(e.get("amount", 0) for e in before(expenses)))
-    in_today = sum(p["amount"] for p in on(cust_in))
-    refund_today = sum(abs(p["amount"]) for p in on(cust_refund))
-    supp_today = sum(p["amount"] for p in on(supp_out))
+
+    in_today = total(cash(on(cust_in)))
+    refund_today = total(cash(on(cust_refund)))
+    supp_today = total(cash(on(supp_out)))
     exp_today = sum(e.get("amount", 0) for e in on(expenses))
     closing = opening + in_today - refund_today - supp_today - exp_today
+
+    # Digital movements are reported alongside so the day still reconciles
+    # against what actually came in, it just does not touch the drawer.
+    bank_in_today = total(digital(on(cust_in)))
+    bank_out_today = total(digital(on(cust_refund))) + total(digital(on(supp_out)))
+
+    by_mode = {}
+    for row in on(cust_in):
+        by_mode[clean_mode(row.get("payment_mode"))] = round(
+            by_mode.get(clean_mode(row.get("payment_mode")), 0) + abs(row.get("amount", 0)), 2)
+
     return {"date": date, "opening": round(opening, 2), "payments_received": round(in_today, 2),
             "paid_to_customers": round(refund_today, 2),
-            "supplier_payments": round(supp_today, 2), "expenses": round(exp_today, 2), "closing": round(closing, 2)}
+            "supplier_payments": round(supp_today, 2), "expenses": round(exp_today, 2),
+            "closing": round(closing, 2),
+            "bank_received": round(bank_in_today, 2), "bank_paid": round(bank_out_today, 2),
+            "received_by_mode": by_mode,
+            "total_received": round(in_today + bank_in_today, 2)}
 
 @api_router.get("/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):

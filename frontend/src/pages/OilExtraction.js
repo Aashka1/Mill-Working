@@ -14,7 +14,7 @@ import { PaymentDialog } from "@/components/PaymentDialog";
 import { toast } from "sonner";
 
 const SEEDS = ["Mustard", "Groundnut", "Sesame", "Coconut", "Sunflower", "Other"];
-const empty = { date: today(), customer_name: "", seed_type: "Mustard", quantity_received: "", oil_extracted: "", oil_cake_produced: "", charge: "", payment_method: "Cash", retained_oil: "", retained_cake: "", cake_sold_to_shop: "", cake_rate: "", payment_status: "Pending", amount_paid: "" };
+const empty = { date: today(), customer_name: "", seed_type: "Mustard", quantity_received: "", oil_extracted: "", oil_cake_produced: "", charge: "", payment_method: "Cash", retained_oil: "", retained_cake: "", cake_sold_to_shop: "", cake_rate: "", payment_status: "Pending", amount_paid: "", payment_mode: "Cash" };
 
 export default function OilExtraction() {
   const oil = useList("/oil");
@@ -29,13 +29,14 @@ export default function OilExtraction() {
   const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
   const openEdit = (o) => {
     setEditingId(o.id);
-    setF({ date: o.date, customer_name: o.customer_name, seed_type: o.seed_type, quantity_received: String(o.quantity_received), oil_extracted: String(o.oil_extracted), oil_cake_produced: String(o.oil_cake_produced || ""), charge: String(o.charge), payment_method: o.payment_method || "Cash", retained_oil: String(o.retained_oil || ""), retained_cake: String(o.retained_cake || ""), cake_sold_to_shop: String(o.cake_sold_to_shop || ""), cake_rate: String(o.cake_rate || ""), payment_status: o.payment_status, amount_paid: "" });
+    setF({ date: o.date, customer_name: o.customer_name, seed_type: o.seed_type, quantity_received: String(o.quantity_received), oil_extracted: String(o.oil_extracted), oil_cake_produced: String(o.oil_cake_produced || ""), charge: String(o.charge), payment_method: o.payment_method || "Cash", retained_oil: String(o.retained_oil || ""), retained_cake: String(o.retained_cake || ""), cake_sold_to_shop: String(o.cake_sold_to_shop || ""), cake_rate: String(o.cake_rate || ""), payment_status: o.payment_status, amount_paid: "", payment_mode: o.payment_mode || "Cash" });
     setOpen(true);
   };
 
   const save = async () => {
     if (!f.customer_name || !f.quantity_received) return toast.error("Fill all fields");
     const body = { date: f.date, customer_name: f.customer_name, seed_type: f.seed_type, quantity_received: +f.quantity_received, oil_extracted: +(f.oil_extracted || 0), oil_cake_produced: +(f.oil_cake_produced || 0), charge: +(f.charge || 0), payment_method: f.payment_method, retained_oil: +(f.retained_oil || 0), retained_cake: +(f.retained_cake || 0), cake_sold_to_shop: +(f.cake_sold_to_shop || 0), cake_rate: +(f.cake_rate || 0), payment_status: f.payment_status };
+    if (!editingId) body.payment_mode = f.payment_mode;
     if (!editingId) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
     try {
       if (editingId) { await api.put(`/oil/${editingId}`, body); toast.success("Order updated"); }
@@ -141,6 +142,17 @@ export default function OilExtraction() {
                   </SelectContent>
                 </Select>
                 </div>
+                {f.payment_status !== "Pending" && (
+                  <div><Label>Paid by</Label>
+                    <Select value={f.payment_mode} onValueChange={(v) => setF({ ...f, payment_mode: v })}>
+                      <SelectTrigger className="h-11 mt-1" data-testid="oil-payment-mode"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="Cash">Cash</SelectItem>
+                        <SelectItem value="Bank">Bank transfer</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
                 {!editingId && f.payment_status === "Partial" && (
                   <div><Label>Amount received</Label>
                     <Input type="number" value={f.amount_paid} onChange={(e) => setF({ ...f, amount_paid: e.target.value })} className="h-11 mt-1" data-testid="oil-amount-paid" />
