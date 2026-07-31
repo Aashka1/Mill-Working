@@ -1346,6 +1346,11 @@ async def startup():
         await db[coll].create_index(field)
     for coll in ("sales", "purchases", "grinding", "oil", "expenses", "payments"):
         await db[coll].create_index("date")
+    for coll in ("sales", "grinding", "oil", "exchanges"):
+        await db[coll].create_index("invoice_number")
+    for coll in ("customers", "suppliers"):
+        await db[coll].create_index("phone")
+    await db.bank_txns.create_index("mode")
     await consolidate_parties()
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@agrimill.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
@@ -3606,6 +3611,232 @@ async def export_report(key: str, request: Request, format: str = "xlsx",
     return StreamingResponse(report_to_xlsx(report),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{key}_{stamp}.xlsx"'})
+
+# ==================== Global search ====================
+# Reuses the report shape — columns, rows, summary — so results print and
+# export through the same PDF and Excel writers rather than a second set.
+#
+# Each scope declares which collection it reads, which fields the free-text box
+# matches, and how to turn a row into something the UI can open, print or
+# delete. Adding a searchable module is one entry.
+
+SEARCH_SCOPES = {
+    "sales": {
+        "title": "Sales", "coll": "sales", "route": "/sales", "invoice": True,
+        "text": ("invoice_number", "customer_name", "product_name"),
+        "party": "customer_name", "item": "product_name",
+        "columns": [col("date", "Date"), col("invoice_number", "Invoice"), col("customer_name", "Customer"),
+                    col("product_name", "Item"), col("quantity", "Qty", "qty"),
+                    col("total", "Total", "money"), col("balance_due", "Balance", "money"),
+                    col("payment_status", "Status")],
+    },
+    "purchases": {
+        "title": "Purchases", "coll": "purchases", "route": "/inventory",
+        "text": ("supplier_name", "product_name"),
+        "party": "supplier_name", "item": "product_name",
+        "columns": [col("date", "Date"), col("supplier_name", "Supplier"), col("product_name", "Item"),
+                    col("quantity", "Qty", "qty"), col("total", "Total", "money"),
+                    col("balance_due", "Balance", "money"), col("payment_status", "Status")],
+    },
+    "grinding": {
+        "title": "Grinding", "coll": "grinding", "route": "/grinding", "invoice": True,
+        "text": ("invoice_number", "customer_name", "grain_type"),
+        "party": "customer_name",
+        "columns": [col("date", "Date"), col("invoice_number", "Invoice"), col("customer_name", "Customer"),
+                    col("grain_type", "Item"), col("wheat_weight", "In (kg)", "qty"),
+                    col("payment_method", "Paid by"), col("total_charge", "Charge", "money"),
+                    col("payment_status", "Status")],
+    },
+    "oil": {
+        "title": "Oil extraction", "coll": "oil", "route": "/oil", "invoice": True,
+        "text": ("invoice_number", "customer_name", "seed_type"),
+        "party": "customer_name",
+        "columns": [col("date", "Date"), col("invoice_number", "Invoice"), col("customer_name", "Customer"),
+                    col("seed_type", "Seed"), col("quantity_received", "Received", "qty"),
+                    col("total", "Total", "money"), col("payment_status", "Status")],
+    },
+    "exchanges": {
+        "title": "Exchange", "coll": "exchanges", "route": "/exchange", "invoice": True,
+        "text": ("invoice_number", "customer_name"),
+        "party": "customer_name",
+        "columns": [col("date", "Date"), col("invoice_number", "Invoice"), col("customer_name", "Customer"),
+                    col("wheat_qty", "Wheat", "qty"), col("final_flour_delivered", "Delivered", "qty"),
+                    col("grinding_charge", "Charge", "money"), col("payment_method", "Paid by")],
+    },
+    "payments": {
+        "title": "Payments", "coll": "payments", "route": "/customers",
+        "text": ("party_name", "note", "reference"),
+        "party": "party_name",
+        "columns": [col("date", "Date"), col("party_name", "Party"), col("party_type", "Type"),
+                    col("payment_mode", "Mode"), col("amount", "Amount", "money"), col("note", "Note")],
+    },
+    "bank": {
+        "title": "Bank transactions", "coll": "bank_txns", "route": "/banks",
+        "text": ("party_name", "reference", "note", "txn_type"),
+        "columns": [col("date", "Date"), col("txn_type", "Type"), col("mode", "Mode"),
+                    col("party_name", "Party"), col("reference", "Reference"),
+                    col("amount", "Amount", "money")],
+    },
+    "expenses": {
+        "title": "Expenses", "coll": "expenses", "route": "/expenses",
+        "text": ("category", "description"),
+        "columns": [col("date", "Date"), col("category", "Category"),
+                    col("description", "Description"), col("amount", "Amount", "money")],
+    },
+    "production": {
+        "title": "Production", "coll": "production", "route": "/production",
+        "text": ("mill", "input_product_name"),
+        "item": "input_product_name",
+        "columns": [col("date", "Date"), col("mill", "Mill"), col("input_product_name", "Input"),
+                    col("input_quantity", "Qty", "qty"), col("input_cost", "Cost", "money")],
+    },
+    "customers": {
+        "title": "Customers", "coll": "customers", "route": "/customers", "undated": True,
+        "text": ("name", "phone", "gstin", "pan_aadhaar", "address"),
+        "columns": [col("name", "Name"), col("phone", "Mobile"), col("address", "Address"),
+                    col("gstin", "GSTIN"), col("opening_balance", "Opening", "money")],
+    },
+    "suppliers": {
+        "title": "Suppliers", "coll": "suppliers", "route": "/suppliers", "undated": True,
+        "text": ("name", "phone", "gstin", "pan_aadhaar", "address"),
+        "columns": [col("name", "Name"), col("phone", "Mobile"), col("address", "Address"),
+                    col("gstin", "GSTIN"), col("opening_balance", "Opening", "money")],
+    },
+    "inventory": {
+        "title": "Stock", "coll": "products", "route": "/inventory", "undated": True,
+        "text": ("name", "category"), "item": "name",
+        "columns": [col("name", "Item"), col("category", "Category"), col("unit", "Unit"),
+                    col("current_stock", "In stock", "qty"), col("rate", "Rate", "money")],
+    },
+}
+
+# Which field carries the money status, per scope, so "Due" means the same
+# thing everywhere. Bank rows and masters have none.
+def matches_status(scope: str, row: dict, status: str) -> bool:
+    if not status:
+        return True
+    current = row.get("payment_status")
+    if current is None:
+        return False
+    if status.lower() in ("due", "pending", "unpaid"):
+        return current in ("Pending", "Partial")
+    return current.lower() == status.lower()
+
+def matches_mode(row: dict, mode: str) -> bool:
+    if not mode:
+        return True
+    asked = normalise_method(mode)
+    # Settled in kind, so match only the method. clean_mode returns Cash for
+    # anything it does not recognise, which would otherwise make a search for
+    # "Flour Deduction" return every cash job as well.
+    if asked in KIND_METHODS:
+        return bool(row.get("payment_method")) and normalise_method(row["payment_method"]) == asked
+    want = clean_mode(mode)
+    for field in ("payment_mode", "mode"):
+        if row.get(field) and clean_mode(row[field]) == want:
+            return True
+    # A money method may be recorded on the bill rather than on a payment row.
+    pm = row.get("payment_method")
+    if pm and normalise_method(pm) not in KIND_METHODS and clean_mode(pm) == want:
+        return True
+    return False
+
+async def run_search(q="", scopes=None, preset=None, start=None, end=None, party=None,
+                     item=None, mode=None, status=None, limit=200):
+    s_date, e_date = date_range(preset, start, end)
+    needle = (q or "").strip().lower()
+    wanted = [k for k in (scopes or SEARCH_SCOPES.keys()) if k in SEARCH_SCOPES]
+    dated = bool(preset or start or end)
+    groups = []
+
+    for key in wanted:
+        spec = SEARCH_SCOPES[key]
+        query = {}
+        # Push the date filter into Mongo, where it is indexed, so the text
+        # match below only ever runs over the rows in the period.
+        if dated and not spec.get("undated"):
+            query["date"] = {"$gte": s_date, "$lte": e_date}
+        if party and spec.get("party"):
+            query[spec["party"]] = party
+        if item and spec.get("item"):
+            query[spec["item"]] = item
+
+        rows = [clean(r) for r in await db[spec["coll"]].find(query).to_list(20000)]
+
+        if needle:
+            rows = [r for r in rows
+                    if any(needle in str(r.get(f, "") or "").lower() for f in spec["text"])]
+        if mode:
+            rows = [r for r in rows if matches_mode(r, mode)]
+        if status:
+            rows = [r for r in rows if matches_status(key, r, status)]
+
+        rows.sort(key=lambda r: str(r.get("date") or r.get("name") or ""), reverse=not spec.get("undated"))
+        total = len(rows)
+        rows = rows[:limit]
+        for r in rows:
+            # Everything the results table needs to open, print or delete a row
+            # without knowing which module it came from.
+            r["_scope"] = key
+            r["_route"] = spec["route"]
+            r["_invoice"] = bool(spec.get("invoice")) and bool(r.get("invoice_number"))
+            if key == "grinding" and r.get("payment_method"):
+                r["payment_method"] = normalise_method(r["payment_method"])
+        if total:
+            groups.append({"scope": key, "title": spec["title"], "count": total,
+                           "shown": len(rows), "columns": spec["columns"], "rows": rows})
+
+    return {"query": q, "start": s_date if dated else None, "end": e_date if dated else None,
+            "dated": dated, "total": sum(g["count"] for g in groups), "groups": groups}
+
+@api_router.get("/search")
+async def global_search(q: str = "", scope: Optional[str] = None, preset: Optional[str] = None,
+                        start: Optional[str] = None, end: Optional[str] = None,
+                        party: Optional[str] = None, item: Optional[str] = None,
+                        mode: Optional[str] = None, status: Optional[str] = None,
+                        limit: int = 200, user: dict = Depends(get_current_user)):
+    scopes = [s.strip() for s in scope.split(",")] if scope else None
+    return await run_search(q, scopes, preset, start, end, party, item, mode, status, limit)
+
+@api_router.get("/search/scopes")
+async def search_scopes(user: dict = Depends(get_current_user)):
+    return [{"key": k, "title": v["title"], "undated": bool(v.get("undated"))}
+            for k, v in SEARCH_SCOPES.items()]
+
+@api_router.get("/search/export")
+async def export_search(request: Request, format: str = "xlsx", q: str = "",
+                        scope: Optional[str] = None, preset: Optional[str] = None,
+                        start: Optional[str] = None, end: Optional[str] = None,
+                        party: Optional[str] = None, item: Optional[str] = None,
+                        mode: Optional[str] = None, status: Optional[str] = None):
+    await get_current_user(request)
+    scopes = [s.strip() for s in scope.split(",")] if scope else None
+    found = await run_search(q, scopes, preset, start, end, party, item, mode, status, limit=20000)
+    # Flattened into one table with a Section column, so a mixed result set
+    # exports as a single readable sheet rather than one file per scope.
+    columns = [col("_section", "Section"), col("date", "Date"), col("_summary", "Details"),
+               col("_amount", "Amount", "money")]
+    rows = []
+    for g in found["groups"]:
+        for r in g["rows"]:
+            parts = [str(r.get(c["key"], "")) for c in g["columns"]
+                     if c["type"] == "text" and r.get(c["key"]) not in (None, "")]
+            amount = next((r.get(c["key"]) for c in g["columns"] if c["type"] == "money"), "")
+            rows.append({"_section": g["title"], "date": r.get("date", ""),
+                         "_summary": " · ".join(parts[:4]), "_amount": amount})
+    report = {"key": "search", "title": f'Search results{f" for {q}" if q else ""}',
+              "start": found["start"] or "all", "end": found["end"] or "dates",
+              "filters": {k: v for k, v in (("party", party), ("item", item),
+                                            ("mode", mode), ("status", status)) if v},
+              "columns": columns, "rows": rows,
+              "summary": [{"label": g["title"], "value": g["count"]} for g in found["groups"]]
+                         + [{"label": "Total matches", "value": found["total"]}]}
+    if format == "pdf":
+        return StreamingResponse(report_to_pdf(report), media_type="application/pdf",
+            headers={"Content-Disposition": 'attachment; filename="search_results.pdf"'})
+    return StreamingResponse(report_to_xlsx(report),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="search_results.xlsx"'})
 
 @api_router.get("/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):

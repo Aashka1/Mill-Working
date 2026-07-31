@@ -6,7 +6,7 @@ import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   LayoutDashboard, Package, ShoppingCart, Wheat, Droplets, Receipt,
-  Users, Truck, FileText, Sun, Moon, LogOut, Bell, Menu, X, Factory, ArrowLeftRight, Wrench, Calculator, BarChart3, Cog, Landmark
+  Users, Truck, FileText, Sun, Moon, LogOut, Bell, Menu, X, Factory, ArrowLeftRight, Wrench, Calculator, BarChart3, Cog, Landmark, Search as SearchIcon
 } from "lucide-react";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuLabel, DropdownMenuSeparator,
@@ -26,6 +26,7 @@ const NAV = [
   { to: "/suppliers", label: "Suppliers", icon: Truck },
   { to: "/invoices", label: "Invoices", icon: FileText },
   { to: "/banks", label: "Bank", icon: Landmark },
+  { to: "/search", label: "Search", icon: SearchIcon },
   { to: "/reports", label: "Reports", icon: BarChart3 },
   { to: "/costing", label: "Costing", icon: Calculator },
   { to: "/maintenance", label: "Maintenance", icon: Wrench },
