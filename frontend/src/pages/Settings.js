@@ -8,14 +8,17 @@ import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { Save, ShieldCheck, Trash2, UserPlus, Users, Wrench } from "lucide-react";
+import { Save, ShieldCheck, Trash2, UserPlus, Users, Wrench, Building2 } from "lucide-react";
 import { toast } from "sonner";
 
 const BLANK_USER = { name: "", email: "", password: "", role: "staff" };
 
 export default function Settings() {
   const { user: currentUser, createUser } = useAuth();
-  const [s, setS] = useState({ washed_loss: 2.5, unwashed_loss: 5, starting_cash: 0, grinding_rate: 2, flour_deduction_percent: 5, flour_rate: 0 });
+  const [s, setS] = useState({ washed_loss: 2.5, unwashed_loss: 5, starting_cash: 0, grinding_rate: 2,
+    flour_deduction_percent: 5, flour_rate: 0, cash_grinding_percent: 5, deposit_flour_deduction_percent: 15,
+    firm_name: "", firm_tagline: "", firm_address: "", firm_mobile: "", firm_email: "",
+    firm_gstin: "", firm_fssai: "", firm_logo: "", materials: [] });
   const [audit, setAudit] = useState([]);
   const [users, setUsers] = useState([]);
   const [draft, setDraft] = useState(BLANK_USER);
@@ -64,8 +67,25 @@ export default function Settings() {
 
   const save = async () => {
     await api.put("/settings", { washed_loss: +s.washed_loss, unwashed_loss: +s.unwashed_loss, starting_cash: +s.starting_cash,
-      grinding_rate: +s.grinding_rate || 0, flour_deduction_percent: +s.flour_deduction_percent || 0, flour_rate: +s.flour_rate || 0 });
+      grinding_rate: +s.grinding_rate || 0, flour_deduction_percent: +s.flour_deduction_percent || 0,
+      flour_rate: +s.flour_rate || 0,
+      cash_grinding_percent: +s.cash_grinding_percent || 0,
+      deposit_flour_deduction_percent: +s.deposit_flour_deduction_percent || 0,
+      firm_name: s.firm_name, firm_tagline: s.firm_tagline, firm_address: s.firm_address,
+      firm_mobile: s.firm_mobile, firm_email: s.firm_email, firm_gstin: s.firm_gstin,
+      firm_fssai: s.firm_fssai, firm_logo: s.firm_logo,
+      materials: (s.materials || []).filter(Boolean) });
     toast.success("Settings saved");
+  };
+
+  const pickLogo = (file) => {
+    if (!file) return;
+    // Read to a data URI so the logo lives in the database with everything
+    // else, and the invoice never depends on an external host.
+    if (file.size > 400 * 1024) return toast.error("Please use a logo under 400 KB");
+    const reader = new FileReader();
+    reader.onload = () => setS((prev) => ({ ...prev, firm_logo: reader.result }));
+    reader.readAsDataURL(file);
   };
 
   const addUser = async (e) => {
@@ -107,6 +127,21 @@ export default function Settings() {
           <div><Label>Unwashed Loss %</Label><Input type="number" value={s.unwashed_loss} onChange={(e) => setS({ ...s, unwashed_loss: e.target.value })} className="h-11 mt-1" data-testid="set-unwashed" /></div>
           <div><Label>Starting Cash ₹</Label><Input type="number" value={s.starting_cash} onChange={(e) => setS({ ...s, starting_cash: e.target.value })} className="h-11 mt-1" data-testid="set-cash" /></div>
         </div>
+        <h3 className="font-heading font-bold text-lg mt-6 mb-4">Deposit Wheat Deductions</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><Label>Cash Grinding %</Label>
+            <Input type="number" value={s.cash_grinding_percent ?? 5} onChange={(e) => setS({ ...s, cash_grinding_percent: e.target.value })} className="h-11 mt-1" data-testid="set-cash-grinding" />
+            <p className="text-xs text-muted-foreground mt-1">Deducted when the customer pays the charge in money. Default 5%.</p>
+          </div>
+          <div><Label>Flour Deduction %</Label>
+            <Input type="number" value={s.deposit_flour_deduction_percent ?? 15} onChange={(e) => setS({ ...s, deposit_flour_deduction_percent: e.target.value })} className="h-11 mt-1" data-testid="set-deposit-flour" />
+            <p className="text-xs text-muted-foreground mt-1">Deducted when the charge is paid in flour instead. Default 15%.</p>
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground mt-2">
+          New withdrawals use these straight away. Withdrawals already recorded keep the rate they were made at.
+        </p>
+
         <h3 className="font-heading font-bold text-lg mt-6 mb-4">Grinding Charges</h3>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div><Label>Grinding Rate ₹/kg</Label>
@@ -123,6 +158,45 @@ export default function Settings() {
           </div>
         </div>
         <Button className="mt-4 h-11" onClick={save} data-testid="save-settings-btn"><Save className="h-4 w-4 mr-1" /> Save Settings</Button>
+      </Card>
+
+      <Card className="p-6 border-border/60 mb-6 max-w-2xl">
+        <div className="flex items-center gap-2 mb-4"><Building2 className="h-5 w-5 text-primary" /><h3 className="font-heading font-bold text-lg">Firm Details on Invoices</h3></div>
+        <p className="text-sm text-muted-foreground mb-4">Printed at the top of every invoice. Anything left blank is simply omitted.</p>
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div><Label>Firm name</Label><Input value={s.firm_name || ""} onChange={(e) => setS({ ...s, firm_name: e.target.value })} className="h-11 mt-1" data-testid="set-firm-name" /></div>
+            <div><Label>Tagline</Label><Input value={s.firm_tagline || ""} onChange={(e) => setS({ ...s, firm_tagline: e.target.value })} className="h-11 mt-1" data-testid="set-firm-tagline" /></div>
+          </div>
+          <div><Label>Business address</Label><Input value={s.firm_address || ""} onChange={(e) => setS({ ...s, firm_address: e.target.value })} className="h-11 mt-1" data-testid="set-firm-address" /></div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div><Label>Mobile number</Label><Input value={s.firm_mobile || ""} onChange={(e) => setS({ ...s, firm_mobile: e.target.value })} className="h-11 mt-1" data-testid="set-firm-mobile" /></div>
+            <div><Label>Email <span className="text-muted-foreground font-normal">(optional)</span></Label><Input value={s.firm_email || ""} onChange={(e) => setS({ ...s, firm_email: e.target.value })} className="h-11 mt-1" data-testid="set-firm-email" /></div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div><Label>GSTIN <span className="text-muted-foreground font-normal">(optional)</span></Label><Input value={s.firm_gstin || ""} onChange={(e) => setS({ ...s, firm_gstin: e.target.value.toUpperCase() })} className="h-11 mt-1" data-testid="set-firm-gstin" /></div>
+            <div><Label>FSSAI licence <span className="text-muted-foreground font-normal">(optional)</span></Label><Input value={s.firm_fssai || ""} onChange={(e) => setS({ ...s, firm_fssai: e.target.value })} className="h-11 mt-1" data-testid="set-firm-fssai" /></div>
+          </div>
+          <div>
+            <Label>Logo</Label>
+            <div className="flex items-center gap-3 mt-1">
+              {s.firm_logo
+                ? <img src={s.firm_logo} alt="Firm logo" className="h-14 w-14 object-contain rounded border border-border/60" />
+                : <div className="h-14 w-14 rounded border border-dashed border-border/60 flex items-center justify-center text-xs text-muted-foreground">None</div>}
+              <Input type="file" accept="image/*" onChange={(e) => pickLogo(e.target.files?.[0])} className="h-11 max-w-xs" data-testid="set-firm-logo" />
+              {s.firm_logo && <Button variant="outline" onClick={() => setS({ ...s, firm_logo: "" })} data-testid="clear-logo">Remove</Button>}
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">Under 400 KB. Stored with your data, so invoices print it without needing the internet.</p>
+          </div>
+          <div>
+            <Label>Materials accepted instead of cash</Label>
+            <Input value={(s.materials || []).join(", ")}
+              onChange={(e) => setS({ ...s, materials: e.target.value.split(",").map((x) => x.trim()) })}
+              placeholder="Wheat, Rice, Maize, Mustard" className="h-11 mt-1" data-testid="set-materials" />
+            <p className="text-xs text-muted-foreground mt-1">Comma separated. These appear when a charge is settled in kind.</p>
+          </div>
+          <Button className="h-11" onClick={save} data-testid="save-firm-btn"><Save className="h-4 w-4 mr-1" /> Save Firm Details</Button>
+        </div>
       </Card>
 
       {isAdmin && (

@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
 import uuid
@@ -610,18 +610,179 @@ async def delete_purchase(pid: str, user: dict = Depends(require_admin)):
 
 # ---------------- Sales ----------------
 
+class SaleItem(BaseModel):
+    product_id: str
+    product_name: str = ""
+    quantity: float
+    # Snapshotted rather than looked up later, so changing a product's unit does
+    # not silently restate quantities on invoices already issued.
+    unit: str = ""
+    rate: float
+    # Either form; a flat amount wins when both are given, since it is the more
+    # specific instruction.
+    discount_percent: float = 0
+    discount_amount: Optional[float] = None
+    gst_percent: float = 0
+    hsn: str = ""
+
 class SaleBody(BaseModel):
     date: str
     customer_id: Optional[str] = None
     customer_name: str
-    product_id: str
-    product_name: str
-    quantity: float
-    price: float
+    items: List[SaleItem] = []
+    # The original single-product fields, kept so older callers keep working. A
+    # body carrying neither items nor these is rejected rather than quietly
+    # saving an empty invoice.
+    product_id: str = ""
+    product_name: str = ""
+    quantity: float = 0
+    price: float = 0
     payment_status: str = "Paid"
     amount_paid: Optional[float] = None
     payment_mode: str = "Cash"
     bank_id: Optional[str] = None
+    round_off: bool = True
+
+def sale_items(sale: dict) -> list:
+    """Line items of a sale, whatever shape it was stored in.
+
+    Every sale written before an invoice could hold more than one product keeps
+    its product at the top level. Reading `items` alone would make all of that
+    history vanish from stock movements, reports, ledgers and analytics, so the
+    old shape is presented here as a single line instead.
+    """
+    items = sale.get("items")
+    if items:
+        return items
+    if not sale.get("product_name") and not sale.get("product_id"):
+        return []
+    qty = sale.get("quantity", 0) or 0
+    rate = sale.get("price", 0) or 0
+    amount = round(qty * rate, 2)
+    return [{
+        "product_id": sale.get("product_id", ""),
+        "product_name": sale.get("product_name", ""),
+        "quantity": qty, "unit": sale.get("unit", ""), "rate": rate,
+        "discount_percent": 0, "discount_amount": 0, "gst_percent": 0, "hsn": "",
+        "line_amount": amount, "discount": 0, "taxable": amount,
+        "gst_amount": 0, "line_total": amount,
+        "unit_cost": sale.get("unit_cost"), "cogs": sale.get("cogs"),
+    }]
+
+def price_sale_item(item: dict) -> dict:
+    """One line, costed independently of the rest of the invoice.
+
+    Discount comes off before GST, because tax is due on what the customer
+    actually pays rather than on the pre-discount figure.
+    """
+    qty = round(float(item.get("quantity", 0) or 0), 3)
+    rate = round(float(item.get("rate", 0) or 0), 4)
+    line_amount = round(qty * rate, 2)
+    flat = item.get("discount_amount")
+    if flat not in (None, ""):
+        discount = round(float(flat), 2)
+    else:
+        discount = round(line_amount * float(item.get("discount_percent", 0) or 0) / 100, 2)
+    discount = min(max(discount, 0), line_amount)
+    taxable = round(line_amount - discount, 2)
+    gst_percent = float(item.get("gst_percent", 0) or 0)
+    gst_amount = round(taxable * gst_percent / 100, 2)
+    return {**item, "quantity": qty, "rate": rate,
+            "discount_percent": float(item.get("discount_percent", 0) or 0),
+            "discount_amount": discount, "gst_percent": gst_percent,
+            "line_amount": line_amount, "discount": discount, "taxable": taxable,
+            "gst_amount": gst_amount, "line_total": round(taxable + gst_amount, 2)}
+
+def sale_totals(items: list, round_off: bool = True) -> dict:
+    """Invoice totals. Quantity is grouped by unit as well as summed, because
+    adding 50 kg to 20 litre to 10 bags produces a figure that means nothing."""
+    subtotal = round(sum(i["line_amount"] for i in items), 2)
+    discount = round(sum(i["discount"] for i in items), 2)
+    gst = round(sum(i["gst_amount"] for i in items), 2)
+    net = round(subtotal - discount + gst, 2)
+    rounded = float(round(net)) if round_off else net
+    by_unit = {}
+    for i in items:
+        u = i.get("unit") or ""
+        by_unit[u] = round(by_unit.get(u, 0) + i["quantity"], 3)
+    return {"subtotal": subtotal, "total_discount": discount, "total_gst": gst,
+            "taxable_value": round(subtotal - discount, 2),
+            "round_off": round(rounded - net, 2), "total": round(rounded, 2),
+            "quantity_by_unit": by_unit, "line_count": len(items),
+            "total_quantity": round(sum(i["quantity"] for i in items), 3)}
+
+async def resolve_sale_items(body: SaleBody) -> list:
+    """Validate and cost every line, filling name and unit from the catalogue."""
+    raw = [i.model_dump() for i in body.items] if body.items else []
+    if not raw and (body.product_id or body.product_name):
+        raw = [{"product_id": body.product_id, "product_name": body.product_name,
+                "quantity": body.quantity, "rate": body.price,
+                "discount_percent": 0, "discount_amount": None, "gst_percent": 0,
+                "unit": "", "hsn": ""}]
+    if not raw:
+        raise HTTPException(status_code=400, detail="Add at least one product to the invoice")
+
+    priced = []
+    for item in raw:
+        prod = None
+        if item.get("product_id"):
+            prod = await db.products.find_one({"id": item["product_id"]})
+        if prod is None and item.get("product_name"):
+            prod = await db.products.find_one({"name_key": product_key(item["product_name"])})
+        if prod is None:
+            label = item.get("product_name") or item.get("product_id")
+            raise HTTPException(status_code=404, detail=f"Unknown product: {label}")
+        if (item.get("quantity", 0) or 0) <= 0:
+            raise HTTPException(status_code=400, detail=f'Enter a quantity for {prod["name"]}')
+        item = {**item, "product_id": prod["id"], "product_name": prod["name"],
+                "unit": item.get("unit") or prod.get("unit", "kg"),
+                "hsn": item.get("hsn") or prod.get("hsn", "")}
+        line = price_sale_item(item)
+        # Cost is snapshotted per line, so an invoice mixing products with
+        # different cost bases still reports profit correctly and a later
+        # purchase cannot rewrite it.
+        unit_cost = round(prod.get("cost_per_unit", 0) or 0, 4)
+        line["unit_cost"] = unit_cost
+        line["cogs"] = round(line["quantity"] * unit_cost, 2)
+        priced.append(line)
+    return priced
+
+def stock_needed(items: list) -> dict:
+    """Quantity per product across all lines.
+
+    Two lines of the same product each pass a stock check on their own and
+    overdraw together, so the check has to see the combined figure.
+    """
+    need = {}
+    for i in items:
+        need[i["product_id"]] = round(need.get(i["product_id"], 0) + i["quantity"], 3)
+    return need
+
+async def check_sale_stock(items: list, allowance: dict = None):
+    """Refuse an invoice that would take more than the shop holds."""
+    allowance = allowance or {}
+    for pid, qty in stock_needed(items).items():
+        prod = await db.products.find_one({"id": pid})
+        if not prod:
+            continue
+        available = round((prod.get("current_stock", 0) or 0) + allowance.get(pid, 0), 3)
+        if qty > available + 0.001:
+            raise HTTPException(status_code=400, detail=(
+                f'Only {available} {prod.get("unit", "")} of {prod["name"]} in stock'))
+
+async def move_sale_stock(items: list, sign: int):
+    """Apply every line's stock movement in one write rather than one each.
+
+    A five-line invoice would otherwise be five sequential round trips to a
+    database that may be a long way away.
+    """
+    need = stock_needed(items)
+    if not need:
+        return
+    await db.products.bulk_write([
+        UpdateOne({"id": pid}, {"$inc": {"current_stock": round(-sign * qty, 3)}})
+        for pid, qty in need.items()
+    ])
 
 async def product_cost(product_id: str) -> float:
     p = await db.products.find_one({"id": product_id})

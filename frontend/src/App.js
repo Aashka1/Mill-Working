@@ -23,6 +23,7 @@ import Suppliers from "@/pages/Suppliers";
 import Invoices from "@/pages/Invoices";
 import Banks from "@/pages/Banks";
 import Search from "@/pages/Search";
+import Deposits from "@/pages/Deposits";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -65,6 +66,7 @@ function App() {
             <Route path="invoices" element={<Invoices />} />
             <Route path="banks" element={<Banks />} />
             <Route path="search" element={<Search />} />
+            <Route path="deposits" element={<Deposits />} />
           </Route>
         </Routes>
       </BrowserRouter>
