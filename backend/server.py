@@ -3838,6 +3838,102 @@ async def export_search(request: Request, format: str = "xlsx", q: str = "",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="search_results.xlsx"'})
 
+# ---------------- Cost basis repair ----------------
+# PUT /products used to write cost_per_unit from the request body, and the edit
+# form never sent that field, so Pydantic's default of 0 was saved on every
+# product edit. A zero cost makes a sale report its full price as profit. The
+# fix stopped new damage; this rebuilds what was already lost.
+
+async def cost_inflows(name: str, pid: str):
+    """Everything the shop acquired of one product, and what it paid.
+
+    Only inflows carry cost. Sales and production consumption take stock out at
+    whatever the average already was, so they cannot help rebuild it.
+    """
+    lots = []
+    for d in await db.purchases.find({"$or": [{"product_id": pid}, {"product_name": name}]}).to_list(20000):
+        qty = d.get("quantity", 0) or 0
+        if qty > 0:
+            lots.append((qty, d.get("total", 0) or 0, "purchase"))
+    for d in await db.production.find().to_list(20000):
+        for o in d.get("outputs", []):
+            if (o.get("product_id") == pid or o.get("product_name") == name) and (o.get("quantity", 0) or 0) > 0:
+                lots.append((o["quantity"], o.get("cost", 0) or 0, "production"))
+    for d in await db.oil.find().to_list(20000):
+        # Cake bought from the customer is stock the shop paid for.
+        if d.get("cake_sold_to_shop") and name == "Mustard Oil Cake":
+            lots.append((d["cake_sold_to_shop"], (d["cake_sold_to_shop"]) * (d.get("cake_rate", 0) or 0), "cake purchase"))
+    for d in await db.grinding.find().to_list(20000):
+        method = normalise_method(d.get("payment_method"))
+        if method == GRAIN_DEDUCTION and (d.get("grain_item") or "") == name and d.get("grain_qty"):
+            lots.append((d["grain_qty"], d.get("grain_value", 0) or 0, "grain fee"))
+        elif method == FLOUR_DEDUCTION and grinding_output_name(d) == name and d.get("deducted_flour"):
+            lots.append((d["deducted_flour"], d.get("flour_value", 0) or 0, "flour fee"))
+    return lots
+
+async def rebuild_costs(only_zero: bool = True, apply: bool = False):
+    products = [clean(p) for p in await db.products.find().sort("name", 1).to_list(2000)]
+    changes = []
+    for prod in products:
+        current = prod.get("cost_per_unit", 0) or 0
+        if only_zero and current > 0:
+            continue
+        lots = await cost_inflows(prod["name"], prod["id"])
+        qty = sum(q for q, _, _ in lots)
+        value = sum(v for _, v, _ in lots)
+        if qty <= 0:
+            continue
+        rebuilt = round(value / qty, 4)
+        if abs(rebuilt - current) < 0.0001:
+            continue
+        changes.append({"id": prod["id"], "name": prod["name"], "unit": prod.get("unit", "kg"),
+                        "current_cost": round(current, 4), "rebuilt_cost": rebuilt,
+                        "acquired_qty": round(qty, 3), "acquired_value": round(value, 2),
+                        "sources": sorted({src for _, _, src in lots}),
+                        "stock": prod.get("current_stock", 0),
+                        "stock_value_change": round((rebuilt - current) * (prod.get("current_stock", 0) or 0), 2)})
+        # Sales snapshot their cost when they are made, so every sale during the
+        # corrupted window carries cogs: 0 and still reports its full price as
+        # profit. Repairing the product alone would leave the reports wrong.
+        # Only zero snapshots are re-stamped: a real one must not be rewritten
+        # by a later purchase, which is why the snapshot exists at all.
+        broken = [clean(x) for x in await db.sales.find({
+            "$or": [{"product_id": prod["id"]}, {"product_name": prod["name"]}],
+            "$and": [{"$or": [{"cogs": 0}, {"cogs": None}, {"cogs": {"$exists": False}}]}],
+        }).to_list(20000)]
+        broken = [b for b in broken if (b.get("quantity", 0) or 0) > 0]
+        changes[-1]["sales_restamped"] = len(broken)
+        changes[-1]["profit_correction"] = round(sum((b.get("quantity", 0) or 0) * rebuilt for b in broken), 2)
+
+        if apply:
+            await db.products.update_one({"id": prod["id"]}, {"$set": {"cost_per_unit": rebuilt}})
+            for b in broken:
+                qty = b.get("quantity", 0) or 0
+                await db.sales.update_one({"id": b["id"]}, {"$set": {
+                    "unit_cost": rebuilt, "cogs": round(qty * rebuilt, 2)}})
+    return changes
+
+@api_router.get("/products/cost-repair/preview")
+async def preview_cost_repair(only_zero: bool = True, user: dict = Depends(require_admin)):
+    changes = await rebuild_costs(only_zero=only_zero, apply=False)
+    return {"changes": changes, "count": len(changes),
+            "stock_value_change": round(sum(c["stock_value_change"] for c in changes), 2),
+            "sales_restamped": sum(c.get("sales_restamped", 0) for c in changes),
+            "profit_correction": round(sum(c.get("profit_correction", 0) for c in changes), 2),
+            "only_zero": only_zero}
+
+@api_router.post("/products/cost-repair")
+async def apply_cost_repair(only_zero: bool = True, user: dict = Depends(require_admin)):
+    changes = await rebuild_costs(only_zero=only_zero, apply=True)
+    for c in changes:
+        await log_audit(user, "Rebuilt cost basis",
+                        f'{c["name"]}: Rs {c["current_cost"]} → {c["rebuilt_cost"]}/{c["unit"]} '
+                        f'from {c["acquired_qty"]} acquired')
+    return {"changes": changes, "count": len(changes),
+            "stock_value_change": round(sum(c["stock_value_change"] for c in changes), 2),
+            "sales_restamped": sum(c.get("sales_restamped", 0) for c in changes),
+            "profit_correction": round(sum(c.get("profit_correction", 0) for c in changes), 2)}
+
 @api_router.get("/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):
     sales = await db.sales.find().to_list(30000)

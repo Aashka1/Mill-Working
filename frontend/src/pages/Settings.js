@@ -8,7 +8,7 @@ import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { Save, ShieldCheck, Trash2, UserPlus, Users } from "lucide-react";
+import { Save, ShieldCheck, Trash2, UserPlus, Users, Wrench } from "lucide-react";
 import { toast } from "sonner";
 
 const BLANK_USER = { name: "", email: "", password: "", role: "staff" };
@@ -20,6 +20,34 @@ export default function Settings() {
   const [users, setUsers] = useState([]);
   const [draft, setDraft] = useState(BLANK_USER);
   const [savingUser, setSavingUser] = useState(false);
+  const [costPreview, setCostPreview] = useState(null);
+  const [costBusy, setCostBusy] = useState(false);
+
+  const previewCosts = async () => {
+    setCostBusy(true);
+    try {
+      const { data } = await api.get("/products/cost-repair/preview");
+      setCostPreview(data);
+      if (data.count === 0) toast.success("Every product already has a cost — nothing to repair");
+    } catch (err) {
+      toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
+    } finally {
+      setCostBusy(false);
+    }
+  };
+
+  const applyCosts = async () => {
+    setCostBusy(true);
+    try {
+      const { data } = await api.post("/products/cost-repair");
+      toast.success(`Rebuilt ${data.count} product cost${data.count === 1 ? "" : "s"}`);
+      setCostPreview({ ...data, applied: true });
+    } catch (err) {
+      toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
+    } finally {
+      setCostBusy(false);
+    }
+  };
 
   const isAdmin = currentUser?.role === "admin";
 
@@ -96,6 +124,62 @@ export default function Settings() {
         </div>
         <Button className="mt-4 h-11" onClick={save} data-testid="save-settings-btn"><Save className="h-4 w-4 mr-1" /> Save Settings</Button>
       </Card>
+
+      {isAdmin && (
+        <Card className="p-6 border-border/60 mb-6">
+          <div className="flex items-center gap-2 mb-4"><Wrench className="h-5 w-5 text-primary" /><h3 className="font-heading font-bold text-lg">Rebuild Cost Basis</h3></div>
+          <p className="text-sm text-muted-foreground mb-4">
+            An earlier bug set a product&apos;s cost to zero whenever the product was edited, which makes every
+            sale of it report its full price as profit. This rebuilds each cost from what the shop actually
+            paid — purchases, production, and stock taken as grinding fees — and corrects the profit already
+            recorded on those sales. Preview first; nothing is written until you apply.
+          </p>
+          <div className="flex gap-2">
+            <Button variant="outline" className="h-11" onClick={previewCosts} disabled={costBusy} data-testid="cost-preview-btn">
+              Preview changes
+            </Button>
+            {costPreview?.count > 0 && !costPreview.applied && (
+              <Button className="h-11" onClick={applyCosts} disabled={costBusy} data-testid="cost-apply-btn">
+                Apply to {costPreview.count} product{costPreview.count === 1 ? "" : "s"}
+              </Button>
+            )}
+          </div>
+
+          {costPreview && costPreview.count === 0 && (
+            <p className="text-sm text-secondary mt-4" data-testid="cost-clean">Nothing to repair — every product has a cost.</p>
+          )}
+
+          {costPreview?.count > 0 && (
+            <div className="mt-4">
+              {costPreview.applied && <p className="text-sm text-secondary mb-2">Applied.</p>}
+              <Table>
+                <TableHeader><TableRow>
+                  <TableHead>Product</TableHead><TableHead className="text-right">Cost now</TableHead>
+                  <TableHead className="text-right">Rebuilt</TableHead><TableHead>Rebuilt from</TableHead>
+                  <TableHead className="text-right">Sales corrected</TableHead>
+                </TableRow></TableHeader>
+                <TableBody>
+                  {costPreview.changes.map((c) => (
+                    <TableRow key={c.id} data-testid={`cost-row-${c.id}`}>
+                      <TableCell className="font-medium">{c.name}</TableCell>
+                      <TableCell className="text-right text-destructive">₹{c.current_cost}</TableCell>
+                      <TableCell className="text-right font-semibold">₹{c.rebuilt_cost}/{c.unit}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {c.acquired_qty} {c.unit} for ₹{c.acquired_value} · {c.sources.join(", ")}
+                      </TableCell>
+                      <TableCell className="text-right">{c.sales_restamped || 0}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+              <p className="text-xs text-muted-foreground mt-2">
+                Stock value moves by ₹{costPreview.stock_value_change} and previously overstated profit
+                falls by ₹{costPreview.profit_correction} across {costPreview.sales_restamped} sale(s).
+              </p>
+            </div>
+          )}
+        </Card>
+      )}
 
       {isAdmin && (
         <Card className="p-6 border-border/60 mb-6">
