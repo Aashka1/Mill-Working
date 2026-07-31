@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+from pymongo import ReturnDocument
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
 import uuid
@@ -856,14 +857,24 @@ class CustomerBody(BaseModel):
 @api_router.get("/customers")
 async def get_customers(user: dict = Depends(get_current_user)):
     customers = [clean(c) for c in await db.customers.find().sort("name", 1).to_list(2000)]
+    # One query per collection rather than per customer. Querying inside the
+    # loop meant five round trips each, which is unnoticeable beside a local
+    # database and adds up to seconds against a remote one.
+    debit = {}
+    for coll, field in [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
+                        ("exchanges", "grinding_charge")]:
+        for d in await db[coll].find({}, {"customer_name": 1, field: 1}).to_list(50000):
+            name = d.get("customer_name")
+            if name:
+                debit[name] = debit.get(name, 0) + (d.get(field, 0) or 0)
+    credit = {}
+    for pay in await db.payments.find({"party_type": "customer"}, {"party_name": 1, "amount": 1}).to_list(50000):
+        name = pay.get("party_name")
+        if name:
+            credit[name] = credit.get(name, 0) + (pay.get("amount", 0) or 0)
     for c in customers:
-        debit = 0.0
-        for coll, field in [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
-                            ("exchanges", "grinding_charge")]:
-            docs = await db[coll].find({"customer_name": c["name"]}).to_list(2000)
-            debit += sum(d.get(field, 0) for d in docs)
-        credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "customer", "party_name": c["name"]}).to_list(2000))
-        c["outstanding"] = round(debit + (c.get("opening_balance", 0) or 0) - credit, 2)
+        c["outstanding"] = round(debit.get(c["name"], 0) + (c.get("opening_balance", 0) or 0)
+                                 - credit.get(c["name"], 0), 2)
     return customers
 
 @api_router.post("/customers")
@@ -959,11 +970,19 @@ class SupplierBody(BaseModel):
 @api_router.get("/suppliers")
 async def get_suppliers(user: dict = Depends(get_current_user)):
     suppliers = [clean(s) for s in await db.suppliers.find().sort("name", 1).to_list(2000)]
+    debit = {}
+    for d in await db.purchases.find({}, {"supplier_name": 1, "total": 1}).to_list(50000):
+        name = d.get("supplier_name")
+        if name:
+            debit[name] = debit.get(name, 0) + (d.get("total", 0) or 0)
+    credit = {}
+    for pay in await db.payments.find({"party_type": "supplier"}, {"party_name": 1, "amount": 1}).to_list(50000):
+        name = pay.get("party_name")
+        if name:
+            credit[name] = credit.get(name, 0) + (pay.get("amount", 0) or 0)
     for s in suppliers:
-        docs = await db.purchases.find({"supplier_name": s["name"]}).to_list(2000)
-        debit = sum(d.get("total", 0) for d in docs)
-        credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "supplier", "party_name": s["name"]}).to_list(2000))
-        s["outstanding"] = round(debit + (s.get("opening_balance", 0) or 0) - credit, 2)
+        s["outstanding"] = round(debit.get(s["name"], 0) + (s.get("opening_balance", 0) or 0)
+                                 - credit.get(s["name"], 0), 2)
     return suppliers
 
 @api_router.post("/suppliers")
@@ -1560,17 +1579,21 @@ async def adjust_stock_by_name(name, delta):
     Matches the normalised key so casing and stray spaces cannot miss the row.
     Names are unique (see product_key), so this always targets exactly one.
     """
-    res = await db.products.update_one({"name_key": product_key(name)},
-                                       {"$inc": {"current_stock": round(delta, 3)}})
-    if res.matched_count == 0:
+    # find_one_and_update returns the new document, so the increment and the
+    # read are one round trip. Stock moves several times per grinding job, and
+    # each extra trip is a full network hop to the database.
+    prod = await db.products.find_one_and_update(
+        {"name_key": product_key(name)},
+        {"$inc": {"current_stock": round(delta, 3)}},
+        return_document=ReturnDocument.AFTER)
+    if prod is None:
         logger.warning("adjust_stock_by_name: no product named %r; %+g not applied", name, delta)
         return
-    # Re-round after the increment: repeated $inc on floats accumulates binary
-    # error, so a figure that should read 506.8 drifts to 506.79999999999995.
-    prod = await db.products.find_one({"name_key": product_key(name)})
-    if prod is not None:
-        await db.products.update_one({"name_key": product_key(name)},
-                                     {"$set": {"current_stock": round(prod.get("current_stock", 0) or 0, 3)}})
+    # Repeated $inc on floats accumulates binary error, so a figure that should
+    # read 506.8 drifts to 506.79999999999995. Only write when it actually has.
+    exact = round(prod.get("current_stock", 0) or 0, 3)
+    if exact != prod.get("current_stock"):
+        await db.products.update_one({"id": prod["id"]}, {"$set": {"current_stock": exact}})
 
 async def add_stock_by_name_with_cost(name, qty, total_cost):
     """Move stock by name while folding the money paid into the cost basis.
@@ -2734,8 +2757,11 @@ async def unpost_bank_txn(source_ref: str):
 @api_router.get("/banks")
 async def list_banks(user: dict = Depends(get_current_user)):
     accounts = [clean(a) for a in await db.bank_accounts.find().sort("bank_name", 1).to_list(200)]
+    moved = {}
+    for t in await db.bank_txns.find({}, {"bank_id": 1, "amount": 1}).to_list(100000):
+        moved[t.get("bank_id")] = moved.get(t.get("bank_id"), 0) + (t.get("amount", 0) or 0)
     for a in accounts:
-        a["balance"] = await bank_balance(a["id"])
+        a["balance"] = round((a.get("opening_balance", 0) or 0) + moved.get(a["id"], 0), 2)
     return accounts
 
 @api_router.post("/banks")
@@ -2900,9 +2926,15 @@ async def bank_reconciliation(bank_id: str, as_of: Optional[str] = None,
 @api_router.get("/bank-summary")
 async def bank_summary(user: dict = Depends(get_current_user)):
     accounts = [clean(a) for a in await db.bank_accounts.find().sort("bank_name", 1).to_list(200)]
+    moved, unreconciled = {}, {}
+    for t in await db.bank_txns.find({}, {"bank_id": 1, "amount": 1, "reconciled": 1}).to_list(100000):
+        bid = t.get("bank_id")
+        moved[bid] = moved.get(bid, 0) + (t.get("amount", 0) or 0)
+        if not t.get("reconciled"):
+            unreconciled[bid] = unreconciled.get(bid, 0) + 1
     for a in accounts:
-        a["balance"] = await bank_balance(a["id"])
-        a["unreconciled_count"] = await db.bank_txns.count_documents({"bank_id": a["id"], "reconciled": False})
+        a["balance"] = round((a.get("opening_balance", 0) or 0) + moved.get(a["id"], 0), 2)
+        a["unreconciled_count"] = unreconciled.get(a["id"], 0)
     return {"accounts": accounts,
             "total_balance": round(sum(a["balance"] for a in accounts if a.get("active") is not False), 2)}
 
@@ -2961,6 +2993,40 @@ async def party_movements(name: str):
             rows.append({"date": pay.get("date"), "particulars": f'{note} ({mode})', "debit": round(abs(amt), 2), "credit": 0})
     rows.sort(key=lambda r: str(r.get("date") or ""))
     return rows
+
+async def all_party_movements():
+    """Every party's movements in one pass, keyed by name.
+
+    party_movements answers for one party in six queries. Asking it per party
+    turns a report into hundreds of round trips; this reads each collection
+    once and buckets the results.
+    """
+    out = {}
+    def add(name, row):
+        if name:
+            out.setdefault(name, []).append(row)
+    for coll, field, label in (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
+                               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange")):
+        for d in await db[coll].find().to_list(50000):
+            if d.get(field):
+                add(d.get("customer_name"),
+                    {"date": d.get("date"), "particulars": f'{label} {d.get("invoice_number", "")}'.strip(),
+                     "debit": round(d.get(field, 0), 2), "credit": 0})
+    for d in await db.purchases.find().to_list(50000):
+        add(d.get("supplier_name"),
+            {"date": d.get("date"), "particulars": f'Purchase {d.get("product_name", "")}',
+             "debit": round(d.get("total", 0), 2), "credit": 0})
+    for pay in await db.payments.find().to_list(50000):
+        amt = pay.get("amount", 0) or 0
+        note = pay.get("note") or "Payment"
+        mode = clean_mode(pay.get("payment_mode"))
+        row = {"date": pay.get("date"), "particulars": f'{note} ({mode})',
+               "debit": 0 if amt >= 0 else round(abs(amt), 2),
+               "credit": round(amt, 2) if amt >= 0 else 0}
+        add(pay.get("party_name"), row)
+    for rows in out.values():
+        rows.sort(key=lambda r: str(r.get("date") or ""))
+    return out
 
 async def product_movements(start: str, end: str):
     """Stock in and out per product, split by what caused it.
@@ -3096,9 +3162,13 @@ async def rep_party_ledger(start, end, party=None, kind="customer", **_):
     if not party:
         # No party chosen: summarise every one of them instead of an empty page.
         parties = [clean(x) for x in await db[coll].find().sort("name", 1).to_list(5000)]
+        # Fetch every movement once and bucket by party, rather than six
+        # queries per party — the difference between one round trip and
+        # hundreds once the mill has a real customer list.
+        by_party = await all_party_movements()
         rows = []
         for x in parties:
-            movements = await party_movements(x["name"])
+            movements = by_party.get(x["name"], [])
             deb = sum(m["debit"] for m in movements if in_range(m, start, end))
             cre = sum(m["credit"] for m in movements if in_range(m, start, end))
             bal = round(sum(m["debit"] - m["credit"] for m in movements) + (x.get("opening_balance", 0) or 0), 2)
@@ -3318,14 +3388,15 @@ async def rep_outstanding(start, end, **_):
     """Everything still owed, both directions. Ignores the date range on
     purpose: a balance is what it is today, not what it was in a window."""
     rows = []
+    by_party = await all_party_movements()
     for c in await db.customers.find().sort("name", 1).to_list(5000):
-        movements = await party_movements(c["name"])
+        movements = by_party.get(c["name"], [])
         bal = round(sum(m["debit"] - m["credit"] for m in movements) + (c.get("opening_balance", 0) or 0), 2)
         if abs(bal) >= 0.01:
             rows.append({"party": c["name"], "type": "Customer", "phone": c.get("phone", ""),
                          "receivable": bal if bal > 0 else "", "payable": -bal if bal < 0 else ""})
     for sup in await db.suppliers.find().sort("name", 1).to_list(5000):
-        movements = await party_movements(sup["name"])
+        movements = by_party.get(sup["name"], [])
         bal = round(sum(m["debit"] - m["credit"] for m in movements) + (sup.get("opening_balance", 0) or 0), 2)
         if abs(bal) >= 0.01:
             rows.append({"party": sup["name"], "type": "Supplier", "phone": sup.get("phone", ""),
