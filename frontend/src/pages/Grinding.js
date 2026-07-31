@@ -16,6 +16,17 @@ import { toast } from "sonner";
 
 const ADD_NEW = "__add_new__";
 
+// Money rails settle to cash or the bank; the last two settle in kind.
+const MONEY_METHODS = ["Cash", "UPI", "Bank", "NEFT", "RTGS", "IMPS", "Cheque"];
+const FLOUR_DEDUCTION = "Flour Deduction";
+const GRAIN_DEDUCTION = "Grain Deduction";
+const DEDUCTION_BASES = [
+  { value: "Value", label: "Enough to cover the charge" },
+  { value: "Percent", label: "Percentage of the flour" },
+  { value: "Weight", label: "A fixed weight" },
+];
+const isKind = (m) => m === FLOUR_DEDUCTION || m === GRAIN_DEDUCTION;
+
 const empty = { date: today(), customer_name: "", grain_type: "Wheat", output_product: "Atta", wheat_weight: "", washed: true, loss_percent: "2.5", charge_per_kg: "2", payment_method: "Cash", grain_fee_kg: "", payment_status: "Pending", amount_paid: "", payment_mode: "Cash" };
 
 export default function Grinding() {
@@ -29,11 +40,13 @@ export default function Grinding() {
   const [f, setF] = useState(empty);
   const [payFor, setPayFor] = useState(null);
   const [grainTypes, setGrainTypes] = useState([]);
+  const [banks, setBanks] = useState([]);
   const [newGrain, setNewGrain] = useState({ name: "", output: "" });
 
   useEffect(() => { api.get("/settings").then((r) => setSettings(r.data)).catch(() => {}); }, []);
   const loadGrainTypes = () => api.get("/grain-types").then((r) => setGrainTypes(r.data)).catch(() => {});
   useEffect(() => { loadGrainTypes(); }, []);
+  useEffect(() => { api.get("/banks").then((r) => setBanks(r.data)).catch(() => {}); }, []);
 
   const addingGrain = f.grain_type === ADD_NEW;
   const pickGrain = (v) => {
@@ -71,9 +84,24 @@ export default function Grinding() {
   const save = async () => {
     if (!f.customer_name || !f.wheat_weight) return toast.error("Fill all fields");
     if (addingGrain) return toast.error("Add the new item first, or pick one from the list");
-    const body = { date: f.date, customer_name: f.customer_name, grain_type: f.grain_type, output_product: f.output_product, wheat_weight: +f.wheat_weight, washed: f.washed, loss_percent: +f.loss_percent, charge_per_kg: +(f.charge_per_kg || 0), payment_method: f.payment_method, grain_fee_kg: +(f.grain_fee_kg || 0), payment_status: f.payment_status };
+    const kind = isKind(f.payment_method);
+    const body = { date: f.date, customer_name: f.customer_name, grain_type: f.grain_type, output_product: f.output_product,
+      wheat_weight: +f.wheat_weight, washed: f.washed, loss_percent: +f.loss_percent,
+      charge_per_kg: +(f.charge_per_kg || 0), payment_method: f.payment_method,
+      grain_fee_kg: +(f.grain_fee_kg || 0),
+      // Paying in kind settles the bill outright, so the money status and mode
+      // do not apply.
+      payment_status: kind ? "Paid" : f.payment_status,
+      payment_mode: kind ? "Cash" : f.payment_method,
+      bank_id: kind ? null : (f.bank_id || null),
+      deduction_basis: f.deduction_basis,
+      deduction_percent: f.deduction_percent === "" ? null : +f.deduction_percent,
+      deduction_weight: f.deduction_weight === "" ? null : +f.deduction_weight,
+      grain_item: f.grain_item, 
+      grain_qty: f.grain_qty === "" ? null : +f.grain_qty,
+      grain_value: f.grain_value === "" ? null : +f.grain_value };
     if (!editingId) body.payment_mode = f.payment_mode;
-    if (!editingId) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
+    if (!editingId && !kind) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
     if (editingId) { await api.put(`/grinding/${editingId}`, body); toast.success("Order updated"); }
     else { await api.post("/grinding", body); toast.success("Grinding order recorded"); }
     setOpen(false); setEditingId(null); setF(empty);
@@ -81,6 +109,8 @@ export default function Grinding() {
   };
 
   const grindCharge = (+f.wheat_weight || 0) * (+f.charge_per_kg || 0);
+  // Zero means "use the product's own rate", which the backend resolves.
+  const flourRate = settings.flour_rate || 0;
 
   return (
     <div>
@@ -151,19 +181,83 @@ export default function Grinding() {
               <span>Loss: <b className="text-destructive">{lossKg.toFixed(2)} kg</b></span>
               <span>{f.output_product} output: <b className="text-secondary">{outputQty.toFixed(2)} kg</b></span>
             </div>
-            <div><Label>Payment Method</Label>
-              <Select value={f.payment_method} onValueChange={(v) => setF({ ...f, payment_method: v })}>
-                <SelectTrigger className="h-11 mt-1" data-testid="grinding-pay-method"><SelectValue /></SelectTrigger>
-                <SelectContent><SelectItem value="Cash">Cash</SelectItem><SelectItem value="Grain">Grain (shop keeps atta)</SelectItem></SelectContent>
-              </Select>
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Payment Method</Label>
+                <Select value={f.payment_method} onValueChange={(v) => setF({ ...f, payment_method: v })}>
+                  <SelectTrigger className="h-11 mt-1" data-testid="grinding-pay-method"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {MONEY_METHODS.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
+                    <SelectItem value={FLOUR_DEDUCTION}>Flour Deduction (shop keeps flour)</SelectItem>
+                    <SelectItem value={GRAIN_DEDUCTION}>Grain / Material Deduction</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {!isKind(f.payment_method) && f.payment_method !== "Cash" && (
+                <div><Label>Into which account</Label>
+                  <Select value={f.bank_id} onValueChange={(v) => setF({ ...f, bank_id: v })}>
+                    <SelectTrigger className="h-11 mt-1" data-testid="grinding-bank"><SelectValue placeholder="Choose" /></SelectTrigger>
+                    <SelectContent>{banks.map((b) => <SelectItem key={b.id} value={b.id}>{b.bank_name}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+              )}
             </div>
-            {f.payment_method === "Cash" ? (
-              <div><Label>Charge ₹/kg</Label><Input type="number" value={f.charge_per_kg} onChange={(e) => setF({ ...f, charge_per_kg: e.target.value })} className="h-11 mt-1" data-testid="grinding-charge" />
-                <p className="text-xs text-muted-foreground mt-1">Total charge: {money((+f.wheat_weight || 0) * (+f.charge_per_kg || 0))}</p></div>
-            ) : (
-              <div><Label>{f.output_product} kept by shop (kg)</Label><Input type="number" value={f.grain_fee_kg} onChange={(e) => setF({ ...f, grain_fee_kg: e.target.value })} className="h-11 mt-1" data-testid="grinding-grainfee" />
-                <p className="text-xs text-muted-foreground mt-1">Customer takes home: {(outputQty - (+f.grain_fee_kg || 0)).toFixed(2)} kg · Shop {f.output_product} stock +{(+f.grain_fee_kg || 0)} kg</p></div>
+            {/* The charge stands on its own however it is settled, so this is
+                always shown rather than hidden behind the payment method. */}
+            <div><Label>Grinding charge ₹/kg</Label>
+              <Input type="number" value={f.charge_per_kg} onChange={(e) => setF({ ...f, charge_per_kg: e.target.value })} className="h-11 mt-1" data-testid="grinding-charge" />
+              <p className="text-xs text-muted-foreground mt-1">
+                Total charge: <b className="text-foreground">{money(grindCharge)}</b>
+                {isKind(f.payment_method) && " — settled in kind below, not in cash."}
+              </p>
+            </div>
+
+            {f.payment_method === FLOUR_DEDUCTION && (
+              <div className="rounded-lg border border-border/60 p-3 space-y-3" data-testid="flour-deduction-panel">
+                <div className="grid grid-cols-2 gap-3">
+                  <div><Label>Deduct flour by</Label>
+                    <Select value={f.deduction_basis} onValueChange={(v) => setF({ ...f, deduction_basis: v })}>
+                      <SelectTrigger className="h-11 mt-1" data-testid="deduction-basis"><SelectValue /></SelectTrigger>
+                      <SelectContent>{DEDUCTION_BASES.map((b) => <SelectItem key={b.value} value={b.value}>{b.label}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                  {f.deduction_basis === "Percent" && (
+                    <div><Label>Percentage</Label>
+                      <Input type="number" value={f.deduction_percent} onChange={(e) => setF({ ...f, deduction_percent: e.target.value })}
+                        placeholder={String(settings.flour_deduction_percent ?? 5)} className="h-11 mt-1" data-testid="deduction-percent" />
+                      <p className="text-xs text-muted-foreground mt-1">Blank uses the {settings.flour_deduction_percent ?? 5}% set in Settings.</p>
+                    </div>
+                  )}
+                  {f.deduction_basis === "Weight" && (
+                    <div><Label>Weight kept (kg)</Label>
+                      <Input type="number" value={f.deduction_weight} onChange={(e) => setF({ ...f, deduction_weight: e.target.value })} className="h-11 mt-1" data-testid="deduction-weight" />
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Flour kept back is valued at {money(flourRate)}/kg and added to shop stock.
+                  The exact figures are calculated on save and printed on the invoice.
+                </p>
+              </div>
             )}
+
+            {f.payment_method === GRAIN_DEDUCTION && (
+              <div className="rounded-lg border border-border/60 p-3 grid grid-cols-3 gap-3" data-testid="grain-deduction-panel">
+                <div><Label>Item received</Label>
+                  <Input value={f.grain_item} onChange={(e) => setF({ ...f, grain_item: e.target.value })} placeholder="Wheat Crop" className="h-11 mt-1" data-testid="grain-item" />
+                </div>
+                <div><Label>Quantity (kg)</Label>
+                  <Input type="number" value={f.grain_qty} onChange={(e) => setF({ ...f, grain_qty: e.target.value })} className="h-11 mt-1" data-testid="grain-qty" />
+                </div>
+                <div><Label>Value ₹</Label>
+                  <Input type="number" value={f.grain_value} onChange={(e) => setF({ ...f, grain_value: e.target.value })} className="h-11 mt-1" data-testid="grain-value" />
+                </div>
+              </div>
+            )}
+            {isKind(f.payment_method) ? (
+              <p className="text-sm text-muted-foreground rounded-lg bg-muted/50 p-3">
+                Settled in kind — the bill is closed and nothing is owed in cash.
+              </p>
+            ) : (
             <div className="grid grid-cols-2 gap-4">
               <div><Label>Payment Status</Label>
                 <Select value={f.payment_status} onValueChange={(v) => setF({ ...f, payment_status: v })}>
@@ -195,6 +289,7 @@ export default function Grinding() {
                 </div>
               )}
             </div>
+            )}
           </div>
           <DialogFooter><Button onClick={save} data-testid="save-grinding-btn">{editingId ? "Update" : "Save"} Order</Button></DialogFooter>
         </DialogContent>

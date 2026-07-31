@@ -15,7 +15,7 @@ const BLANK_USER = { name: "", email: "", password: "", role: "staff" };
 
 export default function Settings() {
   const { user: currentUser, createUser } = useAuth();
-  const [s, setS] = useState({ washed_loss: 2.5, unwashed_loss: 5, starting_cash: 0 });
+  const [s, setS] = useState({ washed_loss: 2.5, unwashed_loss: 5, starting_cash: 0, grinding_rate: 2, flour_deduction_percent: 5, flour_rate: 0 });
   const [audit, setAudit] = useState([]);
   const [users, setUsers] = useState([]);
   const [draft, setDraft] = useState(BLANK_USER);
@@ -35,7 +35,8 @@ export default function Settings() {
   }, [loadUsers]);
 
   const save = async () => {
-    await api.put("/settings", { washed_loss: +s.washed_loss, unwashed_loss: +s.unwashed_loss, starting_cash: +s.starting_cash });
+    await api.put("/settings", { washed_loss: +s.washed_loss, unwashed_loss: +s.unwashed_loss, starting_cash: +s.starting_cash,
+      grinding_rate: +s.grinding_rate || 0, flour_deduction_percent: +s.flour_deduction_percent || 0, flour_rate: +s.flour_rate || 0 });
     toast.success("Settings saved");
   };
 
@@ -77,6 +78,21 @@ export default function Settings() {
           <div><Label>Washed Loss %</Label><Input type="number" value={s.washed_loss} onChange={(e) => setS({ ...s, washed_loss: e.target.value })} className="h-11 mt-1" data-testid="set-washed" /></div>
           <div><Label>Unwashed Loss %</Label><Input type="number" value={s.unwashed_loss} onChange={(e) => setS({ ...s, unwashed_loss: e.target.value })} className="h-11 mt-1" data-testid="set-unwashed" /></div>
           <div><Label>Starting Cash ₹</Label><Input type="number" value={s.starting_cash} onChange={(e) => setS({ ...s, starting_cash: e.target.value })} className="h-11 mt-1" data-testid="set-cash" /></div>
+        </div>
+        <h3 className="font-heading font-bold text-lg mt-6 mb-4">Grinding Charges</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div><Label>Grinding Rate ₹/kg</Label>
+            <Input type="number" value={s.grinding_rate ?? 2} onChange={(e) => setS({ ...s, grinding_rate: e.target.value })} className="h-11 mt-1" data-testid="set-grinding-rate" />
+            <p className="text-xs text-muted-foreground mt-1">What a new grinding job or exchange starts from.</p>
+          </div>
+          <div><Label>Flour Deduction %</Label>
+            <Input type="number" value={s.flour_deduction_percent ?? 5} onChange={(e) => setS({ ...s, flour_deduction_percent: e.target.value })} className="h-11 mt-1" data-testid="set-flour-percent" />
+            <p className="text-xs text-muted-foreground mt-1">Share of the flour kept when a customer pays in kind.</p>
+          </div>
+          <div><Label>Flour Rate ₹/kg</Label>
+            <Input type="number" value={s.flour_rate ?? 0} onChange={(e) => setS({ ...s, flour_rate: e.target.value })} className="h-11 mt-1" data-testid="set-flour-rate" />
+            <p className="text-xs text-muted-foreground mt-1">Value of deducted flour. Leave at 0 to use each product&apos;s own rate.</p>
+          </div>
         </div>
         <Button className="mt-4 h-11" onClick={save} data-testid="save-settings-btn"><Save className="h-4 w-4 mr-1" /> Save Settings</Button>
       </Card>
