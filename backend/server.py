@@ -7,6 +7,7 @@ import os
 import io
 import re
 import jwt
+import base64
 import bcrypt
 import secrets
 import asyncio
@@ -30,7 +31,7 @@ import uuid
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from openpyxl import Workbook
 
@@ -860,7 +861,7 @@ async def get_customers(user: dict = Depends(get_current_user)):
     # together. Sequential awaits cost one network round trip each, which is
     # invisible beside a local database and seconds against a distant one.
     sources = [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
-               ("exchanges", "grinding_charge")]
+               ("exchanges", "grinding_charge"), ("wheat_withdrawals", "charge")]
     customers, *rest = await asyncio.gather(
         db.customers.find().sort("name", 1).to_list(2000),
         *[db[coll].find({}, {"customer_name": 1, field: 1}).to_list(50000) for coll, field in sources],
@@ -1111,6 +1112,27 @@ async def build_invoice_data(ref_id: str):
                 "customer_name": sale["customer_name"], "payment_status": sale["payment_status"],
                 "items": [{"desc": sale["product_name"], "qty": f'{sale["quantity"]} {unit}',
                            "rate": sale["price"], "amount": sale["total"]}], "total": sale["total"]}
+    w = await db.wheat_withdrawals.find_one({"id": ref_id})
+    if w:
+        gtype = normalise_grinding_type(w.get("grinding_type"))
+        items = [{"desc": "Wheat drawn from deposit", "qty": f'{w.get("wheat_drawn", 0)} kg', "rate": "", "amount": ""},
+                 {"desc": f'Less: grinding deduction at {w.get("deduction_percent", 0)}%',
+                  "qty": f'{w.get("deducted_qty", 0)} kg', "rate": "", "amount": ""},
+                 {"desc": "Flour delivered", "qty": f'{w.get("flour_delivered", 0)} kg', "rate": "", "amount": ""}]
+        if gtype == "Cash" and w.get("charge"):
+            items.append({"desc": "Grinding charge", "qty": f'{w.get("wheat_drawn", 0)} kg',
+                          "rate": w.get("charge_per_kg", 0), "amount": w.get("charge", 0)})
+        elif gtype == FLOUR_DEDUCTION:
+            items.append({"desc": "Paid by flour deduction — no cash due",
+                          "qty": f'{w.get("deducted_qty", 0)} kg', "rate": "", "amount": ""})
+        elif gtype == GRAIN_DEDUCTION:
+            items.append({"desc": f'Grinding charge, paid in {w.get("material_item") or "material"}',
+                          "qty": f'{w.get("material_qty", 0)} kg', "rate": "", "amount": w.get("charge", 0)})
+        return {"type": "Deposit Withdrawal", "invoice_number": w.get("invoice_number") or "-",
+                "date": w.get("date"), "customer_name": w.get("customer_name"),
+                "payment_status": w.get("payment_status", "Paid"),
+                "payment_method": gtype, "items": items, "total": w.get("charge", 0) or 0}
+
     x = await db.exchanges.find_one({"id": ref_id})
     if x:
         items = [{"desc": "Wheat received", "qty": f'{x.get("wheat_qty", 0)} kg', "rate": "", "amount": ""},
@@ -1157,17 +1179,76 @@ async def invoice_pdf(ref_id: str, request: Request):
     data = await build_invoice_data(ref_id)
     if not data:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    settings = await get_settings_doc()
+    buyer = await db.customers.find_one({"party_key": party_key(data.get("customer_name", ""))}) or {}
+
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=20*mm)
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=16*mm)
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("t", parent=styles["Title"], textColor=colors.HexColor("#B8860B"))
-    elements = [Paragraph("Gangotri Flour &amp; Oil Mill", title),
-                Paragraph("Wheat Grinding &amp; Oil Extraction Services", styles["Normal"]),
-                Spacer(1, 12),
-                Paragraph(f"<b>Invoice:</b> {data['invoice_number']} &nbsp;&nbsp; <b>Type:</b> {data['type']}", styles["Normal"]),
-                Paragraph(f"<b>Date:</b> {data['date']} &nbsp;&nbsp; <b>Status:</b> {data['payment_status']}", styles["Normal"]),
-                Paragraph(f"<b>Customer:</b> {data['customer_name']}", styles["Normal"]),
-                Spacer(1, 16)]
+    title = ParagraphStyle("t", parent=styles["Title"], textColor=colors.HexColor("#B8860B"),
+                           alignment=0, fontSize=18, spaceAfter=2)
+    small = ParagraphStyle("sm", parent=styles["Normal"], fontSize=8.5, leading=11)
+
+    def esc(v):
+        return str(v or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Header lines are built from what is filled in, so an unset GSTIN or FSSAI
+    # leaves no empty label on a customer's bill.
+    firm_lines = [Paragraph(esc(settings.get("firm_name") or "Mill"), title)]
+    if settings.get("firm_tagline"):
+        firm_lines.append(Paragraph(esc(settings["firm_tagline"]), small))
+    if settings.get("firm_address"):
+        firm_lines.append(Paragraph(esc(settings["firm_address"]).replace("\n", "<br/>"), small))
+    contact = " · ".join(filter(None, [
+        f'Mob: {esc(settings.get("firm_mobile"))}' if settings.get("firm_mobile") else "",
+        esc(settings.get("firm_email")) if settings.get("firm_email") else ""]))
+    if contact:
+        firm_lines.append(Paragraph(contact, small))
+    statutory = " · ".join(filter(None, [
+        f'GSTIN: {esc(settings.get("firm_gstin"))}' if settings.get("firm_gstin") else "",
+        f'FSSAI: {esc(settings.get("firm_fssai"))}' if settings.get("firm_fssai") else ""]))
+    if statutory:
+        firm_lines.append(Paragraph(statutory, small))
+
+    header_cells = [[firm_lines]]
+    logo = settings.get("firm_logo") or ""
+    if logo.startswith("data:image"):
+        try:
+            raw = base64.b64decode(logo.split(",", 1)[1])
+            header_cells[0].append(Image(io.BytesIO(raw), width=26*mm, height=26*mm, kind="proportional"))
+        except Exception:
+            # A malformed logo must not stop the mill printing a bill.
+            logger.warning("Invoice logo could not be decoded; printing without it")
+            header_cells[0].append("")
+    else:
+        header_cells[0].append("")
+
+    head_tbl = Table(header_cells, colWidths=[135*mm, 30*mm])
+    head_tbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                  ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                  ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+
+    buyer_lines = [f'<b>Bill to:</b> {esc(data["customer_name"])}']
+    if buyer.get("address"):
+        buyer_lines.append(esc(buyer["address"]))
+    if buyer.get("phone"):
+        buyer_lines.append(f'Mob: {esc(buyer["phone"])}')
+    if buyer.get("gstin"):
+        buyer_lines.append(f'GSTIN: {esc(buyer["gstin"])}')
+
+    elements = [head_tbl, Spacer(1, 8),
+                Table([[""]], colWidths=[165*mm], style=TableStyle([
+                    ("LINEBELOW", (0, 0), (-1, -1), 0.75, colors.HexColor("#B8860B"))])),
+                Spacer(1, 8),
+                Table([[Paragraph("<br/>".join(buyer_lines), small),
+                        Paragraph(f'<b>Invoice:</b> {esc(data["invoice_number"])}<br/>'
+                                  f'<b>Type:</b> {esc(data["type"])}<br/>'
+                                  f'<b>Date:</b> {esc(data["date"])}<br/>'
+                                  f'<b>Status:</b> {esc(data["payment_status"])}', small)]],
+                      colWidths=[100*mm, 65*mm],
+                      style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                        ("LEFTPADDING", (0, 0), (-1, -1), 0)])),
+                Spacer(1, 14)]
     rows = [["Description", "Quantity", "Rate (Rs)", "Amount (Rs)"]]
     for it in data["items"]:
         def cell(v):
@@ -1199,10 +1280,11 @@ async def invoice_pdf(ref_id: str, request: Request):
 async def dashboard(user: dict = Depends(get_current_user)):
     # The landing page, so it is worth the six reads costing one round trip
     # rather than six. None of them depends on another.
-    products, sales, purchases, grinding, oil, expenses = await asyncio.gather(
+    products, sales, purchases, grinding, oil, expenses, withdrawals = await asyncio.gather(
         db.products.find().to_list(1000), db.sales.find().to_list(5000),
         db.purchases.find().to_list(5000), db.grinding.find().to_list(5000),
         db.oil.find().to_list(5000), db.expenses.find().to_list(5000),
+        db.wheat_withdrawals.find().to_list(5000),
     )
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -1246,7 +1328,8 @@ async def dashboard(user: dict = Depends(get_current_user)):
         return 0 if d.get("payment_status") == "Paid" else max(d.get(field, 0), 0)
 
     pending_customer = 0.0
-    for coll, field in [(sales, "total"), (grinding, "total_charge"), (oil, "total")]:
+    for coll, field in [(sales, "total"), (grinding, "total_charge"), (oil, "total"),
+                        (withdrawals, "charge")]:
         pending_customer += sum(owed(d, field) for d in coll)
     supplier_dues = sum(owed(p, "total") for p in purchases)
     paid_to_customers = round(sum(abs(d.get("total", 0)) for d in oil if (d.get("total", 0) or 0) < 0), 2)
@@ -1304,7 +1387,8 @@ async def notifications(user: dict = Depends(get_current_user)):
         if p.get("current_stock", 0) <= p.get("low_stock_threshold", 0):
             notes.append({"type": "low_stock", "level": "warning",
                           "message": f'Low stock: {p["name"]} ({p.get("current_stock",0)} {p.get("unit","kg")} left)'})
-    for coll, field, label in [("sales", "total", "sale"), ("grinding", "total_charge", "grinding"), ("oil", "total", "oil extraction")]:
+    for coll, field, label in [("sales", "total", "sale"), ("grinding", "total_charge", "grinding"),
+                               ("oil", "total", "oil extraction"), ("wheat_withdrawals", "charge", "deposit withdrawal")]:
         docs = await db[coll].find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000)
         docs = [d for d in docs if (d.get(field, 0) or 0) > 0]
         for d in docs:
@@ -1548,7 +1632,13 @@ async def get_settings_doc():
         s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0, "starting_cash": 0,
              "grinding_rate": 2.0, "flour_deduction_percent": 5.0, "flour_rate": 0}
         await db.settings.insert_one(s)
-    defaults = {"grinding_rate": 2.0, "flour_deduction_percent": 5.0, "flour_rate": 0}
+    defaults = {"grinding_rate": 2.0, "flour_deduction_percent": 5.0, "flour_rate": 0,
+                "cash_grinding_percent": 5.0, "deposit_flour_deduction_percent": 15.0,
+                "firm_name": "Gangotri Flour & Oil Mill",
+                "firm_tagline": "Wheat Grinding & Oil Extraction Services",
+                "firm_address": "", "firm_mobile": "", "firm_email": "",
+                "firm_gstin": "", "firm_fssai": "", "firm_logo": "",
+                "materials": ["Wheat", "Rice", "Maize", "Mustard"]}
     missing = {k: v for k, v in defaults.items() if s.get(k) is None}
     if missing:
         await db.settings.update_one({"id": "config"}, {"$set": missing})
@@ -1873,6 +1963,29 @@ class SettingsBody(BaseModel):
     # What a kilo of kept-back flour is worth. Zero falls back to the product's
     # own rate, so the mill only sets this if it prices deductions differently.
     flour_rate: float = 0
+
+    # Deposit wheat. Two ways to settle a withdrawal, each with its own
+    # deduction, both editable and applied to new withdrawals as soon as they
+    # change. Cash grinding deducts the milling loss only; flour deduction
+    # takes more because the extra is the fee itself.
+    cash_grinding_percent: float = 5.0
+    deposit_flour_deduction_percent: float = 15.0
+
+    # Firm details printed on every invoice. All optional except the name.
+    firm_name: str = "Gangotri Flour & Oil Mill"
+    firm_tagline: str = "Wheat Grinding & Oil Extraction Services"
+    firm_address: str = ""
+    firm_mobile: str = ""
+    firm_email: str = ""
+    firm_gstin: str = ""
+    firm_fssai: str = ""
+    # Stored as a data URI so the logo travels with the database and the PDF
+    # never depends on an external host being reachable.
+    firm_logo: str = ""
+
+    # What the mill will accept instead of cash. Editable, so a mill that takes
+    # something unusual is not blocked on a code change.
+    materials: List[str] = []
 
 @api_router.get("/settings")
 async def read_settings(user: dict = Depends(get_current_user)):
@@ -2481,7 +2594,8 @@ async def post_payment_to_bank(payment_id: str):
 # a cached sum of it, recomputed rather than incremented so an edit or a
 # repeated call can never double-count.
 
-TOTAL_FIELD = {"sales": "total", "grinding": "total_charge", "oil": "total", "purchases": "total"}
+TOTAL_FIELD = {"sales": "total", "grinding": "total_charge", "oil": "total",
+               "purchases": "total", "wheat_withdrawals": "charge"}
 
 def payment_state(total: float, paid: float) -> str:
     # A negative total means the by-product the customer sold us is worth more
@@ -2562,7 +2676,8 @@ async def delete_payment(pid: str, user: dict = Depends(require_admin)):
 async def build_ledger(party_type, name):
     entries = []
     if party_type == "customer":
-        for coll, field, label in [("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"), ("oil", "total", "Oil Extraction")]:
+        for coll, field, label in [("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
+                                   ("oil", "total", "Oil Extraction"), ("wheat_withdrawals", "charge", "Deposit withdrawal")]:
             for d in await db[coll].find({"customer_name": name}).to_list(3000):
                 if d.get(field, 0):
                     entries.append({"date": d.get("date"), "type": label, "ref": d.get("invoice_number", ""), "debit": round(d.get(field, 0), 2), "credit": 0})
@@ -2990,7 +3105,8 @@ async def party_movements(name: str):
     """Every debit and credit against one party, oldest first."""
     rows = []
     for coll, field, label in (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
-                               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange")):
+                               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange"),
+                               ("wheat_withdrawals", "charge", "Deposit withdrawal")):
         for d in await db[coll].find({"customer_name": name}).to_list(5000):
             if d.get(field):
                 rows.append({"date": d.get("date"), "particulars": f'{label} {d.get("invoice_number", "")}'.strip(),
@@ -3022,7 +3138,8 @@ async def all_party_movements():
         if name:
             out.setdefault(name, []).append(row)
     sources = (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
-               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange"))
+               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange"),
+               ("wheat_withdrawals", "charge", "Deposit withdrawal"))
     *docs, purchases, payments = await asyncio.gather(
         *[db[coll].find().to_list(50000) for coll, _, _ in sources],
         db.purchases.find().to_list(50000),
@@ -3324,6 +3441,49 @@ async def rep_material_ledger(start, end, party=None, item=None, **_):
             "summary": [{"label": "Received in kind", "value": round(sum(r["qty"] for r in out), 3)},
                         {"label": "Value", "value": round(sum(r["value"] for r in out), 2), "type": "money"}]}
 
+async def rep_deposit_wheat(start, end, party=None, **_):
+    """Every depositor's position, plus their withdrawals in the period."""
+    summary = await deposits_summary_data()
+    rows = summary["rows"]
+    if party:
+        rows = [r for r in rows if r["customer_name"] == party]
+    return {"columns": [col("customer_name", "Depositor"), col("phone", "Mobile"),
+                        col("deposited_kg", "Deposited", "qty"), col("withdrawn_kg", "Withdrawn", "qty"),
+                        col("remaining_kg", "Balance (kg)", "qty"),
+                        col("remaining_quintal", "Balance (qt)", "qty"),
+                        col("flour_delivered", "Flour given", "qty"),
+                        col("flour_deducted", "Deducted", "qty"),
+                        col("grinding_charges", "Charges", "money"),
+                        col("last_activity", "Last activity")],
+            "rows": rows,
+            "summary": [{"label": "Depositors", "value": len(rows)},
+                        {"label": "Wheat on deposit", "value": round(sum(r["remaining_kg"] for r in rows), 3)},
+                        {"label": "Flour delivered", "value": round(sum(r["flour_delivered"] for r in rows), 3)},
+                        {"label": "Charges billed", "value": round(sum(r["grinding_charges"] for r in rows), 2), "type": "money"}]}
+
+async def rep_deposit_withdrawals(start, end, party=None, **_):
+    rows = [clean(w) for w in await db.wheat_withdrawals.find().sort("date", -1).to_list(20000)]
+    rows = [r for r in rows if in_range(r, start, end)]
+    if party:
+        rows = [r for r in rows if r.get("customer_name") == party]
+    out = [{"date": r.get("date"), "invoice": r.get("invoice_number", ""),
+            "customer": r.get("customer_name", ""), "wheat": r.get("wheat_drawn", 0),
+            "type": r.get("grinding_type", ""), "percent": r.get("deduction_percent", 0),
+            "deducted": r.get("deducted_qty", 0), "flour": r.get("flour_delivered", 0),
+            "material": (f'{r.get("material_qty", 0)} {r.get("material_item", "")}'.strip()
+                         if r.get("material_qty") else ""),
+            "charge": r.get("charge", 0), "status": r.get("payment_status", "")} for r in rows]
+    return {"columns": [col("date", "Date"), col("invoice", "Invoice"), col("customer", "Depositor"),
+                        col("wheat", "Wheat drawn", "qty"), col("type", "Grinding type"),
+                        col("percent", "Deduction %", "qty"), col("deducted", "Deducted", "qty"),
+                        col("flour", "Flour delivered", "qty"), col("material", "Material taken"),
+                        col("charge", "Charge", "money"), col("status", "Status")],
+            "rows": out,
+            "summary": [{"label": "Withdrawals", "value": len(out)},
+                        {"label": "Wheat drawn", "value": round(sum(r["wheat"] for r in out), 3)},
+                        {"label": "Flour delivered", "value": round(sum(r["flour"] for r in out), 3)},
+                        {"label": "Charges", "value": round(sum(r["charge"] for r in out), 2), "type": "money"}]}
+
 async def rep_stock(start, end, item=None, **_):
     rows = await product_movements(start, end)
     if item: rows = [r for r in rows if r["item"] == item]
@@ -3569,6 +3729,8 @@ REPORTS = {
     "cash-book":        {"title": "Cash Book",                 "group": "Daily",   "fn": "rep_cash_ledger"},
     "bank-book":        {"title": "Bank Book",                 "group": "Daily",   "fn": "rep_bank_book"},
     "day-book":         {"title": "Day Book",                  "group": "Daily",   "fn": "rep_day_book"},
+    "deposit-wheat":    {"title": "Deposit Wheat Balances",    "group": "Deposits", "fn": "rep_deposit_wheat", "party": "customer"},
+    "deposit-withdrawals": {"title": "Flour Withdrawal History", "group": "Deposits", "fn": "rep_deposit_withdrawals", "party": "customer"},
     "item-wise":        {"title": "Item-wise Movement",        "group": "Stock",   "fn": "rep_item_wise", "item": True},
     "stock":            {"title": "Stock Report",              "group": "Stock",   "fn": "rep_stock",     "item": True},
     "sales":            {"title": "Sales Report",              "group": "Trading", "fn": "rep_sales",     "party": "customer", "item": True},
@@ -3790,6 +3952,22 @@ SEARCH_SCOPES = {
         "item": "input_product_name",
         "columns": [col("date", "Date"), col("mill", "Mill"), col("input_product_name", "Input"),
                     col("input_quantity", "Qty", "qty"), col("input_cost", "Cost", "money")],
+    },
+    "deposits": {
+        "title": "Wheat deposits", "coll": "wheat_deposits", "route": "/deposits",
+        "text": ("customer_name", "grain", "note"), "party": "customer_name",
+        "columns": [col("date", "Date"), col("customer_name", "Depositor"),
+                    col("grain", "Grain"), col("quantity", "Quantity (kg)", "qty"),
+                    col("note", "Note")],
+    },
+    "withdrawals": {
+        "title": "Flour withdrawals", "coll": "wheat_withdrawals", "route": "/deposits", "invoice": True,
+        "text": ("customer_name", "invoice_number", "grinding_type", "material_item"),
+        "party": "customer_name",
+        "columns": [col("date", "Date"), col("invoice_number", "Invoice"),
+                    col("customer_name", "Depositor"), col("wheat_drawn", "Wheat", "qty"),
+                    col("grinding_type", "Type"), col("flour_delivered", "Flour", "qty"),
+                    col("charge", "Charge", "money"), col("payment_status", "Status")],
     },
     "customers": {
         "title": "Customers", "coll": "customers", "route": "/customers", "undated": True,
@@ -4034,6 +4212,374 @@ async def apply_cost_repair(only_zero: bool = True, user: dict = Depends(require
             "stock_value_change": round(sum(c["stock_value_change"] for c in changes), 2),
             "sales_restamped": sum(c.get("sales_restamped", 0) for c in changes),
             "profit_correction": round(sum(c.get("profit_correction", 0) for c in changes), 2)}
+
+# ==================== Deposit Wheat (Warehouse) ====================
+# Farmers leave wheat at harvest and draw flour against it through the year.
+# The wheat stays theirs — it is held, not bought — so it never enters shop
+# stock. Only what the mill keeps as its fee does.
+#
+# A withdrawal is settled one of two ways, and the difference is the whole
+# point of the module:
+#   Cash grinding      — a small deduction for the milling loss, and the
+#                        grinding charge is paid in money.
+#   Flour deduction    — a larger deduction, because the extra flour above the
+#                        milling loss is the fee. Nothing is paid in cash.
+
+QUINTAL_KG = 100.0
+
+class DepositBody(BaseModel):
+    date: str
+    customer_name: str
+    quantity_kg: float = 0
+    quantity_quintal: float = 0
+    grain: str = "Wheat"
+    note: str = ""
+
+class WithdrawalBody(BaseModel):
+    date: str
+    customer_name: str
+    # Wheat drawn from the deposit. The flour handed over is this less the
+    # deduction, which is what the customer actually cares about.
+    wheat_kg: float = 0
+    wheat_quintal: float = 0
+    grinding_type: str = "Cash"           # Cash | Flour Deduction | Material
+    deduction_percent: Optional[float] = None
+    charge_per_kg: Optional[float] = None
+    # Paying the cash charge with grain or another material instead.
+    material_item: str = ""
+    material_qty: Optional[float] = None
+    material_value: Optional[float] = None
+    payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
+    payment_status: str = "Paid"
+    note: str = ""
+
+def to_kg(kg, quintal) -> float:
+    return round((kg or 0) + (quintal or 0) * QUINTAL_KG, 3)
+
+async def deposit_percent(grinding_type: str, override=None) -> float:
+    """Deduction for a withdrawal, from Settings unless the entry overrides it."""
+    if override is not None:
+        return max(float(override), 0)
+    settings = await get_settings_doc()
+    if grinding_type == FLOUR_DEDUCTION:
+        return float(settings.get("deposit_flour_deduction_percent", 15) or 0)
+    return float(settings.get("cash_grinding_percent", 5) or 0)
+
+def normalise_grinding_type(value: str) -> str:
+    v = (value or "Cash").strip()
+    if v.lower() in ("flour", "flour deduction", "flourdeduction"):
+        return FLOUR_DEDUCTION
+    if v.lower() in ("material", "grain", "grain deduction", "grain/material"):
+        return GRAIN_DEDUCTION
+    return "Cash"
+
+async def deposit_balance(name: str):
+    """Live position for one depositor, from the records rather than a stored
+    running total — a stored one drifts the moment an entry is edited."""
+    deposits, withdrawals = await asyncio.gather(
+        db.wheat_deposits.find({"customer_name": name}).to_list(20000),
+        db.wheat_withdrawals.find({"customer_name": name}).to_list(20000),
+    )
+    deposited = round(sum(d.get("quantity", 0) or 0 for d in deposits), 3)
+    drawn = round(sum(w.get("wheat_drawn", 0) or 0 for w in withdrawals), 3)
+    flour_given = round(sum(w.get("flour_delivered", 0) or 0 for w in withdrawals), 3)
+    deducted = round(sum(w.get("deducted_qty", 0) or 0 for w in withdrawals), 3)
+    charges = round(sum(w.get("charge", 0) or 0 for w in withdrawals), 2)
+    settings = await get_settings_doc()
+    remaining = round(deposited - drawn, 3)
+    # What the balance would yield today. An estimate, because the percentage
+    # can change before the customer comes back for it.
+    rate = float(settings.get("cash_grinding_percent", 5) or 0)
+    return {
+        "customer_name": name,
+        "deposited_kg": deposited, "deposited_quintal": round(deposited / QUINTAL_KG, 3),
+        "withdrawn_kg": drawn, "remaining_kg": remaining,
+        "remaining_quintal": round(remaining / QUINTAL_KG, 3),
+        "flour_delivered": flour_given, "flour_deducted": deducted,
+        "grinding_charges": charges,
+        "flour_estimate_at_current_rate": round(remaining * (1 - rate / 100), 3),
+        "deposits": len(deposits), "withdrawals": len(withdrawals),
+    }
+
+@api_router.get("/deposits")
+async def list_deposits(customer: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = {"customer_name": customer} if customer else {}
+    rows = [clean(d) for d in await db.wheat_deposits.find(q).sort("date", -1).to_list(20000)]
+    return rows
+
+@api_router.get("/deposits/summary")
+async def deposits_summary(user: dict = Depends(get_current_user)):
+    return await deposits_summary_data()
+
+async def deposits_summary_data():
+    """Every depositor with a live balance, in a handful of queries."""
+    deposits, withdrawals, customers, settings = await asyncio.gather(
+        db.wheat_deposits.find().to_list(20000),
+        db.wheat_withdrawals.find().to_list(20000),
+        db.customers.find().to_list(5000),
+        get_settings_doc(),
+    )
+    phones = {c["name"]: {"phone": c.get("phone", ""), "address": c.get("address", "")} for c in customers}
+    rate = float(settings.get("cash_grinding_percent", 5) or 0)
+    agg = {}
+    for d in deposits:
+        a = agg.setdefault(d.get("customer_name", "?"), {"deposited": 0.0, "drawn": 0.0, "flour": 0.0,
+                                                         "deducted": 0.0, "charges": 0.0, "last": ""})
+        a["deposited"] += d.get("quantity", 0) or 0
+        a["last"] = max(a["last"], str(d.get("date") or ""))
+    for w in withdrawals:
+        a = agg.setdefault(w.get("customer_name", "?"), {"deposited": 0.0, "drawn": 0.0, "flour": 0.0,
+                                                         "deducted": 0.0, "charges": 0.0, "last": ""})
+        a["drawn"] += w.get("wheat_drawn", 0) or 0
+        a["flour"] += w.get("flour_delivered", 0) or 0
+        a["deducted"] += w.get("deducted_qty", 0) or 0
+        a["charges"] += w.get("charge", 0) or 0
+        a["last"] = max(a["last"], str(w.get("date") or ""))
+    rows = []
+    for name, a in sorted(agg.items()):
+        remaining = round(a["deposited"] - a["drawn"], 3)
+        rows.append({"customer_name": name, "phone": phones.get(name, {}).get("phone", ""),
+                     "address": phones.get(name, {}).get("address", ""),
+                     "deposited_kg": round(a["deposited"], 3), "withdrawn_kg": round(a["drawn"], 3),
+                     "remaining_kg": remaining, "remaining_quintal": round(remaining / QUINTAL_KG, 3),
+                     "flour_delivered": round(a["flour"], 3), "flour_deducted": round(a["deducted"], 3),
+                     "grinding_charges": round(a["charges"], 2),
+                     "flour_estimate_at_current_rate": round(remaining * (1 - rate / 100), 3),
+                     "last_activity": a["last"]})
+    return {"rows": rows,
+            "total_remaining_kg": round(sum(r["remaining_kg"] for r in rows), 3),
+            "depositors": len(rows)}
+
+@api_router.get("/deposits/{customer}/statement")
+async def deposit_statement(customer: str, user: dict = Depends(get_current_user)):
+    """One depositor's full history, oldest first, with a running balance."""
+    balance = await deposit_balance(customer)
+    deposits, withdrawals = await asyncio.gather(
+        db.wheat_deposits.find({"customer_name": customer}).to_list(20000),
+        db.wheat_withdrawals.find({"customer_name": customer}).to_list(20000),
+    )
+    entries = []
+    for d in deposits:
+        entries.append({"date": d.get("date"), "kind": "Deposit", "id": d.get("id"),
+                        "wheat_in": d.get("quantity", 0), "wheat_out": 0,
+                        "grinding_type": "", "percent": "", "deducted": "", "flour": "",
+                        "charge": "", "note": d.get("note", "")})
+    for w in withdrawals:
+        entries.append({"date": w.get("date"), "kind": "Withdrawal", "id": w.get("id"),
+                        "wheat_in": 0, "wheat_out": w.get("wheat_drawn", 0),
+                        "grinding_type": w.get("grinding_type", ""),
+                        "percent": w.get("deduction_percent", ""),
+                        "deducted": w.get("deducted_qty", 0),
+                        "flour": w.get("flour_delivered", 0),
+                        "charge": w.get("charge", 0),
+                        "invoice_number": w.get("invoice_number", ""),
+                        "note": w.get("note", "")})
+    entries.sort(key=lambda e: (str(e.get("date") or ""), e["kind"] != "Deposit"))
+    running = 0.0
+    for e in entries:
+        running = round(running + (e["wheat_in"] or 0) - (e["wheat_out"] or 0), 3)
+        e["balance"] = running
+    return {"balance": balance, "entries": entries}
+
+@api_router.post("/deposits")
+async def create_deposit(body: DepositBody, user: dict = Depends(get_current_user)):
+    qty = to_kg(body.quantity_kg, body.quantity_quintal)
+    if qty <= 0:
+        raise HTTPException(status_code=400, detail="Enter a quantity greater than zero")
+    # Keeps the depositor on the one customer master rather than a name that
+    # exists only here.
+    await ensure_party("customers", body.customer_name)
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "quantity": qty,
+           "quantity_quintal_display": round(qty / QUINTAL_KG, 3), "created_at": now_iso()}
+    await db.wheat_deposits.insert_one(doc)
+    await log_audit(user, "Wheat deposit", f'{body.customer_name}: {qty} kg')
+    return {**clean(doc), "balance": await deposit_balance(body.customer_name)}
+
+@api_router.put("/deposits/{did}")
+async def edit_deposit(did: str, body: DepositBody, user: dict = Depends(get_current_user)):
+    old = await db.wheat_deposits.find_one({"id": did})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    qty = to_kg(body.quantity_kg, body.quantity_quintal)
+    if qty <= 0:
+        raise HTTPException(status_code=400, detail="Enter a quantity greater than zero")
+    await db.wheat_deposits.update_one({"id": did}, {"$set": {**body.model_dump(), "quantity": qty,
+        "quantity_quintal_display": round(qty / QUINTAL_KG, 3)}})
+    await log_audit(user, "Edited wheat deposit", f'{body.customer_name}: {qty} kg')
+    return {**clean(await db.wheat_deposits.find_one({"id": did})),
+            "balance": await deposit_balance(body.customer_name)}
+
+@api_router.delete("/deposits/{did}")
+async def delete_deposit(did: str, user: dict = Depends(require_admin)):
+    d = await db.wheat_deposits.find_one({"id": did})
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    balance = await deposit_balance(d["customer_name"])
+    # Removing the deposit would leave withdrawals drawing on wheat that was
+    # never deposited, and the balance would go negative.
+    if balance["remaining_kg"] - (d.get("quantity", 0) or 0) < -0.001:
+        raise HTTPException(status_code=400, detail=(
+            f'{d["customer_name"]} has already withdrawn against this deposit. '
+            f'Only {balance["remaining_kg"]} kg is still on hand.'))
+    await db.wheat_deposits.delete_one({"id": did})
+    await log_audit(user, "Deleted wheat deposit", f'{d["customer_name"]}: {d.get("quantity")} kg')
+    return {"message": "deleted"}
+
+async def build_withdrawal(body: WithdrawalBody, existing: dict = None) -> dict:
+    """Price a withdrawal and work out what the customer walks out with."""
+    settings = await get_settings_doc()
+    gtype = normalise_grinding_type(body.grinding_type)
+    drawn = to_kg(body.wheat_kg, body.wheat_quintal)
+    pct = await deposit_percent(gtype, body.deduction_percent)
+    deducted = round(drawn * pct / 100, 3)
+    flour = round(drawn - deducted, 3)
+
+    # Cash grinding bills a charge; paying in flour or material is the payment,
+    # so there is nothing left to bill.
+    rate = body.charge_per_kg if body.charge_per_kg is not None else (settings.get("grinding_rate", 2) or 0)
+    charge = round(drawn * rate, 2) if gtype == "Cash" else 0.0
+
+    material_qty = round(body.material_qty or 0, 3)
+    material_value = round(body.material_value or 0, 2)
+    if gtype == GRAIN_DEDUCTION:
+        # Settled with grain or another material rather than money, so the
+        # charge is still recorded but nothing is owed in cash.
+        charge = round(drawn * rate, 2)
+
+    doc = {**(existing or {}), **body.model_dump(),
+           "grinding_type": gtype, "wheat_drawn": drawn,
+           "deduction_percent": pct, "deducted_qty": deducted,
+           "flour_delivered": flour, "charge_per_kg": round(rate, 3), "charge": charge,
+           "material_qty": material_qty, "material_value": material_value}
+    return doc
+
+async def apply_withdrawal_effects(doc: dict, sign: int):
+    """Only what the mill keeps touches shop stock.
+
+    The customer's own wheat is held, not owned, so drawing it moves nothing in
+    inventory. Flour kept as the fee, and any material taken instead of cash,
+    do belong to the shop.
+    """
+    gtype = normalise_grinding_type(doc.get("grinding_type"))
+    if gtype == FLOUR_DEDUCTION and doc.get("deducted_qty"):
+        await adjust_stock_by_name("Atta", sign * doc["deducted_qty"])
+        if sign > 0:
+            await post_material_ledger(
+                date=doc.get("date"), party_name=doc.get("customer_name", ""),
+                item="Atta", qty=doc["deducted_qty"], unit="kg",
+                value=doc.get("deducted_value", 0), direction="in",
+                ref_id=doc["id"], source="deposit_withdrawal",
+                note=f'Grinding fee on deposit withdrawal {doc.get("invoice_number", "")}'.strip())
+        else:
+            await unpost_material_ledger(doc["id"])
+    elif gtype == GRAIN_DEDUCTION and doc.get("material_qty"):
+        item = doc.get("material_item") or "Wheat Crop"
+        await adjust_stock_by_name(item, sign * doc["material_qty"])
+        if sign > 0:
+            await post_material_ledger(
+                date=doc.get("date"), party_name=doc.get("customer_name", ""),
+                item=item, qty=doc["material_qty"], unit="kg",
+                value=doc.get("material_value", 0), direction="in",
+                ref_id=doc["id"], source="deposit_withdrawal",
+                note=f'Grinding paid in {item}')
+        else:
+            await unpost_material_ledger(doc["id"])
+
+async def settle_withdrawal(doc: dict, body: WithdrawalBody):
+    """Bill the grinding charge to whichever ledger the payment names."""
+    charge = doc.get("charge", 0) or 0
+    if charge <= 0:
+        return
+    gtype = normalise_grinding_type(doc.get("grinding_type"))
+    if gtype == GRAIN_DEDUCTION:
+        await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
+                         f'Deposit grinding paid in {doc.get("material_item") or "grain"}', mode="Grain")
+    elif doc.get("payment_status") == "Paid":
+        await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
+                         f'Deposit grinding {doc.get("invoice_number", "")}'.strip(),
+                         mode=body.payment_mode, bank_id=body.bank_id)
+    # Credit (Due) leaves the charge on the customer's account, which the
+    # ledger already shows as a debit with no matching credit.
+
+@api_router.get("/withdrawals")
+async def list_withdrawals(customer: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = {"customer_name": customer} if customer else {}
+    return [clean(w) for w in await db.wheat_withdrawals.find(q).sort("date", -1).to_list(20000)]
+
+@api_router.post("/withdrawals")
+async def create_withdrawal(body: WithdrawalBody, user: dict = Depends(get_current_user)):
+    doc = await build_withdrawal(body)
+    balance = await deposit_balance(body.customer_name)
+    if doc["wheat_drawn"] <= 0:
+        raise HTTPException(status_code=400, detail="Enter a quantity greater than zero")
+    if doc["wheat_drawn"] > balance["remaining_kg"] + 0.001:
+        raise HTTPException(status_code=400, detail=(
+            f'{body.customer_name} has only {balance["remaining_kg"]} kg of wheat on deposit'))
+    doc["id"] = str(uuid.uuid4())
+    doc["invoice_number"] = await next_invoice_number()
+    doc["created_at"] = now_iso()
+    # Value the flour kept, so the material ledger carries what the fee was worth.
+    doc["deducted_value"] = round(doc["deducted_qty"] * await flour_unit_rate("Atta"), 2)
+    await db.wheat_withdrawals.insert_one(doc)
+    if doc["charge"] > 0:
+        await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"],
+            "type": "Deposit Withdrawal", "ref_id": doc["id"], "customer_name": doc["customer_name"],
+            "date": doc["date"], "total": doc["charge"],
+            "payment_status": doc.get("payment_status", "Paid"), "created_at": now_iso()})
+    await apply_withdrawal_effects(doc, 1)
+    await settle_withdrawal(doc, body)
+    if doc["charge"] > 0:
+        await sync_payment_state("wheat_withdrawals", doc["id"])
+    await log_audit(user, "Deposit withdrawal",
+                    f'{body.customer_name}: {doc["wheat_drawn"]} kg wheat, {doc["flour_delivered"]} kg flour '
+                    f'({doc["grinding_type"]}, {doc["deduction_percent"]}%)')
+    return {**clean(await db.wheat_withdrawals.find_one({"id": doc["id"]})),
+            "balance": await deposit_balance(body.customer_name)}
+
+@api_router.put("/withdrawals/{wid}")
+async def edit_withdrawal(wid: str, body: WithdrawalBody, user: dict = Depends(get_current_user)):
+    old = await db.wheat_withdrawals.find_one({"id": wid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    await apply_withdrawal_effects(old, -1)
+    doc = await build_withdrawal(body, existing=old)
+    doc["id"] = wid
+    # The old draw is already reversed above, so the balance check sees the
+    # wheat this withdrawal had taken out.
+    balance = await deposit_balance(body.customer_name)
+    available = balance["remaining_kg"] + (old.get("wheat_drawn", 0) or 0)
+    if doc["wheat_drawn"] > available + 0.001:
+        await apply_withdrawal_effects(old, 1)
+        raise HTTPException(status_code=400, detail=f'Only {available} kg is on deposit')
+    doc["deducted_value"] = round(doc["deducted_qty"] * await flour_unit_rate("Atta"), 2)
+    await db.wheat_withdrawals.replace_one({"id": wid}, doc)
+    await apply_withdrawal_effects(doc, 1)
+    for row in await db.payments.find({"ref_id": wid}).to_list(500):
+        await unpost_bank_txn(row["id"])
+    await db.payments.delete_many({"ref_id": wid})
+    await db.invoices.update_one({"ref_id": wid}, {"$set": {"total": doc["charge"], "date": doc["date"]}})
+    await settle_withdrawal(doc, body)
+    if doc["charge"] > 0:
+        await sync_payment_state("wheat_withdrawals", wid)
+    await log_audit(user, "Edited deposit withdrawal", f'{body.customer_name}: {doc["wheat_drawn"]} kg')
+    return {**clean(await db.wheat_withdrawals.find_one({"id": wid})),
+            "balance": await deposit_balance(body.customer_name)}
+
+@api_router.delete("/withdrawals/{wid}")
+async def delete_withdrawal(wid: str, user: dict = Depends(require_admin)):
+    w = await db.wheat_withdrawals.find_one({"id": wid})
+    if not w:
+        raise HTTPException(status_code=404, detail="Not found")
+    await apply_withdrawal_effects(w, -1)
+    await unpost_material_ledger(wid)
+    for row in await db.payments.find({"ref_id": wid}).to_list(500):
+        await unpost_bank_txn(row["id"])
+    await db.payments.delete_many({"ref_id": wid})
+    await db.invoices.delete_one({"ref_id": wid})
+    await db.wheat_withdrawals.delete_one({"id": wid})
+    await log_audit(user, "Deleted deposit withdrawal", f'{w.get("customer_name")}: {w.get("wheat_drawn")} kg')
+    return {"message": "deleted"}
 
 @api_router.get("/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):
