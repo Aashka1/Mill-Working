@@ -25,7 +25,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from pymongo import ReturnDocument, UpdateOne
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 import uuid
 
 from reportlab.lib.pagesizes import A4
@@ -1001,6 +1001,41 @@ async def delete_expense(eid: str, user: dict = Depends(require_admin)):
     await db.expenses.delete_one({"id": eid})
     return {"message": "deleted"}
 
+# ---------------- What the mill bills, and to whom ----------------
+# One definition of every billable module, because scattering the list made the
+# same bug twice: a new module credited the customer's settlement without ever
+# debiting the charge, because it had been added to some of the lists and not
+# others, and every one of its customers showed a permanent negative balance.
+#
+# Adding a billable module means adding a line here. Party balances, ledgers,
+# statements, renames, delete guards and pending alerts all read from it.
+
+class Billing(NamedTuple):
+    coll: str          # collection holding the records
+    amount: str        # field holding what was charged
+    party: str         # field holding the party's name
+    label: str         # how it reads in a ledger line or an alert
+    invoice: bool      # whether its rows carry an invoice number
+
+CUSTOMER_BILLING = (
+    Billing("sales", "total", "customer_name", "Sale", True),
+    Billing("grinding", "total_charge", "customer_name", "Grinding", True),
+    Billing("oil", "total", "customer_name", "Oil extraction", True),
+    Billing("exchanges", "grinding_charge", "customer_name", "Exchange", True),
+    Billing("wheat_withdrawals", "charge", "customer_name", "Deposit withdrawal", True),
+)
+
+SUPPLIER_BILLING = (
+    Billing("purchases", "total", "supplier_name", "Purchase", False),
+)
+
+def billing_for(party_type: str):
+    return SUPPLIER_BILLING if party_type == "supplier" else CUSTOMER_BILLING
+
+# Where each collection keeps its total, derived rather than restated so the
+# payment engine cannot fall out of step with the registry.
+TOTAL_FIELD = {b.coll: b.amount for b in CUSTOMER_BILLING + SUPPLIER_BILLING}
+
 # ---------------- Customers ----------------
 
 class CustomerBody(BaseModel):
@@ -1021,20 +1056,18 @@ async def get_customers(user: dict = Depends(get_current_user)):
     # One query per collection rather than per customer, and all of them issued
     # together. Sequential awaits cost one network round trip each, which is
     # invisible beside a local database and seconds against a distant one.
-    sources = [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
-               ("exchanges", "grinding_charge"), ("wheat_withdrawals", "charge")]
     customers, *rest = await asyncio.gather(
         db.customers.find().sort("name", 1).to_list(2000),
-        *[db[coll].find({}, {"customer_name": 1, field: 1}).to_list(50000) for coll, field in sources],
+        *[db[b.coll].find({}, {b.party: 1, b.amount: 1}).to_list(50000) for b in CUSTOMER_BILLING],
         db.payments.find({"party_type": "customer"}, {"party_name": 1, "amount": 1}).to_list(50000),
     )
     customers = [clean(c) for c in customers]
     debit = {}
-    for (coll, field), docs in zip(sources, rest):
+    for b, docs in zip(CUSTOMER_BILLING, rest):
         for d in docs:
-            name = d.get("customer_name")
+            name = d.get(b.party)
             if name:
-                debit[name] = debit.get(name, 0) + (d.get(field, 0) or 0)
+                debit[name] = debit.get(name, 0) + (d.get(b.amount, 0) or 0)
     credit = {}
     for pay in rest[-1]:
         name = pay.get("party_name")
@@ -1086,8 +1119,8 @@ async def update_customer(cid: str, body: CustomerBody, user: dict = Depends(get
     # Every transaction stores the party by name, so a rename has to carry them
     # with it or the ledger silently empties.
     if old.get("name") and old["name"] != name:
-        for c, field in (('sales', 'customer_name'), ('grinding', 'customer_name'), ('oil', 'customer_name'), ('exchanges', 'customer_name')):
-            await db[c].update_many({field: old["name"]}, {"$set": {field: name}})
+        for b in CUSTOMER_BILLING:
+            await db[b.coll].update_many({b.party: old["name"]}, {"$set": {b.party: name}})
         await db.payments.update_many({"party_type": "customer", "party_name": old["name"]},
                                       {"$set": {"party_name": name}})
         await log_audit(user, "Renamed customer", f'{old["name"]} to {name}')
@@ -1099,11 +1132,8 @@ async def customer_history(cid: str, user: dict = Depends(get_current_user)):
     if not c:
         raise HTTPException(status_code=404, detail="Not found")
     name = c["name"]
-    return {
-        "sales": [clean(x) for x in await db.sales.find({"customer_name": name}).to_list(1000)],
-        "grinding": [clean(x) for x in await db.grinding.find({"customer_name": name}).to_list(1000)],
-        "oil": [clean(x) for x in await db.oil.find({"customer_name": name}).to_list(1000)],
-    }
+    found = await asyncio.gather(*[db[b.coll].find({b.party: name}).to_list(1000) for b in CUSTOMER_BILLING])
+    return {b.coll: [clean(x) for x in rows] for b, rows in zip(CUSTOMER_BILLING, found)}
 
 @api_router.delete("/customers/{cid}")
 async def delete_customer(cid: str, user: dict = Depends(require_admin)):
@@ -1112,8 +1142,8 @@ async def delete_customer(cid: str, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Not found")
     # Transactions reference the party by name, so removing one with history
     # would leave those records pointing at nobody.
-    for c, field in (("sales", "customer_name"), ("grinding", "customer_name"), ("oil", "customer_name"), ("exchanges", "customer_name")):
-        if await db[c].count_documents({field: party["name"]}):
+    for b in CUSTOMER_BILLING:
+        if await db[b.coll].count_documents({b.party: party["name"]}):
             raise HTTPException(status_code=400,
                 detail=f'{party["name"]} has transactions and cannot be deleted. Edit the record instead.')
     await db.customers.delete_one({"id": cid})
@@ -1199,8 +1229,8 @@ async def update_supplier(sid: str, body: SupplierBody, user: dict = Depends(get
     # Every transaction stores the party by name, so a rename has to carry them
     # with it or the ledger silently empties.
     if old.get("name") and old["name"] != name:
-        for c, field in (('purchases', 'supplier_name'),):
-            await db[c].update_many({field: old["name"]}, {"$set": {field: name}})
+        for b in SUPPLIER_BILLING:
+            await db[b.coll].update_many({b.party: old["name"]}, {"$set": {b.party: name}})
         await db.payments.update_many({"party_type": "supplier", "party_name": old["name"]},
                                       {"$set": {"party_name": name}})
         await log_audit(user, "Renamed supplier", f'{old["name"]} to {name}')
@@ -1213,8 +1243,8 @@ async def delete_supplier(sid: str, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Not found")
     # Transactions reference the party by name, so removing one with history
     # would leave those records pointing at nobody.
-    for c, field in (("purchases", "supplier_name"),):
-        if await db[c].count_documents({field: party["name"]}):
+    for b in SUPPLIER_BILLING:
+        if await db[b.coll].count_documents({b.party: party["name"]}):
             raise HTTPException(status_code=400,
                 detail=f'{party["name"]} has transactions and cannot be deleted. Edit the record instead.')
     await db.suppliers.delete_one({"id": sid})
@@ -1441,12 +1471,17 @@ async def invoice_pdf(ref_id: str, request: Request):
 async def dashboard(user: dict = Depends(get_current_user)):
     # The landing page, so it is worth the six reads costing one round trip
     # rather than six. None of them depends on another.
-    products, sales, purchases, grinding, oil, expenses, withdrawals = await asyncio.gather(
-        db.products.find().to_list(1000), db.sales.find().to_list(5000),
-        db.purchases.find().to_list(5000), db.grinding.find().to_list(5000),
-        db.oil.find().to_list(5000), db.expenses.find().to_list(5000),
-        db.wheat_withdrawals.find().to_list(5000),
+    # Billable collections come from the registry, so a new module appears in
+    # the outstanding figure without anyone remembering to add it here.
+    products, expenses, *billed = await asyncio.gather(
+        db.products.find().to_list(1000), db.expenses.find().to_list(5000),
+        *[db[b.coll].find().to_list(20000) for b in CUSTOMER_BILLING + SUPPLIER_BILLING],
     )
+    by_coll = {b.coll: rows for b, rows in zip(CUSTOMER_BILLING + SUPPLIER_BILLING, billed)}
+    sales = by_coll["sales"]
+    purchases = by_coll["purchases"]
+    grinding = by_coll["grinding"]
+    oil = by_coll["oil"]
 
     today = datetime.now().strftime("%Y-%m-%d")
     month = datetime.now().strftime("%Y-%m")
@@ -1489,10 +1524,9 @@ async def dashboard(user: dict = Depends(get_current_user)):
         return 0 if d.get("payment_status") == "Paid" else max(d.get(field, 0), 0)
 
     pending_customer = 0.0
-    for coll, field in [(sales, "total"), (grinding, "total_charge"), (oil, "total"),
-                        (withdrawals, "charge")]:
-        pending_customer += sum(owed(d, field) for d in coll)
-    supplier_dues = sum(owed(p, "total") for p in purchases)
+    for b in CUSTOMER_BILLING:
+        pending_customer += sum(owed(d, b.amount) for d in by_coll[b.coll])
+    supplier_dues = sum(owed(p, b.amount) for b in SUPPLIER_BILLING for p in by_coll[b.coll])
     paid_to_customers = round(sum(abs(d.get("total", 0)) for d in oil if (d.get("total", 0) or 0) < 0), 2)
 
     low_stock = [{"name": p["name"], "stock": p.get("current_stock", 0), "threshold": p.get("low_stock_threshold", 0), "unit": p.get("unit", "kg")}
@@ -1548,15 +1582,13 @@ async def notifications(user: dict = Depends(get_current_user)):
         if p.get("current_stock", 0) <= p.get("low_stock_threshold", 0):
             notes.append({"type": "low_stock", "level": "warning",
                           "message": f'Low stock: {p["name"]} ({p.get("current_stock",0)} {p.get("unit","kg")} left)'})
-    for coll, field, label in [("sales", "total", "sale"), ("grinding", "total_charge", "grinding"),
-                               ("oil", "total", "oil extraction"), ("wheat_withdrawals", "charge", "deposit withdrawal")]:
-        docs = await db[coll].find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000)
-        docs = [d for d in docs if (d.get(field, 0) or 0) > 0]
-        for d in docs:
-            due = d.get("balance_due", d.get(field, 0))
+    for b in CUSTOMER_BILLING:
+        docs = await db[b.coll].find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000)
+        for d in [x for x in docs if (x.get(b.amount, 0) or 0) > 0]:
+            due = d.get("balance_due", d.get(b.amount, 0))
             part = " (part paid)" if d.get("payment_status") == "Partial" else ""
             notes.append({"type": "pending_payment", "level": "info",
-                          "message": f'Pending payment from {d.get("customer_name","?")} - Rs {due:.0f}{part} ({label})'})
+                          "message": f'Pending payment from {d.get(b.party,"?")} - Rs {due:.0f}{part} ({b.label.lower()})'})
     for p in await db.purchases.find({"payment_status": {"$in": ["Pending", "Partial"]}}).to_list(1000):
         due = p.get("balance_due", p.get("total", 0))
         notes.append({"type": "supplier_due", "level": "info",
@@ -2755,9 +2787,6 @@ async def post_payment_to_bank(payment_id: str):
 # a cached sum of it, recomputed rather than incremented so an edit or a
 # repeated call can never double-count.
 
-TOTAL_FIELD = {"sales": "total", "grinding": "total_charge", "oil": "total",
-               "purchases": "total", "wheat_withdrawals": "charge"}
-
 def payment_state(total: float, paid: float) -> str:
     # A negative total means the by-product the customer sold us is worth more
     # than the service charge, so the shop hands cash over instead of taking it.
@@ -2837,9 +2866,8 @@ async def delete_payment(pid: str, user: dict = Depends(require_admin)):
 async def build_ledger(party_type, name):
     entries = []
     if party_type == "customer":
-        for coll, field, label in [("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
-                                   ("oil", "total", "Oil Extraction"), ("wheat_withdrawals", "charge", "Deposit withdrawal")]:
-            for d in await db[coll].find({"customer_name": name}).to_list(3000):
+        for b in CUSTOMER_BILLING:
+            for d in await db[b.coll].find({b.party: name}).to_list(3000):
                 if d.get(field, 0):
                     entries.append({"date": d.get("date"), "type": label, "ref": d.get("invoice_number", ""), "debit": round(d.get(field, 0), 2), "credit": 0})
     else:
@@ -3265,13 +3293,11 @@ def col(key, label, kind="text", align=None):
 async def party_movements(name: str):
     """Every debit and credit against one party, oldest first."""
     rows = []
-    for coll, field, label in (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
-                               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange"),
-                               ("wheat_withdrawals", "charge", "Deposit withdrawal")):
-        for d in await db[coll].find({"customer_name": name}).to_list(5000):
-            if d.get(field):
-                rows.append({"date": d.get("date"), "particulars": f'{label} {d.get("invoice_number", "")}'.strip(),
-                             "debit": round(d.get(field, 0), 2), "credit": 0})
+    for b in CUSTOMER_BILLING:
+        for d in await db[b.coll].find({b.party: name}).to_list(5000):
+            if d.get(b.amount):
+                rows.append({"date": d.get("date"), "particulars": f'{b.label} {d.get("invoice_number", "")}'.strip(),
+                             "debit": round(d.get(b.amount, 0), 2), "credit": 0})
     for d in await db.purchases.find({"supplier_name": name}).to_list(5000):
         rows.append({"date": d.get("date"), "particulars": f'Purchase {d.get("product_name", "")}',
                      "debit": round(d.get("total", 0), 2), "credit": 0})
@@ -3298,24 +3324,18 @@ async def all_party_movements():
     def add(name, row):
         if name:
             out.setdefault(name, []).append(row)
-    sources = (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
-               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange"),
-               ("wheat_withdrawals", "charge", "Deposit withdrawal"))
-    *docs, purchases, payments = await asyncio.gather(
-        *[db[coll].find().to_list(50000) for coll, _, _ in sources],
-        db.purchases.find().to_list(50000),
+    billing = CUSTOMER_BILLING + SUPPLIER_BILLING
+    *docs, payments = await asyncio.gather(
+        *[db[b.coll].find().to_list(50000) for b in billing],
         db.payments.find().to_list(50000),
     )
-    for (coll, field, label), rows in zip(sources, docs):
+    for b, rows in zip(billing, docs):
         for d in rows:
-            if d.get(field):
-                add(d.get("customer_name"),
-                    {"date": d.get("date"), "particulars": f'{label} {d.get("invoice_number", "")}'.strip(),
-                     "debit": round(d.get(field, 0), 2), "credit": 0})
-    for d in purchases:
-        add(d.get("supplier_name"),
-            {"date": d.get("date"), "particulars": f'Purchase {d.get("product_name", "")}',
-             "debit": round(d.get("total", 0), 2), "credit": 0})
+            if d.get(b.amount):
+                detail = d.get("invoice_number") or d.get("product_name") or ""
+                add(d.get(b.party),
+                    {"date": d.get("date"), "particulars": f'{b.label} {detail}'.strip(),
+                     "debit": round(d.get(b.amount, 0), 2), "credit": 0})
     for pay in payments:
         amt = pay.get("amount", 0) or 0
         note = pay.get("note") or "Payment"
