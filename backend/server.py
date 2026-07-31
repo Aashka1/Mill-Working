@@ -685,8 +685,18 @@ class GrindingBody(BaseModel):
     washed: bool = True
     loss_percent: float = 2.5
     charge_per_kg: float = 0
+    # Cash / UPI / Bank / NEFT / RTGS / IMPS / Cheque, or paid in kind with
+    # Flour Deduction or Grain Deduction.
     payment_method: str = "Cash"
     grain_fee_kg: float = 0
+    # Flour deduction: how much to keep back, and on what basis.
+    deduction_basis: str = "Percent"
+    deduction_percent: Optional[float] = None
+    deduction_weight: Optional[float] = None
+    # Grain deduction: what came in instead of money.
+    grain_item: str = ""
+    grain_qty: Optional[float] = None
+    grain_value: Optional[float] = None
     payment_status: str = "Pending"
     amount_paid: Optional[float] = None
     payment_mode: str = "Cash"
@@ -705,8 +715,20 @@ async def create_grinding(body: GrindingBody, user: dict = Depends(get_current_u
         "ref_id": doc["id"], "customer_name": doc["customer_name"], "date": doc["date"],
         "total": doc["total_charge"], "payment_status": doc["payment_status"], "created_at": now_iso()})
     charge = doc["total_charge"]
-    received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
-    await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}", mode=body.payment_mode, bank_id=body.bank_id)
+    method = normalise_method(doc.get("payment_method"))
+    if settled_in_kind(method):
+        # The flour or grain kept back is the payment, so the bill is settled in
+        # full. Crediting only what the goods valued at would leave small
+        # phantom dues whenever the rate and the charge did not divide evenly.
+        kind_mode = "Flour" if method == FLOUR_DEDUCTION else "Grain"
+        detail = (f'{doc.get("deducted_flour", 0)} kg {grinding_output_name(doc)} kept'
+                  if method == FLOUR_DEDUCTION
+                  else f'{doc.get("grain_qty", 0)} kg {doc.get("grain_item") or "grain"} received')
+        await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
+                         f'Grinding {doc["invoice_number"]} · {detail}', mode=kind_mode)
+    else:
+        received = charge if body.amount_paid is None and doc["payment_status"] == "Paid" else (body.amount_paid or 0)
+        await add_credit("customer", doc["customer_name"], min(received, charge), doc["date"], doc["id"], f"Grinding {doc['invoice_number']}", mode=body.payment_mode or method, bank_id=body.bank_id)
     await sync_payment_state("grinding", doc["id"])
     doc = await db.grinding.find_one({"id": doc["id"]})
     return clean(doc)
@@ -716,6 +738,7 @@ async def delete_grinding(gid: str, user: dict = Depends(require_admin)):
     g = await db.grinding.find_one({"id": gid})
     if g:
         await apply_grinding_effects(g, -1)
+        await unpost_material_ledger(gid)
         await db.grinding.delete_one({"id": gid})
         await db.invoices.delete_one({"ref_id": gid})
         for row in await db.payments.find({"ref_id": gid}).to_list(500):
@@ -820,7 +843,8 @@ async def get_customers(user: dict = Depends(get_current_user)):
     customers = [clean(c) for c in await db.customers.find().sort("name", 1).to_list(2000)]
     for c in customers:
         debit = 0.0
-        for coll, field in [("sales", "total"), ("grinding", "total_charge"), ("oil", "total")]:
+        for coll, field in [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
+                            ("exchanges", "grinding_charge")]:
             docs = await db[coll].find({"customer_name": c["name"]}).to_list(2000)
             debit += sum(d.get(field, 0) for d in docs)
         credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "customer", "party_name": c["name"]}).to_list(2000))
@@ -905,6 +929,33 @@ async def product_unit(product_id: str, default: str = "kg") -> str:
     p = await db.products.find_one({"id": product_id})
     return (p or {}).get("unit") or default
 
+def grinding_invoice_items(g: dict) -> list:
+    """Invoice lines for a grinding job.
+
+    The charge is always its own line, whatever settled it. When flour was kept
+    back, the deduction and what the customer actually walks out with are shown
+    underneath — otherwise the bill says one weight and the customer carries a
+    different one home.
+    """
+    out_name = grinding_output_name(g)
+    items = [{"desc": f'{g.get("grain_type", "Wheat")} Grinding ({g["wheat_weight"]} kg)',
+              "qty": f'{g["wheat_weight"]} kg', "rate": g.get("charge_per_kg", 0),
+              "amount": g.get("total_charge", 0)}]
+    method = normalise_method(g.get("payment_method"))
+    if method == FLOUR_DEDUCTION and g.get("deducted_flour"):
+        items.append({"desc": f'Less: {out_name} kept as grinding fee',
+                      "qty": f'{g["deducted_flour"]} kg',
+                      "rate": g.get("flour_unit_rate", 0),
+                      "amount": -abs(g.get("flour_value", 0))})
+        items.append({"desc": f'{out_name} delivered to customer',
+                      "qty": f'{g.get("final_flour_delivered", g.get("customer_receives", 0))} kg',
+                      "rate": "", "amount": ""})
+    elif method == GRAIN_DEDUCTION and g.get("grain_qty"):
+        items.append({"desc": f'Paid in {g.get("grain_item") or "grain"}',
+                      "qty": f'{g["grain_qty"]} kg', "rate": "",
+                      "amount": -abs(g.get("grain_value", 0))})
+    return items
+
 async def build_invoice_data(ref_id: str):
     sale = await db.sales.find_one({"id": ref_id})
     if sale:
@@ -913,12 +964,29 @@ async def build_invoice_data(ref_id: str):
                 "customer_name": sale["customer_name"], "payment_status": sale["payment_status"],
                 "items": [{"desc": sale["product_name"], "qty": f'{sale["quantity"]} {unit}',
                            "rate": sale["price"], "amount": sale["total"]}], "total": sale["total"]}
+    x = await db.exchanges.find_one({"id": ref_id})
+    if x:
+        items = [{"desc": "Wheat received", "qty": f'{x.get("wheat_qty", 0)} kg', "rate": "", "amount": ""},
+                 {"desc": "Flour produced", "qty": f'{x.get("flour_produced", x.get("atta_given", 0))} kg', "rate": "", "amount": ""},
+                 {"desc": "Grinding charge", "qty": f'{x.get("wheat_qty", 0)} kg',
+                  "rate": x.get("grinding_rate", 0), "amount": x.get("grinding_charge", 0)}]
+        if normalise_method(x.get("payment_method")) == FLOUR_DEDUCTION and x.get("deducted_flour"):
+            items.append({"desc": "Less: flour deducted as grinding charges",
+                          "qty": f'{x["deducted_flour"]} kg', "rate": x.get("flour_unit_rate", 0),
+                          "amount": -abs(x.get("flour_value", 0))})
+        items.append({"desc": "Final flour delivered",
+                      "qty": f'{x.get("final_flour_delivered", x.get("atta_given", 0))} kg', "rate": "", "amount": ""})
+        return {"type": "Exchange", "invoice_number": x.get("invoice_number") or "-", "date": x.get("date"),
+                "customer_name": x.get("customer_name"), "payment_status": x.get("payment_status", "Paid"),
+                "payment_method": normalise_method(x.get("payment_method")),
+                "items": items, "total": x.get("grinding_charge", 0)}
+
     g = await db.grinding.find_one({"id": ref_id})
     if g:
         return {"type": "Grinding Service", "invoice_number": g["invoice_number"], "date": g["date"],
                 "customer_name": g["customer_name"], "payment_status": g["payment_status"],
-                "items": [{"desc": f'{g.get("grain_type", "Wheat")} Grinding ({g["wheat_weight"]} kg)', "qty": f'{g["wheat_weight"]} kg',
-                           "rate": g["charge_per_kg"], "amount": g["total_charge"]}], "total": g["total_charge"]}
+                "items": grinding_invoice_items(g), "total": g["total_charge"],
+                "payment_method": normalise_method(g.get("payment_method"))}
     o = await db.oil.find_one({"id": ref_id})
     if o:
         items = [{"desc": f'{o["seed_type"]} Oil Extraction ({o["oil_extracted"]} L extracted)',
@@ -955,7 +1023,9 @@ async def invoice_pdf(ref_id: str, request: Request):
                 Spacer(1, 16)]
     rows = [["Description", "Quantity", "Rate (Rs)", "Amount (Rs)"]]
     for it in data["items"]:
-        rows.append([it["desc"], it["qty"], f'{it["rate"]:.2f}', f'{it["amount"]:.2f}'])
+        def cell(v):
+            return f'{v:.2f}' if isinstance(v, (int, float)) else (v or "")
+        rows.append([it["desc"], it["qty"], cell(it["rate"]), cell(it["amount"])])
     rows.append(["", "", "Total", f'Rs {data["total"]:.2f}'])
     tbl = Table(rows, colWidths=[80*mm, 30*mm, 35*mm, 35*mm])
     tbl.setStyle(TableStyle([
@@ -1286,8 +1356,14 @@ DEFAULT_GRAIN_TYPES = [
 async def get_settings_doc():
     s = await db.settings.find_one({"id": "config"})
     if not s:
-        s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0, "starting_cash": 0}
+        s = {"id": "config", "washed_loss": 2.5, "unwashed_loss": 5.0, "starting_cash": 0,
+             "grinding_rate": 2.0, "flour_deduction_percent": 5.0, "flour_rate": 0}
         await db.settings.insert_one(s)
+    defaults = {"grinding_rate": 2.0, "flour_deduction_percent": 5.0, "flour_rate": 0}
+    missing = {k: v for k, v in defaults.items() if s.get(k) is None}
+    if missing:
+        await db.settings.update_one({"id": "config"}, {"$set": missing})
+        s.update(missing)
     if not s.get("grain_types"):
         await db.settings.update_one({"id": "config"}, {"$set": {"grain_types": DEFAULT_GRAIN_TYPES}})
         s["grain_types"] = DEFAULT_GRAIN_TYPES
@@ -1330,6 +1406,13 @@ async def adjust_stock_by_name(name, delta):
                                        {"$inc": {"current_stock": round(delta, 3)}})
     if res.matched_count == 0:
         logger.warning("adjust_stock_by_name: no product named %r; %+g not applied", name, delta)
+        return
+    # Re-round after the increment: repeated $inc on floats accumulates binary
+    # error, so a figure that should read 506.8 drifts to 506.79999999999995.
+    prod = await db.products.find_one({"name_key": product_key(name)})
+    if prod is not None:
+        await db.products.update_one({"name_key": product_key(name)},
+                                     {"$set": {"current_stock": round(prod.get("current_stock", 0) or 0, 3)}})
 
 async def add_stock_by_name_with_cost(name, qty, total_cost):
     """Move stock by name while folding the money paid into the cost basis.
@@ -1361,20 +1444,156 @@ async def add_stock_with_cost(pid, qty, total_cost):
         "current_stock": round(new_stock, 3), "cost_per_unit": round(new_cost, 4)}})
 
 # ---- build helpers ----
+# ---------------- Paying in kind ----------------
+# Many customers settle grinding by leaving flour or grain behind rather than
+# handing over cash. The charge is still a charge: it is computed and shown
+# whichever way it is paid, so the mill can see what its grinding actually
+# earned. Only the settlement differs.
+
+MONEY_METHODS = ("Cash", "UPI", "Bank", "NEFT", "RTGS", "IMPS", "Cheque")
+FLOUR_DEDUCTION = "Flour Deduction"
+GRAIN_DEDUCTION = "Grain Deduction"
+KIND_METHODS = (FLOUR_DEDUCTION, GRAIN_DEDUCTION)
+GRINDING_METHODS = MONEY_METHODS + KIND_METHODS
+
+# How much flour to keep back: a share of the output, a flat weight, or however
+# much covers the charge at the flour rate.
+DEDUCTION_BASES = ("Percent", "Weight", "Value")
+
+def normalise_method(method: str) -> str:
+    """Map what a record stored onto today's vocabulary.
+
+    "Grain" was the old single in-kind option and always meant flour kept back,
+    so it reads as a flour deduction rather than falling through to Cash and
+    misreporting an in-kind job as money taken.
+    """
+    m = (method or "Cash").strip()
+    if m in GRINDING_METHODS:
+        return m
+    if m.lower() in ("grain", "grain/material", "material"):
+        return FLOUR_DEDUCTION
+    return clean_mode(m) if clean_mode(m) in MONEY_METHODS else "Cash"
+
+def settled_in_kind(method: str) -> bool:
+    return normalise_method(method) in KIND_METHODS
+
+async def flour_unit_rate(product_name: str) -> float:
+    """What a kilo of kept-back flour is valued at."""
+    settings = await get_settings_doc()
+    configured = settings.get("flour_rate", 0) or 0
+    if configured > 0:
+        return round(configured, 4)
+    prod = await db.products.find_one({"name_key": product_key(product_name or "Atta")})
+    return round((prod or {}).get("rate", 0) or 0, 4)
+
+async def compute_flour_deduction(*, output_qty, total_charge, basis, percent, weight, unit_rate):
+    """Flour kept back as the grinding fee, and what it is worth.
+
+    Value basis keeps exactly enough flour to cover the charge, which is what a
+    mill quoting in rupees actually does. Percent and Weight let the operator
+    work the way their customers expect instead.
+    """
+    b = basis if basis in DEDUCTION_BASES else "Percent"
+    if b == "Weight":
+        deducted = max(float(weight or 0), 0)
+    elif b == "Value":
+        deducted = round(total_charge / unit_rate, 3) if unit_rate > 0 else 0.0
+    else:
+        deducted = round(output_qty * max(float(percent or 0), 0) / 100, 3)
+    deducted = round(min(deducted, output_qty), 3)
+    return deducted, round(deducted * unit_rate, 2)
+
+async def post_material_ledger(*, date, party_name, item, qty, unit, value, direction,
+                               ref_id=None, source=None, note=""):
+    """Record stock moving in settlement of a bill.
+
+    Kept apart from the cash and bank ledgers on purpose: this is grain and
+    flour changing hands, not money, and folding it into either would overstate
+    what the mill actually took in rupees.
+    """
+    if not qty:
+        return
+    existing = await db.material_ledger.find_one({"ref_id": ref_id, "source": source}) if ref_id else None
+    doc = {"date": date, "party_name": party_name, "item": item, "qty": round(qty, 3),
+           "unit": unit, "value": round(value or 0, 2), "direction": direction,
+           "ref_id": ref_id, "source": source, "note": note}
+    if existing:
+        await db.material_ledger.update_one({"id": existing["id"]}, {"$set": doc})
+        return existing["id"]
+    doc["id"] = str(uuid.uuid4())
+    doc["created_at"] = now_iso()
+    await db.material_ledger.insert_one(doc)
+    return doc["id"]
+
+async def unpost_material_ledger(ref_id: str):
+    if ref_id:
+        await db.material_ledger.delete_many({"ref_id": ref_id})
+
+@api_router.get("/material-ledger")
+async def material_ledger(start: Optional[str] = None, end: Optional[str] = None,
+                          party: Optional[str] = None, item: Optional[str] = None,
+                          user: dict = Depends(get_current_user)):
+    q = {}
+    if party: q["party_name"] = party
+    if item: q["item"] = item
+    if start or end:
+        rng = {}
+        if start: rng["$gte"] = start
+        if end: rng["$lte"] = end
+        q["date"] = rng
+    rows = [clean(r) for r in await db.material_ledger.find(q).sort("date", -1).to_list(20000)]
+    return {"rows": rows,
+            "total_in": round(sum(r["qty"] for r in rows if r.get("direction") == "in"), 3),
+            "total_value": round(sum(r.get("value", 0) for r in rows if r.get("direction") == "in"), 2)}
+
 async def build_grinding_doc(body: GrindingBody):
     inv = await next_invoice_number()
     output_atta = round(body.wheat_weight * (1 - body.loss_percent / 100), 2)
     loss_kg = round(body.wheat_weight - output_atta, 2)
-    if body.payment_method == "Grain":
-        total_charge = 0.0
-        customer_receives = round(output_atta - body.grain_fee_kg, 2)
-    else:
-        total_charge = round(body.wheat_weight * body.charge_per_kg, 2)
-        customer_receives = output_atta
+    method = normalise_method(body.payment_method)
+    output_name = body.output_product or "Atta"
+
+    # The charge is what the grinding was worth and is computed the same way
+    # every time. Previously paying in kind set it to zero, which hid the
+    # mill's own earnings whenever a customer settled with flour.
+    total_charge = round(body.wheat_weight * (body.charge_per_kg or 0), 2)
+
+    deducted_flour = 0.0
+    flour_value = 0.0
+    unit_rate = 0.0
+    grain_qty = round(body.grain_qty or 0, 3)
+    grain_value = round(body.grain_value or 0, 2)
+
+    if method == FLOUR_DEDUCTION:
+        unit_rate = await flour_unit_rate(output_name)
+        settings = await get_settings_doc()
+        percent = body.deduction_percent if body.deduction_percent is not None else settings.get("flour_deduction_percent", 5)
+        # grain_fee_kg is what older records used for the same idea. A stated
+        # weight is an instruction, so honour it rather than overwriting it with
+        # the configured percentage.
+        weight = body.deduction_weight if body.deduction_weight is not None else body.grain_fee_kg
+        basis = body.deduction_basis
+        if body.deduction_weight is None and body.deduction_basis == "Percent" and body.grain_fee_kg:
+            basis = "Weight"
+        deducted_flour, flour_value = await compute_flour_deduction(
+            output_qty=output_atta, total_charge=total_charge, basis=basis,
+            percent=percent, weight=weight, unit_rate=unit_rate)
+    elif method == GRAIN_DEDUCTION:
+        grain_qty = round(body.grain_qty or body.grain_fee_kg or 0, 3)
+        grain_value = round(body.grain_value or 0, 2)
+
+    customer_receives = round(output_atta - deducted_flour, 3)
+
     d = body.model_dump()
     d.update({"id": str(uuid.uuid4()), "invoice_number": inv, "output_atta": output_atta,
               "loss_kg": loss_kg, "customer_receives": customer_receives,
-              "total_charge": total_charge, "created_at": now_iso()})
+              "payment_method": method, "total_charge": total_charge,
+              "deducted_flour": deducted_flour, "flour_unit_rate": unit_rate,
+              "flour_value": flour_value, "final_flour_delivered": customer_receives,
+              "grain_qty": grain_qty, "grain_value": grain_value,
+              # Kept in step so old readers of grain_fee_kg still see the weight.
+              "grain_fee_kg": deducted_flour if method == FLOUR_DEDUCTION else grain_qty,
+              "created_at": now_iso()})
     return d
 
 def grinding_output_name(doc: dict) -> str:
@@ -1405,8 +1624,33 @@ async def build_oil_doc(body: OilBody):
     return d
 
 async def apply_grinding_effects(doc, sign):
-    if doc.get("payment_method") == "Grain" and doc.get("grain_fee_kg", 0):
-        await adjust_stock_by_name(grinding_output_name(doc), sign * doc["grain_fee_kg"])
+    method = normalise_method(doc.get("payment_method"))
+    if method == FLOUR_DEDUCTION:
+        kept = doc.get("deducted_flour", doc.get("grain_fee_kg", 0)) or 0
+        if kept:
+            await adjust_stock_by_name(grinding_output_name(doc), sign * kept)
+            if sign > 0:
+                await post_material_ledger(
+                    date=doc.get("date"), party_name=doc.get("customer_name", ""),
+                    item=grinding_output_name(doc), qty=kept, unit="kg",
+                    value=doc.get("flour_value", 0), direction="in",
+                    ref_id=doc["id"], source="grinding",
+                    note=f'Grinding fee for invoice {doc.get("invoice_number", "")}')
+            else:
+                await unpost_material_ledger(doc["id"])
+    elif method == GRAIN_DEDUCTION:
+        qty = doc.get("grain_qty", 0) or 0
+        item = doc.get("grain_item") or doc.get("grain_type") or "Wheat Crop"
+        if qty:
+            await adjust_stock_by_name(item, sign * qty)
+            if sign > 0:
+                await post_material_ledger(
+                    date=doc.get("date"), party_name=doc.get("customer_name", ""),
+                    item=item, qty=qty, unit="kg", value=doc.get("grain_value", 0),
+                    direction="in", ref_id=doc["id"], source="grinding",
+                    note=f'Grinding paid in grain, invoice {doc.get("invoice_number", "")}')
+            else:
+                await unpost_material_ledger(doc["id"])
 
 async def apply_oil_effects(doc, sign):
     if doc.get("retained_oil", 0):
@@ -1427,6 +1671,15 @@ class SettingsBody(BaseModel):
     washed_loss: float
     unwashed_loss: float
     starting_cash: float = 0
+    # Default grinding charge. Every job still carries its own rate; this is
+    # what a new job starts from.
+    grinding_rate: float = 2.0
+    # Share of the flour kept back when the customer pays in kind instead of
+    # cash. 5, 10, 15 — whatever the mill works on.
+    flour_deduction_percent: float = 5.0
+    # What a kilo of kept-back flour is worth. Zero falls back to the product's
+    # own rate, so the mill only sets this if it prices deductions differently.
+    flour_rate: float = 0
 
 @api_router.get("/settings")
 async def read_settings(user: dict = Depends(get_current_user)):
@@ -1550,6 +1803,81 @@ class ExchangeBody(BaseModel):
     washed: bool = True
     loss_percent: float = 2.5
     atta_given: float
+    # Grinding is a separate charge from the swap itself. It was previously
+    # folded into the quantities and never shown, so the mill could not see
+    # what its grinding earned on an exchange.
+    grinding_rate: Optional[float] = None
+    payment_method: str = "Cash"
+    payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
+    deduction_basis: str = "Value"
+    deduction_percent: Optional[float] = None
+    deduction_weight: Optional[float] = None
+    payment_status: str = "Paid"
+
+async def build_exchange_doc(body: ExchangeBody, existing: dict = None) -> dict:
+    """Price an exchange and work out what the customer actually walks out with.
+
+    atta_given is the flour the swap produces. When grinding is paid in flour,
+    the fee comes out of that, so the delivered figure is lower — and both are
+    recorded, because the customer needs to see why.
+    """
+    settings = await get_settings_doc()
+    rate = body.grinding_rate if body.grinding_rate is not None else (settings.get("grinding_rate", 2) or 0)
+    method = normalise_method(body.payment_method)
+    charge = round(body.wheat_qty * rate, 2)
+
+    deducted = 0.0
+    value = 0.0
+    unit_rate = 0.0
+    if method == FLOUR_DEDUCTION:
+        unit_rate = await flour_unit_rate("Atta")
+        percent = body.deduction_percent if body.deduction_percent is not None else settings.get("flour_deduction_percent", 5)
+        deducted, value = await compute_flour_deduction(
+            output_qty=body.atta_given, total_charge=charge, basis=body.deduction_basis,
+            percent=percent, weight=body.deduction_weight, unit_rate=unit_rate)
+
+    doc = {**(existing or {}), **body.model_dump(),
+           "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2),
+           "grinding_rate": round(rate, 2), "grinding_charge": charge,
+           "payment_method": method,
+           "flour_produced": round(body.atta_given, 3),
+           "deducted_flour": deducted, "flour_unit_rate": unit_rate, "flour_value": value,
+           "final_flour_delivered": round(body.atta_given - deducted, 3)}
+    return doc
+
+async def apply_exchange_effects(doc: dict, sign: int):
+    """Wheat in, flour out, and any flour kept back as the grinding fee.
+
+    The fee stays with the shop, so only what the customer actually takes comes
+    off stock — the deduction is netted against the flour going out.
+    """
+    await adjust_stock_by_name("Wheat Crop", sign * doc.get("wheat_qty", 0))
+    delivered = doc.get("final_flour_delivered", doc.get("atta_given", 0)) or 0
+    await adjust_stock_by_name("Atta", -sign * delivered)
+    if normalise_method(doc.get("payment_method")) == FLOUR_DEDUCTION and doc.get("deducted_flour"):
+        if sign > 0:
+            await post_material_ledger(
+                date=doc.get("date"), party_name=doc.get("customer_name", ""),
+                item="Atta", qty=doc["deducted_flour"], unit="kg",
+                value=doc.get("flour_value", 0), direction="in",
+                ref_id=doc["id"], source="exchange",
+                note="Grinding fee kept as flour on exchange")
+        else:
+            await unpost_material_ledger(doc["id"])
+
+async def settle_exchange(doc: dict, body: ExchangeBody):
+    """Post the grinding charge to whichever ledger the payment names."""
+    charge = doc.get("grinding_charge", 0) or 0
+    if charge <= 0:
+        return
+    method = normalise_method(doc.get("payment_method"))
+    if method == FLOUR_DEDUCTION:
+        await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
+                         f'Exchange grinding · {doc.get("deducted_flour", 0)} kg flour kept', mode="Flour")
+    elif doc.get("payment_status", "Paid") == "Paid":
+        await add_credit("customer", doc["customer_name"], charge, doc["date"], doc["id"],
+                         "Exchange grinding charge", mode=body.payment_mode or method, bank_id=body.bank_id)
 
 @api_router.get("/exchanges")
 async def get_exchanges(user: dict = Depends(get_current_user)):
@@ -1557,14 +1885,24 @@ async def get_exchanges(user: dict = Depends(get_current_user)):
 
 @api_router.post("/exchanges")
 async def create_exchange(body: ExchangeBody, user: dict = Depends(get_current_user)):
-    atta = await db.products.find_one({"name": "Atta"})
-    if atta and body.atta_given > atta.get("current_stock", 0):
+    doc = await build_exchange_doc(body)
+    doc["id"] = str(uuid.uuid4())
+    doc["invoice_number"] = await next_invoice_number()
+    doc["created_at"] = now_iso()
+    # Only the flour the customer takes leaves stock; anything kept as the fee
+    # stays with the shop, so that is the figure to check against.
+    atta = await db.products.find_one({"name_key": product_key("Atta")})
+    needed = doc["final_flour_delivered"]
+    if atta and needed > atta.get("current_stock", 0):
         raise HTTPException(status_code=400, detail=f"Not enough Atta stock (have {atta.get('current_stock',0)} kg)")
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(),
-           "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2), "created_at": now_iso()}
     await db.exchanges.insert_one(doc)
-    await adjust_stock_by_name("Wheat Crop", body.wheat_qty)
-    await adjust_stock_by_name("Atta", -body.atta_given)
+    await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"],
+        "type": "Exchange", "ref_id": doc["id"], "customer_name": doc["customer_name"],
+        "date": doc["date"], "total": doc["grinding_charge"],
+        "payment_status": doc.get("payment_status", "Paid"), "created_at": now_iso()})
+    await apply_exchange_effects(doc, 1)
+    await settle_exchange(doc, body)
+    await log_audit(user, "Exchange", f'{body.customer_name}: {body.wheat_qty} kg wheat, grinding Rs {doc["grinding_charge"]} by {doc["payment_method"]}')
     return clean(doc)
 
 @api_router.put("/exchanges/{eid}")
@@ -1574,26 +1912,33 @@ async def edit_exchange(eid: str, body: ExchangeBody, user: dict = Depends(get_c
         raise HTTPException(status_code=404, detail="Not found")
     # Undo the original swap first, so the stock check below sees the atta that
     # this very exchange had taken out.
-    await adjust_stock_by_name("Wheat Crop", -old["wheat_qty"])
-    await adjust_stock_by_name("Atta", old["atta_given"])
+    await apply_exchange_effects(old, -1)
+    doc = await build_exchange_doc(body, existing=old)
+    doc["id"] = eid
     atta = await db.products.find_one({"name_key": product_key("Atta")})
-    if atta and body.atta_given > atta.get("current_stock", 0):
-        await adjust_stock_by_name("Wheat Crop", old["wheat_qty"])
-        await adjust_stock_by_name("Atta", -old["atta_given"])
+    if atta and doc["final_flour_delivered"] > atta.get("current_stock", 0):
+        await apply_exchange_effects(old, 1)
         raise HTTPException(status_code=400, detail=f"Not enough Atta stock (have {atta.get('current_stock',0)} kg)")
-    doc = {**old, **body.model_dump(), "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2)}
     await db.exchanges.replace_one({"id": eid}, doc)
-    await adjust_stock_by_name("Wheat Crop", body.wheat_qty)
-    await adjust_stock_by_name("Atta", -body.atta_given)
-    await log_audit(user, "Edited exchange", f'{body.customer_name}: {body.wheat_qty} kg wheat → {body.atta_given} kg atta')
+    await apply_exchange_effects(doc, 1)
+    # Re-settle from scratch: the charge or the way it was paid may have changed.
+    for row in await db.payments.find({"ref_id": eid}).to_list(500):
+        await unpost_bank_txn(row["id"])
+    await db.payments.delete_many({"ref_id": eid})
+    await settle_exchange(doc, body)
+    await log_audit(user, "Edited exchange", f'{body.customer_name}: {body.wheat_qty} kg wheat, grinding Rs {doc["grinding_charge"]}')
     return clean(doc)
 
 @api_router.delete("/exchanges/{eid}")
 async def delete_exchange(eid: str, user: dict = Depends(require_admin)):
     e = await db.exchanges.find_one({"id": eid})
     if e:
-        await adjust_stock_by_name("Wheat Crop", -e["wheat_qty"])
-        await adjust_stock_by_name("Atta", e["atta_given"])
+        await apply_exchange_effects(e, -1)
+        await unpost_material_ledger(eid)
+        await db.invoices.delete_one({"ref_id": eid})
+        for row in await db.payments.find({"ref_id": eid}).to_list(500):
+            await unpost_bank_txn(row["id"])
+        await db.payments.delete_many({"ref_id": eid})
         await db.exchanges.delete_one({"id": eid})
     return {"message": "deleted"}
 
@@ -1814,7 +2159,7 @@ BANK_MODES = ("Bank", "UPI", "NEFT", "RTGS", "IMPS", "Cheque")
 
 # Paid in kind — flour kept back as the grinding fee, or grain handed over
 # instead of cash. Moves stock, never money, so it must reach neither ledger.
-MATERIAL_MODES = ("Grain", "Material")
+MATERIAL_MODES = ("Grain", "Material", "Flour")
 
 PAYMENT_MODES = ("Cash",) + BANK_MODES + MATERIAL_MODES
 
