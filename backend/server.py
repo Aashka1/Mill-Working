@@ -856,19 +856,25 @@ class CustomerBody(BaseModel):
 
 @api_router.get("/customers")
 async def get_customers(user: dict = Depends(get_current_user)):
-    customers = [clean(c) for c in await db.customers.find().sort("name", 1).to_list(2000)]
-    # One query per collection rather than per customer. Querying inside the
-    # loop meant five round trips each, which is unnoticeable beside a local
-    # database and adds up to seconds against a remote one.
+    # One query per collection rather than per customer, and all of them issued
+    # together. Sequential awaits cost one network round trip each, which is
+    # invisible beside a local database and seconds against a distant one.
+    sources = [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
+               ("exchanges", "grinding_charge")]
+    customers, *rest = await asyncio.gather(
+        db.customers.find().sort("name", 1).to_list(2000),
+        *[db[coll].find({}, {"customer_name": 1, field: 1}).to_list(50000) for coll, field in sources],
+        db.payments.find({"party_type": "customer"}, {"party_name": 1, "amount": 1}).to_list(50000),
+    )
+    customers = [clean(c) for c in customers]
     debit = {}
-    for coll, field in [("sales", "total"), ("grinding", "total_charge"), ("oil", "total"),
-                        ("exchanges", "grinding_charge")]:
-        for d in await db[coll].find({}, {"customer_name": 1, field: 1}).to_list(50000):
+    for (coll, field), docs in zip(sources, rest):
+        for d in docs:
             name = d.get("customer_name")
             if name:
                 debit[name] = debit.get(name, 0) + (d.get(field, 0) or 0)
     credit = {}
-    for pay in await db.payments.find({"party_type": "customer"}, {"party_name": 1, "amount": 1}).to_list(50000):
+    for pay in rest[-1]:
         name = pay.get("party_name")
         if name:
             credit[name] = credit.get(name, 0) + (pay.get("amount", 0) or 0)
@@ -969,14 +975,19 @@ class SupplierBody(BaseModel):
 
 @api_router.get("/suppliers")
 async def get_suppliers(user: dict = Depends(get_current_user)):
-    suppliers = [clean(s) for s in await db.suppliers.find().sort("name", 1).to_list(2000)]
+    suppliers, purchases, payments = await asyncio.gather(
+        db.suppliers.find().sort("name", 1).to_list(2000),
+        db.purchases.find({}, {"supplier_name": 1, "total": 1}).to_list(50000),
+        db.payments.find({"party_type": "supplier"}, {"party_name": 1, "amount": 1}).to_list(50000),
+    )
+    suppliers = [clean(s) for s in suppliers]
     debit = {}
-    for d in await db.purchases.find({}, {"supplier_name": 1, "total": 1}).to_list(50000):
+    for d in purchases:
         name = d.get("supplier_name")
         if name:
             debit[name] = debit.get(name, 0) + (d.get("total", 0) or 0)
     credit = {}
-    for pay in await db.payments.find({"party_type": "supplier"}, {"party_name": 1, "amount": 1}).to_list(50000):
+    for pay in payments:
         name = pay.get("party_name")
         if name:
             credit[name] = credit.get(name, 0) + (pay.get("amount", 0) or 0)
@@ -1186,12 +1197,13 @@ async def invoice_pdf(ref_id: str, request: Request):
 
 @api_router.get("/dashboard")
 async def dashboard(user: dict = Depends(get_current_user)):
-    products = await db.products.find().to_list(1000)
-    sales = await db.sales.find().to_list(5000)
-    purchases = await db.purchases.find().to_list(5000)
-    grinding = await db.grinding.find().to_list(5000)
-    oil = await db.oil.find().to_list(5000)
-    expenses = await db.expenses.find().to_list(5000)
+    # The landing page, so it is worth the six reads costing one round trip
+    # rather than six. None of them depends on another.
+    products, sales, purchases, grinding, oil, expenses = await asyncio.gather(
+        db.products.find().to_list(1000), db.sales.find().to_list(5000),
+        db.purchases.find().to_list(5000), db.grinding.find().to_list(5000),
+        db.oil.find().to_list(5000), db.expenses.find().to_list(5000),
+    )
 
     today = datetime.now().strftime("%Y-%m-%d")
     month = datetime.now().strftime("%Y-%m")
@@ -2756,9 +2768,13 @@ async def unpost_bank_txn(source_ref: str):
 
 @api_router.get("/banks")
 async def list_banks(user: dict = Depends(get_current_user)):
-    accounts = [clean(a) for a in await db.bank_accounts.find().sort("bank_name", 1).to_list(200)]
+    accounts, txns = await asyncio.gather(
+        db.bank_accounts.find().sort("bank_name", 1).to_list(200),
+        db.bank_txns.find({}, {"bank_id": 1, "amount": 1}).to_list(100000),
+    )
+    accounts = [clean(a) for a in accounts]
     moved = {}
-    for t in await db.bank_txns.find({}, {"bank_id": 1, "amount": 1}).to_list(100000):
+    for t in txns:
         moved[t.get("bank_id")] = moved.get(t.get("bank_id"), 0) + (t.get("amount", 0) or 0)
     for a in accounts:
         a["balance"] = round((a.get("opening_balance", 0) or 0) + moved.get(a["id"], 0), 2)
@@ -3005,18 +3021,24 @@ async def all_party_movements():
     def add(name, row):
         if name:
             out.setdefault(name, []).append(row)
-    for coll, field, label in (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
-                               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange")):
-        for d in await db[coll].find().to_list(50000):
+    sources = (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
+               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange"))
+    *docs, purchases, payments = await asyncio.gather(
+        *[db[coll].find().to_list(50000) for coll, _, _ in sources],
+        db.purchases.find().to_list(50000),
+        db.payments.find().to_list(50000),
+    )
+    for (coll, field, label), rows in zip(sources, docs):
+        for d in rows:
             if d.get(field):
                 add(d.get("customer_name"),
                     {"date": d.get("date"), "particulars": f'{label} {d.get("invoice_number", "")}'.strip(),
                      "debit": round(d.get(field, 0), 2), "credit": 0})
-    for d in await db.purchases.find().to_list(50000):
+    for d in purchases:
         add(d.get("supplier_name"),
             {"date": d.get("date"), "particulars": f'Purchase {d.get("product_name", "")}',
              "debit": round(d.get("total", 0), 2), "credit": 0})
-    for pay in await db.payments.find().to_list(50000):
+    for pay in payments:
         amt = pay.get("amount", 0) or 0
         note = pay.get("note") or "Payment"
         mode = clean_mode(pay.get("payment_mode"))
@@ -3036,7 +3058,15 @@ async def product_movements(start: str, end: str):
     movement history. Adjustments are included, which is why they are recorded
     with a date.
     """
-    products = [clean(p) for p in await db.products.find().sort("name", 1).to_list(2000)]
+    (products, purchases_r, sales_r, production_r, grinding_r,
+     exchanges_r, oil_r, adjustments_r) = await asyncio.gather(
+        db.products.find().sort("name", 1).to_list(2000),
+        db.purchases.find().to_list(20000), db.sales.find().to_list(20000),
+        db.production.find().to_list(20000), db.grinding.find().to_list(20000),
+        db.exchanges.find().to_list(20000), db.oil.find().to_list(20000),
+        db.stock_adjustments.find().to_list(20000),
+    )
+    products = [clean(p) for p in products]
     by_name = {p["name"]: p for p in products}
     acc = {p["name"]: {"purchased": 0.0, "sold": 0.0, "produced": 0.0, "consumed": 0.0,
                        "adjusted": 0.0, "after_start": 0.0} for p in products}
@@ -3049,29 +3079,29 @@ async def product_movements(start: str, end: str):
         if str(date or "") >= start:
             acc[name]["after_start"] += qty
 
-    for d in await db.purchases.find().to_list(20000):
+    for d in purchases_r:
         touch(d.get("product_name"), d.get("quantity", 0) or 0, "purchased", d.get("date"))
-    for d in await db.sales.find().to_list(20000):
+    for d in sales_r:
         touch(d.get("product_name"), -(d.get("quantity", 0) or 0), "sold", d.get("date"))
-    for d in await db.production.find().to_list(20000):
+    for d in production_r:
         touch(d.get("input_product_name"), -(d.get("input_quantity", 0) or 0), "consumed", d.get("date"))
         for o in d.get("outputs", []):
             touch(o.get("product_name"), o.get("quantity", 0) or 0, "produced", d.get("date"))
-    for d in await db.grinding.find().to_list(20000):
+    for d in grinding_r:
         method = normalise_method(d.get("payment_method"))
         if method == FLOUR_DEDUCTION and d.get("deducted_flour"):
             touch(grinding_output_name(d), d["deducted_flour"], "produced", d.get("date"))
         elif method == GRAIN_DEDUCTION and d.get("grain_qty"):
             touch(d.get("grain_item") or "Wheat Crop", d["grain_qty"], "purchased", d.get("date"))
-    for d in await db.exchanges.find().to_list(20000):
+    for d in exchanges_r:
         touch("Wheat Crop", d.get("wheat_qty", 0) or 0, "purchased", d.get("date"))
         touch("Atta", -(d.get("final_flour_delivered", d.get("atta_given", 0)) or 0), "sold", d.get("date"))
-    for d in await db.oil.find().to_list(20000):
+    for d in oil_r:
         for field, name in (("retained_oil", "Mustard Oil"), ("retained_cake", "Mustard Oil Cake"),
                             ("cake_sold_to_shop", "Mustard Oil Cake")):
             if d.get(field):
                 touch(name, d[field], "purchased", d.get("date"))
-    for d in await db.stock_adjustments.find().to_list(20000):
+    for d in adjustments_r:
         touch(d.get("product_name"), d.get("delta", 0) or 0, "adjusted", d.get("date"))
 
     rows = []
