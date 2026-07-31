@@ -12,7 +12,7 @@ import { Plus, Trash2, History, Phone, MapPin, Pencil } from "lucide-react";
 import { toast } from "sonner";
 import { LedgerDialog } from "@/components/LedgerDialog";
 
-const BLANK = { name: "", phone: "", address: "" };
+const BLANK = { name: "", phone: "", address: "", gstin: "", pan_aadhaar: "", opening_balance: "", credit_limit: "" };
 
 export default function Customers() {
   const customers = useList("/customers");
@@ -26,18 +26,20 @@ export default function Customers() {
   const openNew = () => { setEditingId(null); setF(BLANK); setOpen(true); };
   const openEdit = (c) => {
     setEditingId(c.id);
-    setF({ name: c.name || "", phone: c.phone || "", address: c.address || "" });
+    setF({ name: c.name || "", phone: c.phone || "", address: c.address || "",
+           gstin: c.gstin || "", pan_aadhaar: c.pan_aadhaar || "",
+           opening_balance: c.opening_balance ?? "", credit_limit: c.credit_limit ?? "" });
     setOpen(true);
   };
 
   const save = async () => {
     if (!f.name) return toast.error("Enter name");
     if (editingId) {
-      await api.put(`/customers/${editingId}`, f);
+      await api.put(`/customers/${editingId}`, { ...f, opening_balance: +f.opening_balance || 0, credit_limit: +f.credit_limit || 0 });
       toast.success("Customer updated");
       customers.load();
     } else {
-      await customers.create(f);
+      await customers.create({ ...f, opening_balance: +f.opening_balance || 0, credit_limit: +f.credit_limit || 0 });
     }
     setOpen(false);
     setEditingId(null);
@@ -58,6 +60,19 @@ export default function Customers() {
                 <div><Label>Name</Label><Input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className="h-11 mt-1" data-testid="customer-name" /></div>
                 <div><Label>Phone</Label><Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="h-11 mt-1" data-testid="customer-phone" /></div>
                 <div><Label>Address</Label><Input value={f.address} onChange={(e) => setF({ ...f, address: e.target.value })} className="h-11 mt-1" data-testid="customer-address" /></div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><Label>GSTIN <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                    <Input value={f.gstin} onChange={(e) => setF({ ...f, gstin: e.target.value.toUpperCase() })} className="h-11 mt-1" data-testid="customer-gstin" /></div>
+                  <div><Label>Aadhaar / PAN <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                    <Input value={f.pan_aadhaar} onChange={(e) => setF({ ...f, pan_aadhaar: e.target.value.toUpperCase() })} className="h-11 mt-1" data-testid="customer-pan" /></div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><Label>Opening balance ₹</Label>
+                    <Input type="number" value={f.opening_balance} onChange={(e) => setF({ ...f, opening_balance: e.target.value })} className="h-11 mt-1" data-testid="customer-opening" />
+                    <p className="text-xs text-muted-foreground mt-1">What they already owed before today.</p></div>
+                  <div><Label>Credit limit ₹ <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                    <Input type="number" value={f.credit_limit} onChange={(e) => setF({ ...f, credit_limit: e.target.value })} className="h-11 mt-1" data-testid="customer-limit" /></div>
+                </div>
               </div>
               <DialogFooter><Button onClick={save} data-testid="save-customer-btn">Save</Button></DialogFooter>
             </DialogContent>

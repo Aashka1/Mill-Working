@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Plus, Trash2, Download, FileDown, Pencil, IndianRupee } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
+import { PartySelect } from "@/components/PartySelect";
 import { toast } from "sonner";
 
 const empty = { date: today(), customer_name: "", product_id: "", product_name: "", quantity: "", price: "", payment_status: "Paid", amount_paid: "", payment_mode: "Cash" };
@@ -76,11 +77,10 @@ export default function Sales() {
             <div className="grid grid-cols-2 gap-4">
               <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
               <div><Label>Customer</Label>
-                <Select value={f.customer_name} onValueChange={(v) => setF({ ...f, customer_name: v })}>
-                  <SelectTrigger className="h-11 mt-1" data-testid="sale-customer"><SelectValue placeholder="Select" /></SelectTrigger>
-                  <SelectContent>{customers.items.map((c) => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
-                    {customers.items.length === 0 && <SelectItem value="Walk-in">Walk-in Customer</SelectItem>}</SelectContent>
-                </Select>
+                <PartySelect kind="customer" value={f.customer_name}
+                    onChange={(v) => setF({ ...f, customer_name: v })}
+                    items={customers.items} onCreated={() => customers.load()}
+                    testid="sale-customer" />
               </div>
             </div>
             <div><Label>Product</Label>

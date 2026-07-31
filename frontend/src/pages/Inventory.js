@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Plus, Trash2, Pencil, Scale, IndianRupee } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
+import { PartySelect } from "@/components/PartySelect";
 import { toast } from "sonner";
 
 // Must cover every category the seeded catalogue uses, or those products cannot
@@ -258,11 +259,10 @@ export default function Inventory() {
                   <div className="grid grid-cols-2 gap-4">
                     <div><Label>Date</Label><Input type="date" value={buf.date} onChange={(e) => setBuf({ ...buf, date: e.target.value })} className="h-11 mt-1" /></div>
                     <div><Label>Supplier</Label>
-                      <Select value={buf.supplier_name} onValueChange={(v) => setBuf({ ...buf, supplier_name: v })}>
-                        <SelectTrigger className="h-11 mt-1" data-testid="purchase-supplier"><SelectValue placeholder="Select" /></SelectTrigger>
-                        <SelectContent>{suppliers.items.map((s) => <SelectItem key={s.id} value={s.name}>{s.name}</SelectItem>)}
-                          {suppliers.items.length === 0 && <SelectItem value="Walk-in">Walk-in Supplier</SelectItem>}</SelectContent>
-                      </Select>
+                      <PartySelect kind="supplier" value={buf.supplier_name}
+                        onChange={(v) => setBuf({ ...buf, supplier_name: v })}
+                        items={suppliers.items} onCreated={() => suppliers.load()}
+                        testid="purchase-supplier" />
                     </div>
                   </div>
                   <div><Label>Product</Label>

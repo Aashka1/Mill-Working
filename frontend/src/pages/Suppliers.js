@@ -12,7 +12,7 @@ import { Plus, Trash2, Phone, MapPin, History, Pencil } from "lucide-react";
 import { toast } from "sonner";
 import { LedgerDialog } from "@/components/LedgerDialog";
 
-const BLANK = { name: "", phone: "", address: "" };
+const BLANK = { name: "", phone: "", address: "", gstin: "", pan_aadhaar: "", opening_balance: "", credit_limit: "" };
 
 export default function Suppliers() {
   const suppliers = useList("/suppliers");
@@ -26,18 +26,20 @@ export default function Suppliers() {
   const openNew = () => { setEditingId(null); setF(BLANK); setOpen(true); };
   const openEdit = (s) => {
     setEditingId(s.id);
-    setF({ name: s.name || "", phone: s.phone || "", address: s.address || "" });
+    setF({ name: s.name || "", phone: s.phone || "", address: s.address || "",
+           gstin: s.gstin || "", pan_aadhaar: s.pan_aadhaar || "",
+           opening_balance: s.opening_balance ?? "", credit_limit: s.credit_limit ?? "" });
     setOpen(true);
   };
 
   const save = async () => {
     if (!f.name) return toast.error("Enter name");
     if (editingId) {
-      await api.put(`/suppliers/${editingId}`, f);
+      await api.put(`/suppliers/${editingId}`, { ...f, opening_balance: +f.opening_balance || 0, credit_limit: +f.credit_limit || 0 });
       toast.success("Supplier updated");
       suppliers.load();
     } else {
-      await suppliers.create(f);
+      await suppliers.create({ ...f, opening_balance: +f.opening_balance || 0, credit_limit: +f.credit_limit || 0 });
     }
     setOpen(false);
     setEditingId(null);
@@ -58,6 +60,19 @@ export default function Suppliers() {
                 <div><Label>Name</Label><Input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className="h-11 mt-1" data-testid="supplier-name" /></div>
                 <div><Label>Phone</Label><Input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="h-11 mt-1" data-testid="supplier-phone" /></div>
                 <div><Label>Address</Label><Input value={f.address} onChange={(e) => setF({ ...f, address: e.target.value })} className="h-11 mt-1" data-testid="supplier-address" /></div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><Label>GSTIN <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                    <Input value={f.gstin} onChange={(e) => setF({ ...f, gstin: e.target.value.toUpperCase() })} className="h-11 mt-1" data-testid="supplier-gstin" /></div>
+                  <div><Label>Aadhaar / PAN <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                    <Input value={f.pan_aadhaar} onChange={(e) => setF({ ...f, pan_aadhaar: e.target.value.toUpperCase() })} className="h-11 mt-1" data-testid="supplier-pan" /></div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div><Label>Opening balance ₹</Label>
+                    <Input type="number" value={f.opening_balance} onChange={(e) => setF({ ...f, opening_balance: e.target.value })} className="h-11 mt-1" data-testid="supplier-opening" />
+                    <p className="text-xs text-muted-foreground mt-1">What they already owed before today.</p></div>
+                  <div><Label>Credit limit ₹ <span className="text-muted-foreground font-normal">(optional)</span></Label>
+                    <Input type="number" value={f.credit_limit} onChange={(e) => setF({ ...f, credit_limit: e.target.value })} className="h-11 mt-1" data-testid="supplier-limit" /></div>
+                </div>
               </div>
               <DialogFooter><Button onClick={save} data-testid="save-supplier-btn">Save</Button></DialogFooter>
             </DialogContent>

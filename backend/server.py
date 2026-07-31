@@ -837,6 +837,14 @@ class CustomerBody(BaseModel):
     name: str
     phone: str = ""
     address: str = ""
+    # Optional on purpose: a walk-in customer has a name and nothing else, and
+    # demanding more would push staff into inventing values.
+    gstin: str = ""
+    pan_aadhaar: str = ""
+    # What the party already owed when they were first entered, so a balance
+    # carried over from the old books is not lost.
+    opening_balance: float = 0
+    credit_limit: float = 0
 
 @api_router.get("/customers")
 async def get_customers(user: dict = Depends(get_current_user)):
@@ -848,18 +856,55 @@ async def get_customers(user: dict = Depends(get_current_user)):
             docs = await db[coll].find({"customer_name": c["name"]}).to_list(2000)
             debit += sum(d.get(field, 0) for d in docs)
         credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "customer", "party_name": c["name"]}).to_list(2000))
-        c["outstanding"] = round(debit - credit, 2)
+        c["outstanding"] = round(debit + (c.get("opening_balance", 0) or 0) - credit, 2)
     return customers
 
 @api_router.post("/customers")
 async def create_customer(body: CustomerBody, user: dict = Depends(get_current_user)):
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "created_at": now_iso()}
+    """Create a customer, or return the existing one under that name.
+
+    Called inline from the transaction screens, where the operator is halfway
+    through a bill. Returning the match rather than erroring means a name typed
+    twice never splits into two ledgers, and never blocks the bill in progress.
+    """
+    name = " ".join((body.name or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a name")
+    key = party_key(name)
+    existing = await db.customers.find_one({"party_key": key})
+    if existing:
+        out = clean(existing)
+        out["existing"] = True
+        return out
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "name": name,
+           "party_key": key, "created_at": now_iso()}
     await db.customers.insert_one(doc)
-    return clean(doc)
+    await log_audit(user, "Added customer", name)
+    out = clean(doc)
+    out["existing"] = False
+    return out
 
 @api_router.put("/customers/{cid}")
 async def update_customer(cid: str, body: CustomerBody, user: dict = Depends(get_current_user)):
-    await db.customers.update_one({"id": cid}, {"$set": body.model_dump()})
+    old = await db.customers.find_one({"id": cid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    name = " ".join((body.name or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a name")
+    key = party_key(name)
+    clash = await db.customers.find_one({"party_key": key, "id": {"$ne": cid}})
+    if clash:
+        raise HTTPException(status_code=400, detail=f'Another customer is already called "{clash["name"]}"')
+    await db.customers.update_one({"id": cid}, {"$set": {**body.model_dump(), "name": name, "party_key": key}})
+    # Every transaction stores the party by name, so a rename has to carry them
+    # with it or the ledger silently empties.
+    if old.get("name") and old["name"] != name:
+        for c, field in (('sales', 'customer_name'), ('grinding', 'customer_name'), ('oil', 'customer_name'), ('exchanges', 'customer_name')):
+            await db[c].update_many({field: old["name"]}, {"$set": {field: name}})
+        await db.payments.update_many({"party_type": "customer", "party_name": old["name"]},
+                                      {"$set": {"party_name": name}})
+        await log_audit(user, "Renamed customer", f'{old["name"]} to {name}')
     return clean(await db.customers.find_one({"id": cid}))
 
 @api_router.get("/customers/{cid}/history")
@@ -876,7 +921,17 @@ async def customer_history(cid: str, user: dict = Depends(get_current_user)):
 
 @api_router.delete("/customers/{cid}")
 async def delete_customer(cid: str, user: dict = Depends(require_admin)):
+    party = await db.customers.find_one({"id": cid})
+    if not party:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Transactions reference the party by name, so removing one with history
+    # would leave those records pointing at nobody.
+    for c, field in (("sales", "customer_name"), ("grinding", "customer_name"), ("oil", "customer_name"), ("exchanges", "customer_name")):
+        if await db[c].count_documents({field: party["name"]}):
+            raise HTTPException(status_code=400,
+                detail=f'{party["name"]} has transactions and cannot be deleted. Edit the record instead.')
     await db.customers.delete_one({"id": cid})
+    await log_audit(user, "Deleted customer", party["name"])
     return {"message": "deleted"}
 
 # ---------------- Suppliers ----------------
@@ -885,6 +940,14 @@ class SupplierBody(BaseModel):
     name: str
     phone: str = ""
     address: str = ""
+    # Optional on purpose: a walk-in customer has a name and nothing else, and
+    # demanding more would push staff into inventing values.
+    gstin: str = ""
+    pan_aadhaar: str = ""
+    # What the party already owed when they were first entered, so a balance
+    # carried over from the old books is not lost.
+    opening_balance: float = 0
+    credit_limit: float = 0
 
 @api_router.get("/suppliers")
 async def get_suppliers(user: dict = Depends(get_current_user)):
@@ -893,23 +956,70 @@ async def get_suppliers(user: dict = Depends(get_current_user)):
         docs = await db.purchases.find({"supplier_name": s["name"]}).to_list(2000)
         debit = sum(d.get("total", 0) for d in docs)
         credit = sum(p.get("amount", 0) for p in await db.payments.find({"party_type": "supplier", "party_name": s["name"]}).to_list(2000))
-        s["outstanding"] = round(debit - credit, 2)
+        s["outstanding"] = round(debit + (s.get("opening_balance", 0) or 0) - credit, 2)
     return suppliers
 
 @api_router.post("/suppliers")
 async def create_supplier(body: SupplierBody, user: dict = Depends(get_current_user)):
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "created_at": now_iso()}
+    """Create a supplier, or return the existing one under that name.
+
+    Called inline from the transaction screens, where the operator is halfway
+    through a bill. Returning the match rather than erroring means a name typed
+    twice never splits into two ledgers, and never blocks the bill in progress.
+    """
+    name = " ".join((body.name or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a name")
+    key = party_key(name)
+    existing = await db.suppliers.find_one({"party_key": key})
+    if existing:
+        out = clean(existing)
+        out["existing"] = True
+        return out
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "name": name,
+           "party_key": key, "created_at": now_iso()}
     await db.suppliers.insert_one(doc)
-    return clean(doc)
+    await log_audit(user, "Added supplier", name)
+    out = clean(doc)
+    out["existing"] = False
+    return out
 
 @api_router.put("/suppliers/{sid}")
 async def update_supplier(sid: str, body: SupplierBody, user: dict = Depends(get_current_user)):
-    await db.suppliers.update_one({"id": sid}, {"$set": body.model_dump()})
+    old = await db.suppliers.find_one({"id": sid})
+    if not old:
+        raise HTTPException(status_code=404, detail="Not found")
+    name = " ".join((body.name or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a name")
+    key = party_key(name)
+    clash = await db.suppliers.find_one({"party_key": key, "id": {"$ne": sid}})
+    if clash:
+        raise HTTPException(status_code=400, detail=f'Another supplier is already called "{clash["name"]}"')
+    await db.suppliers.update_one({"id": sid}, {"$set": {**body.model_dump(), "name": name, "party_key": key}})
+    # Every transaction stores the party by name, so a rename has to carry them
+    # with it or the ledger silently empties.
+    if old.get("name") and old["name"] != name:
+        for c, field in (('purchases', 'supplier_name'),):
+            await db[c].update_many({field: old["name"]}, {"$set": {field: name}})
+        await db.payments.update_many({"party_type": "supplier", "party_name": old["name"]},
+                                      {"$set": {"party_name": name}})
+        await log_audit(user, "Renamed supplier", f'{old["name"]} to {name}')
     return clean(await db.suppliers.find_one({"id": sid}))
 
 @api_router.delete("/suppliers/{sid}")
 async def delete_supplier(sid: str, user: dict = Depends(require_admin)):
+    party = await db.suppliers.find_one({"id": sid})
+    if not party:
+        raise HTTPException(status_code=404, detail="Not found")
+    # Transactions reference the party by name, so removing one with history
+    # would leave those records pointing at nobody.
+    for c, field in (("purchases", "supplier_name"),):
+        if await db[c].count_documents({field: party["name"]}):
+            raise HTTPException(status_code=400,
+                detail=f'{party["name"]} has transactions and cannot be deleted. Edit the record instead.')
     await db.suppliers.delete_one({"id": sid})
+    await log_audit(user, "Deleted supplier", party["name"])
     return {"message": "deleted"}
 
 # ---------------- Invoices ----------------
@@ -1229,6 +1339,7 @@ async def startup():
         await db[coll].create_index(field)
     for coll in ("sales", "purchases", "grinding", "oil", "expenses", "payments"):
         await db[coll].create_index("date")
+    await consolidate_parties()
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@agrimill.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
@@ -1318,6 +1429,41 @@ async def consolidate_products():
                        len(rest) + 1, keeper.get("name"), merged["current_stock"])
 
     await db.products.create_index("name_key", unique=True)
+
+async def consolidate_parties():
+    """Give every party a normalised key and fold same-name duplicates together.
+
+    Parties created before the key existed can differ only by casing or spacing,
+    which reads as two ledgers for one person. The survivor keeps the richest
+    record rather than whichever happened to be first.
+    """
+    for coll in ("customers", "suppliers"):
+        async for row in db[coll].find({"party_key": {"$exists": False}}):
+            await db[coll].update_one({"_id": row["_id"]},
+                                      {"$set": {"party_key": party_key(row.get("name", ""))}})
+
+        groups = await db[coll].aggregate([
+            {"$group": {"_id": "$party_key", "ids": {"$push": "$id"}, "n": {"$sum": 1}}},
+            {"$match": {"n": {"$gt": 1}}},
+        ]).to_list(1000)
+        for g in groups:
+            rows = await db[coll].find({"id": {"$in": g["ids"]}}).to_list(100)
+            # Most filled-in record wins; a bare duplicate should not overwrite
+            # a party someone took the time to enter properly.
+            rows.sort(key=lambda r: sum(1 for f in ("phone", "address", "gstin", "pan_aadhaar") if r.get(f)),
+                      reverse=True)
+            keeper, rest = rows[0], rows[1:]
+            merged = {f: keeper.get(f) or next((r.get(f) for r in rest if r.get(f)), "")
+                      for f in ("phone", "address", "gstin", "pan_aadhaar")}
+            merged["opening_balance"] = sum(r.get("opening_balance", 0) or 0 for r in rows)
+            merged["credit_limit"] = max((r.get("credit_limit", 0) or 0) for r in rows)
+            await db[coll].update_one({"id": keeper["id"]}, {"$set": merged})
+            for r in rest:
+                await db[coll].delete_one({"id": r["id"]})
+            logger.warning("Merged %d duplicate %s records named %r", len(rows), coll, keeper.get("name"))
+
+        await db[coll].create_index("party_key", unique=True,
+                                    partialFilterExpression={"party_key": {"$type": "string"}})
 
 async def seed_products():
     """Populate the catalogue once, on a brand new database only.
@@ -2185,6 +2331,32 @@ def is_bank_mode(mode) -> bool:
 
 def is_material_mode(mode) -> bool:
     return clean_mode(mode) in MATERIAL_MODES
+
+def party_key(name: str) -> str:
+    return " ".join((name or "").split()).lower()
+
+async def find_party(coll: str, name: str):
+    return await db[coll].find_one({"party_key": party_key(name)})
+
+async def ensure_party(coll: str, name: str) -> dict:
+    """Return the named party, creating a bare record if it is new.
+
+    Transactions can name a party that was never entered in the master — a
+    walk-in, or a typo corrected later. Creating the record keeps every ledger
+    attached to exactly one party instead of stranding history under a name
+    with no master entry.
+    """
+    key = party_key(name)
+    if not key:
+        return {}
+    found = await db[coll].find_one({"party_key": key})
+    if found:
+        return clean(found)
+    doc = {"id": str(uuid.uuid4()), "name": name.strip(), "party_key": key,
+           "phone": "", "address": "", "gstin": "", "pan_aadhaar": "",
+           "opening_balance": 0, "credit_limit": 0, "created_at": now_iso()}
+    await db[coll].insert_one(doc)
+    return clean(doc)
 
 async def add_credit(party_type, name, amount, date, ref_id=None, note="", kind="receipt", mode="Cash", bank_id=None):
     """Record money moving against a party.

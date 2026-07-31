@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogT
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Plus, Trash2, ArrowLeftRight, Info, Pencil } from "lucide-react";
+import { PartySelect } from "@/components/PartySelect";
 import { toast } from "sonner";
 
 const MONEY_METHODS = ["Cash", "UPI", "Bank", "NEFT", "RTGS", "IMPS", "Cheque"];
@@ -111,11 +112,10 @@ export default function Exchange() {
                 <div className="grid grid-cols-2 gap-4">
                   <div><Label>Date</Label><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} className="h-11 mt-1" /></div>
                   <div><Label>Customer</Label>
-                    <Select value={f.customer_name} onValueChange={(v) => setF({ ...f, customer_name: v })}>
-                      <SelectTrigger className="h-11 mt-1" data-testid="exchange-customer"><SelectValue placeholder="Select" /></SelectTrigger>
-                      <SelectContent>{customers.items.map((c) => <SelectItem key={c.id} value={c.name}>{c.name}</SelectItem>)}
-                        {customers.items.length === 0 && <SelectItem value="Walk-in">Walk-in Customer</SelectItem>}</SelectContent>
-                    </Select>
+                    <PartySelect kind="customer" value={f.customer_name}
+                    onChange={(v) => setF({ ...f, customer_name: v })}
+                    items={customers.items} onCreated={() => customers.load()}
+                    testid="exchange-customer" />
                   </div>
                 </div>
                 <div className="flex items-center justify-between rounded-lg border border-border/60 p-3">
