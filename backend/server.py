@@ -485,6 +485,13 @@ async def adjust_product_stock(pid: str, body: StockAdjustBody, user: dict = Dep
         raise HTTPException(status_code=400, detail=(
             f'Only {p.get("current_stock", 0)} {p.get("unit")} in stock — cannot remove {abs(body.delta)}'))
     await db.products.update_one({"id": pid}, {"$inc": {"current_stock": body.delta}})
+    # Recorded as a dated movement, not only in the audit text. The item report
+    # reconstructs opening stock by walking back from today's figure, so an
+    # adjustment with no date would silently unbalance every period before it.
+    await db.stock_adjustments.insert_one({
+        "id": str(uuid.uuid4()), "product_id": pid, "product_name": p["name"],
+        "delta": round(body.delta, 3), "reason": body.reason or "",
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "created_at": now_iso()})
     await log_audit(user, "Adjusted stock", (
         f'{p["name"]}: {p.get("current_stock", 0)} → {new_stock} {p.get("unit")} '
         f'({body.delta:+g}){" · " + body.reason if body.reason else ""}'))
@@ -2893,6 +2900,712 @@ async def bank_summary(user: dict = Depends(get_current_user)):
         a["unreconciled_count"] = await db.bank_txns.count_documents({"bank_id": a["id"], "reconciled": False})
     return {"accounts": accounts,
             "total_balance": round(sum(a["balance"] for a in accounts if a.get("active") is not False), 2)}
+
+# ==================== Reports ====================
+# Every report returns the same shape — columns, rows, summary — so the date
+# filters and the print, PDF and Excel exports are written once rather than
+# fourteen times. A new report is a builder function and a registry entry.
+
+def date_range(preset: str = None, start: str = None, end: str = None):
+    """Resolve a preset or an explicit range into (start, end) inclusive."""
+    today = datetime.now(timezone.utc).date()
+    p = (preset or "").lower().replace(" ", "-")
+    if p == "today":
+        return str(today), str(today)
+    if p == "yesterday":
+        y = today - timedelta(days=1)
+        return str(y), str(y)
+    if p in ("this-week", "week"):
+        return str(today - timedelta(days=today.weekday())), str(today)
+    if p in ("this-month", "month"):
+        return str(today.replace(day=1)), str(today)
+    if p in ("financial-year", "fy"):
+        # Indian financial year runs April to March.
+        fy_start = today.replace(month=4, day=1) if today.month >= 4 else today.replace(year=today.year - 1, month=4, day=1)
+        return str(fy_start), str(today)
+    return (start or "1900-01-01"), (end or str(today))
+
+def in_range(row, start, end, field="date"):
+    d = str(row.get(field, "") or "")
+    return bool(d) and start <= d <= end
+
+def col(key, label, kind="text", align=None):
+    return {"key": key, "label": label, "type": kind,
+            "align": align or ("right" if kind in ("money", "qty") else "left")}
+
+async def party_movements(name: str):
+    """Every debit and credit against one party, oldest first."""
+    rows = []
+    for coll, field, label in (("sales", "total", "Sale"), ("grinding", "total_charge", "Grinding"),
+                               ("oil", "total", "Oil extraction"), ("exchanges", "grinding_charge", "Exchange")):
+        for d in await db[coll].find({"customer_name": name}).to_list(5000):
+            if d.get(field):
+                rows.append({"date": d.get("date"), "particulars": f'{label} {d.get("invoice_number", "")}'.strip(),
+                             "debit": round(d.get(field, 0), 2), "credit": 0})
+    for d in await db.purchases.find({"supplier_name": name}).to_list(5000):
+        rows.append({"date": d.get("date"), "particulars": f'Purchase {d.get("product_name", "")}',
+                     "debit": round(d.get("total", 0), 2), "credit": 0})
+    for pay in await db.payments.find({"party_name": name}).to_list(5000):
+        amt = pay.get("amount", 0) or 0
+        note = pay.get("note") or "Payment"
+        mode = clean_mode(pay.get("payment_mode"))
+        if amt >= 0:
+            rows.append({"date": pay.get("date"), "particulars": f'{note} ({mode})', "debit": 0, "credit": round(amt, 2)})
+        else:
+            # Money paid back out to a customer is a debit on their account.
+            rows.append({"date": pay.get("date"), "particulars": f'{note} ({mode})', "debit": round(abs(amt), 2), "credit": 0})
+    rows.sort(key=lambda r: str(r.get("date") or ""))
+    return rows
+
+async def product_movements(start: str, end: str):
+    """Stock in and out per product, split by what caused it.
+
+    Opening is derived by walking today's figure back through everything dated
+    on or after the start, because the app stores a running stock rather than a
+    movement history. Adjustments are included, which is why they are recorded
+    with a date.
+    """
+    products = [clean(p) for p in await db.products.find().sort("name", 1).to_list(2000)]
+    by_name = {p["name"]: p for p in products}
+    acc = {p["name"]: {"purchased": 0.0, "sold": 0.0, "produced": 0.0, "consumed": 0.0,
+                       "adjusted": 0.0, "after_start": 0.0} for p in products}
+
+    def touch(name, qty, bucket, date):
+        if name not in acc:
+            return
+        if start <= str(date or "") <= end:
+            acc[name][bucket] += qty
+        if str(date or "") >= start:
+            acc[name]["after_start"] += qty
+
+    for d in await db.purchases.find().to_list(20000):
+        touch(d.get("product_name"), d.get("quantity", 0) or 0, "purchased", d.get("date"))
+    for d in await db.sales.find().to_list(20000):
+        touch(d.get("product_name"), -(d.get("quantity", 0) or 0), "sold", d.get("date"))
+    for d in await db.production.find().to_list(20000):
+        touch(d.get("input_product_name"), -(d.get("input_quantity", 0) or 0), "consumed", d.get("date"))
+        for o in d.get("outputs", []):
+            touch(o.get("product_name"), o.get("quantity", 0) or 0, "produced", d.get("date"))
+    for d in await db.grinding.find().to_list(20000):
+        method = normalise_method(d.get("payment_method"))
+        if method == FLOUR_DEDUCTION and d.get("deducted_flour"):
+            touch(grinding_output_name(d), d["deducted_flour"], "produced", d.get("date"))
+        elif method == GRAIN_DEDUCTION and d.get("grain_qty"):
+            touch(d.get("grain_item") or "Wheat Crop", d["grain_qty"], "purchased", d.get("date"))
+    for d in await db.exchanges.find().to_list(20000):
+        touch("Wheat Crop", d.get("wheat_qty", 0) or 0, "purchased", d.get("date"))
+        touch("Atta", -(d.get("final_flour_delivered", d.get("atta_given", 0)) or 0), "sold", d.get("date"))
+    for d in await db.oil.find().to_list(20000):
+        for field, name in (("retained_oil", "Mustard Oil"), ("retained_cake", "Mustard Oil Cake"),
+                            ("cake_sold_to_shop", "Mustard Oil Cake")):
+            if d.get(field):
+                touch(name, d[field], "purchased", d.get("date"))
+    for d in await db.stock_adjustments.find().to_list(20000):
+        touch(d.get("product_name"), d.get("delta", 0) or 0, "adjusted", d.get("date"))
+
+    rows = []
+    for name, a in acc.items():
+        prod = by_name[name]
+        current = prod.get("current_stock", 0) or 0
+        opening = round(current - a["after_start"], 3)
+        moved = a["purchased"] + a["sold"] + a["produced"] + a["consumed"] + a["adjusted"]
+        rows.append({
+            "item": name, "unit": prod.get("unit", "kg"), "category": prod.get("category", ""),
+            "opening": opening,
+            "purchased": round(a["purchased"], 3),
+            "sold": round(abs(a["sold"]), 3),
+            "produced": round(a["produced"], 3),
+            "consumed": round(abs(a["consumed"]), 3),
+            "adjusted": round(a["adjusted"], 3),
+            "closing": round(opening + moved, 3),
+            "current": round(current, 3),
+            "rate": prod.get("rate", 0), "cost_per_unit": prod.get("cost_per_unit", 0),
+            "value": round(current * (prod.get("cost_per_unit", 0) or 0), 2),
+        })
+    return rows
+
+async def rep_sales(start, end, party=None, item=None, **_):
+    rows = [clean(d) for d in await db.sales.find().sort("date", -1).to_list(20000)]
+    rows = [r for r in rows if in_range(r, start, end)]
+    if party: rows = [r for r in rows if r.get("customer_name") == party]
+    if item: rows = [r for r in rows if r.get("product_name") == item]
+    units = {p["name"]: p.get("unit", "kg") for p in await db.products.find().to_list(2000)}
+    out = [{"date": r.get("date"), "invoice": r.get("invoice_number", ""), "customer": r.get("customer_name", ""),
+            "item": r.get("product_name", ""), "qty": f'{r.get("quantity", 0)} {units.get(r.get("product_name"), "")}'.strip(),
+            "rate": r.get("price", 0), "total": r.get("total", 0),
+            "paid": r.get("amount_paid", 0) or 0, "balance": r.get("balance_due", 0) or 0,
+            "status": r.get("payment_status", "")} for r in rows]
+    return {"columns": [col("date", "Date"), col("invoice", "Invoice"), col("customer", "Customer"),
+                        col("item", "Item"), col("qty", "Qty", "qty"), col("rate", "Rate", "money"),
+                        col("total", "Total", "money"), col("paid", "Paid", "money"),
+                        col("balance", "Balance", "money"), col("status", "Status")],
+            "rows": out,
+            "summary": [{"label": "Sales", "value": round(sum(r["total"] for r in out), 2), "type": "money"},
+                        {"label": "Received", "value": round(sum(r["paid"] for r in out), 2), "type": "money"},
+                        {"label": "Outstanding", "value": round(sum(r["balance"] for r in out), 2), "type": "money"},
+                        {"label": "Bills", "value": len(out)}]}
+
+async def rep_purchases(start, end, party=None, item=None, **_):
+    rows = [clean(d) for d in await db.purchases.find().sort("date", -1).to_list(20000)]
+    rows = [r for r in rows if in_range(r, start, end)]
+    if party: rows = [r for r in rows if r.get("supplier_name") == party]
+    if item: rows = [r for r in rows if r.get("product_name") == item]
+    out = [{"date": r.get("date"), "supplier": r.get("supplier_name", ""), "item": r.get("product_name", ""),
+            "qty": r.get("quantity", 0), "rate": r.get("rate", 0), "total": r.get("total", 0),
+            "paid": r.get("amount_paid", 0) or 0, "balance": r.get("balance_due", 0) or 0,
+            "status": r.get("payment_status", "")} for r in rows]
+    return {"columns": [col("date", "Date"), col("supplier", "Supplier"), col("item", "Item"),
+                        col("qty", "Qty", "qty"), col("rate", "Rate", "money"), col("total", "Total", "money"),
+                        col("paid", "Paid", "money"), col("balance", "Balance", "money"), col("status", "Status")],
+            "rows": out,
+            "summary": [{"label": "Purchases", "value": round(sum(r["total"] for r in out), 2), "type": "money"},
+                        {"label": "Paid", "value": round(sum(r["paid"] for r in out), 2), "type": "money"},
+                        {"label": "Due to suppliers", "value": round(sum(r["balance"] for r in out), 2), "type": "money"}]}
+
+async def rep_grinding(start, end, party=None, **_):
+    rows = [clean(d) for d in await db.grinding.find().sort("date", -1).to_list(20000)]
+    rows = [r for r in rows if in_range(r, start, end)]
+    if party: rows = [r for r in rows if r.get("customer_name") == party]
+    out = [{"date": r.get("date"), "invoice": r.get("invoice_number", ""), "customer": r.get("customer_name", ""),
+            "item": r.get("grain_type", "Wheat"), "wheat": r.get("wheat_weight", 0),
+            "output": r.get("output_atta", 0), "method": normalise_method(r.get("payment_method")),
+            "deducted": r.get("deducted_flour", 0) or 0,
+            "percent": (round((r.get("deducted_flour", 0) or 0) / r["output_atta"] * 100, 2)
+                        if r.get("output_atta") else 0),
+            "delivered": r.get("final_flour_delivered", r.get("customer_receives", 0)) or 0,
+            "grain": f'{r.get("grain_qty", 0)} {r.get("grain_item", "")}'.strip() if r.get("grain_qty") else "",
+            "charge": r.get("total_charge", 0), "status": r.get("payment_status", "")} for r in rows]
+    return {"columns": [col("date", "Date"), col("invoice", "Invoice"), col("customer", "Customer"),
+                        col("item", "Item"), col("wheat", "In (kg)", "qty"), col("output", "Output (kg)", "qty"),
+                        col("method", "Paid by"), col("deducted", "Flour kept", "qty"),
+                        col("percent", "Deduction %", "qty"), col("delivered", "Delivered", "qty"),
+                        col("grain", "Grain taken"), col("charge", "Charge", "money"), col("status", "Status")],
+            "rows": out,
+            "summary": [{"label": "Grinding charges", "value": round(sum(r["charge"] for r in out), 2), "type": "money"},
+                        {"label": "Wheat ground", "value": round(sum(r["wheat"] for r in out), 2)},
+                        {"label": "Flour kept as fees", "value": round(sum(r["deducted"] for r in out), 3)},
+                        {"label": "Jobs", "value": len(out)}]}
+
+async def rep_party_ledger(start, end, party=None, kind="customer", **_):
+    coll = "customers" if kind == "customer" else "suppliers"
+    if not party:
+        # No party chosen: summarise every one of them instead of an empty page.
+        parties = [clean(x) for x in await db[coll].find().sort("name", 1).to_list(5000)]
+        rows = []
+        for x in parties:
+            movements = await party_movements(x["name"])
+            deb = sum(m["debit"] for m in movements if in_range(m, start, end))
+            cre = sum(m["credit"] for m in movements if in_range(m, start, end))
+            bal = round(sum(m["debit"] - m["credit"] for m in movements) + (x.get("opening_balance", 0) or 0), 2)
+            if deb or cre or bal:
+                rows.append({"party": x["name"], "phone": x.get("phone", ""), "debit": round(deb, 2),
+                             "credit": round(cre, 2), "balance": bal})
+        return {"columns": [col("party", "Name"), col("phone", "Mobile"), col("debit", "Billed", "money"),
+                            col("credit", "Paid", "money"), col("balance", "Balance", "money")],
+                "rows": rows,
+                "summary": [{"label": "Billed", "value": round(sum(r["debit"] for r in rows), 2), "type": "money"},
+                            {"label": "Received" if kind == "customer" else "Paid",
+                             "value": round(sum(r["credit"] for r in rows), 2), "type": "money"},
+                            {"label": "Outstanding", "value": round(sum(r["balance"] for r in rows), 2), "type": "money"}]}
+
+    master = await db[coll].find_one({"party_key": party_key(party)})
+    opening = (master or {}).get("opening_balance", 0) or 0
+    movements = await party_movements(party)
+    before_start = sum(m["debit"] - m["credit"] for m in movements if str(m.get("date") or "") < start)
+    running = round(opening + before_start, 2)
+    rows = [{"date": start, "particulars": "Opening balance", "debit": "", "credit": "", "balance": running}]
+    for m in movements:
+        if not in_range(m, start, end):
+            continue
+        running = round(running + m["debit"] - m["credit"], 2)
+        rows.append({"date": m["date"], "particulars": m["particulars"],
+                     "debit": m["debit"] or "", "credit": m["credit"] or "", "balance": running})
+    return {"columns": [col("date", "Date"), col("particulars", "Particulars"), col("debit", "Debit", "money"),
+                        col("credit", "Credit", "money"), col("balance", "Balance", "money")],
+            "rows": rows,
+            "summary": [{"label": "Closing balance", "value": running, "type": "money"},
+                        {"label": "Entries", "value": max(len(rows) - 1, 0)}]}
+
+async def rep_customer_ledger(start, end, party=None, **kw):
+    return await rep_party_ledger(start, end, party, kind="customer")
+
+async def rep_supplier_ledger(start, end, party=None, **kw):
+    return await rep_party_ledger(start, end, party, kind="supplier")
+
+async def rep_cash_ledger(start, end, **_):
+    settings = await get_settings_doc()
+    payments = await db.payments.find().to_list(30000)
+    expenses = [clean(e) for e in await db.expenses.find().to_list(20000)]
+    cash_rows = [p for p in payments if clean_mode(p.get("payment_mode")) == "Cash"]
+
+    def signed(p):
+        # Customer receipts come in; refunds and supplier payments go out.
+        amt = p.get("amount", 0) or 0
+        return amt if (p.get("party_type") == "customer" and amt >= 0) else -abs(amt)
+
+    opening = round((settings.get("starting_cash", 0) or 0)
+                    + sum(signed(p) for p in cash_rows if str(p.get("date") or "") < start)
+                    - sum(e.get("amount", 0) for e in expenses if str(e.get("date") or "") < start), 2)
+    entries = []
+    for p in cash_rows:
+        if in_range(p, start, end):
+            amt = signed(p)
+            entries.append({"date": p.get("date"), "particulars": f'{p.get("party_name", "")} · {p.get("note", "")}'.strip(" ·"),
+                            "receipt": round(amt, 2) if amt > 0 else "", "payment": round(-amt, 2) if amt < 0 else ""})
+    for e in expenses:
+        if in_range(e, start, end):
+            entries.append({"date": e.get("date"), "particulars": f'Expense · {e.get("category", "")} {e.get("description", "")}'.strip(),
+                            "receipt": "", "payment": round(e.get("amount", 0), 2)})
+    entries.sort(key=lambda r: str(r.get("date") or ""))
+    running = opening
+    rows = [{"date": start, "particulars": "Opening balance", "receipt": "", "payment": "", "balance": running}]
+    for e in entries:
+        running = round(running + (e["receipt"] or 0) - (e["payment"] or 0), 2)
+        rows.append({**e, "balance": running})
+    return {"columns": [col("date", "Date"), col("particulars", "Particulars"), col("receipt", "Receipt", "money"),
+                        col("payment", "Payment", "money"), col("balance", "Balance", "money")],
+            "rows": rows,
+            "summary": [{"label": "Opening", "value": opening, "type": "money"},
+                        {"label": "Receipts", "value": round(sum(e["receipt"] or 0 for e in entries), 2), "type": "money"},
+                        {"label": "Payments", "value": round(sum(e["payment"] or 0 for e in entries), 2), "type": "money"},
+                        {"label": "Closing", "value": running, "type": "money"}]}
+
+async def rep_bank_ledger(start, end, bank_id=None, mode=None, **_):
+    q = {}
+    if bank_id: q["bank_id"] = bank_id
+    if mode: q["mode"] = clean_mode(mode)
+    txns = [clean(t) for t in await db.bank_txns.find(q).sort("date", 1).to_list(30000)]
+    accounts = {a["id"]: a for a in await db.bank_accounts.find().to_list(200)}
+    opening_base = sum((a.get("opening_balance", 0) or 0) for a in accounts.values()
+                       if not bank_id or a["id"] == bank_id)
+    opening = round(opening_base + sum(t.get("amount", 0) for t in txns if str(t.get("date") or "") < start), 2)
+    running = opening
+    rows = [{"date": start, "bank": "", "particulars": "Opening balance", "mode": "", "reference": "",
+             "receipt": "", "payment": "", "balance": running}]
+    receipts = payments_out = 0.0
+    for t in txns:
+        if not in_range(t, start, end):
+            continue
+        amt = t.get("amount", 0) or 0
+        running = round(running + amt, 2)
+        if amt >= 0: receipts += amt
+        else: payments_out += -amt
+        rows.append({"date": t.get("date"), "bank": accounts.get(t.get("bank_id"), {}).get("bank_name", ""),
+                     "particulars": f'{t.get("txn_type")} · {t.get("party_name", "")}'.strip(" ·"),
+                     "mode": t.get("mode", ""), "reference": t.get("reference", ""),
+                     "receipt": round(amt, 2) if amt >= 0 else "", "payment": round(-amt, 2) if amt < 0 else "",
+                     "balance": running})
+    return {"columns": [col("date", "Date"), col("bank", "Account"), col("particulars", "Particulars"),
+                        col("mode", "Mode"), col("reference", "Reference"), col("receipt", "Receipt", "money"),
+                        col("payment", "Payment", "money"), col("balance", "Balance", "money")],
+            "rows": rows,
+            "summary": [{"label": "Opening", "value": opening, "type": "money"},
+                        {"label": "Received", "value": round(receipts, 2), "type": "money"},
+                        {"label": "Paid", "value": round(payments_out, 2), "type": "money"},
+                        {"label": "Closing", "value": running, "type": "money"}]}
+
+async def rep_material_ledger(start, end, party=None, item=None, **_):
+    rows = [clean(r) for r in await db.material_ledger.find().sort("date", -1).to_list(30000)]
+    rows = [r for r in rows if in_range(r, start, end)]
+    if party: rows = [r for r in rows if r.get("party_name") == party]
+    if item: rows = [r for r in rows if r.get("item") == item]
+    out = [{"date": r.get("date"), "party": r.get("party_name", ""), "item": r.get("item", ""),
+            "qty": r.get("qty", 0), "unit": r.get("unit", "kg"), "value": r.get("value", 0),
+            "note": r.get("note", "")} for r in rows]
+    return {"columns": [col("date", "Date"), col("party", "Party"), col("item", "Item"),
+                        col("qty", "Quantity", "qty"), col("unit", "Unit"), col("value", "Value", "money"),
+                        col("note", "Particulars")],
+            "rows": out,
+            "summary": [{"label": "Received in kind", "value": round(sum(r["qty"] for r in out), 3)},
+                        {"label": "Value", "value": round(sum(r["value"] for r in out), 2), "type": "money"}]}
+
+async def rep_stock(start, end, item=None, **_):
+    rows = await product_movements(start, end)
+    if item: rows = [r for r in rows if r["item"] == item]
+    return {"columns": [col("item", "Item"), col("category", "Category"), col("unit", "Unit"),
+                        col("opening", "Opening", "qty"), col("purchased", "Purchased", "qty"),
+                        col("produced", "Produced", "qty"), col("sold", "Sold", "qty"),
+                        col("consumed", "Consumed", "qty"), col("adjusted", "Adjusted", "qty"),
+                        col("closing", "Closing", "qty"), col("current", "Available now", "qty"),
+                        col("value", "Stock value", "money")],
+            "rows": rows,
+            "summary": [{"label": "Items", "value": len(rows)},
+                        {"label": "Stock value", "value": round(sum(r["value"] for r in rows), 2), "type": "money"}]}
+
+async def rep_item_wise(start, end, item=None, **_):
+    """Same movements as the stock report, limited to items that actually moved."""
+    rows = [r for r in await product_movements(start, end)
+            if r["purchased"] or r["sold"] or r["produced"] or r["consumed"] or r["adjusted"]]
+    if item: rows = [r for r in rows if r["item"] == item]
+    return {"columns": [col("item", "Item"), col("unit", "Unit"), col("opening", "Opening", "qty"),
+                        col("purchased", "Purchased", "qty"), col("produced", "Produced", "qty"),
+                        col("sold", "Sold", "qty"), col("consumed", "Consumed", "qty"),
+                        col("closing", "Closing", "qty"), col("current", "Available now", "qty")],
+            "rows": rows,
+            "summary": [{"label": "Items moved", "value": len(rows)},
+                        {"label": "Sold", "value": round(sum(r["sold"] for r in rows), 3)},
+                        {"label": "Purchased", "value": round(sum(r["purchased"] for r in rows), 3)}]}
+
+async def _money_flows(start, end):
+    """Receipts and payments in a period, split by how the money moved."""
+    payments = await db.payments.find().to_list(30000)
+    expenses = [clean(e) for e in await db.expenses.find().to_list(20000)]
+    inflow, outflow = {}, {}
+    for pay in payments:
+        if not in_range(pay, start, end):
+            continue
+        mode = clean_mode(pay.get("payment_mode"))
+        if is_material_mode(mode):
+            continue  # settled in kind — no money moved
+        amt = pay.get("amount", 0) or 0
+        if pay.get("party_type") == "customer" and amt >= 0:
+            inflow[mode] = round(inflow.get(mode, 0) + amt, 2)
+        else:
+            outflow[mode] = round(outflow.get(mode, 0) + abs(amt), 2)
+    exp_total = round(sum(e.get("amount", 0) for e in expenses if in_range(e, start, end)), 2)
+    outflow["Cash"] = round(outflow.get("Cash", 0) + exp_total, 2)
+    return inflow, outflow, exp_total
+
+async def rep_daily_summary(start, end, **_):
+    inflow, outflow, exp_total = await _money_flows(start, end)
+    cash = await rep_cash_ledger(start, end)
+    bank = await rep_bank_ledger(start, end)
+    sales = await rep_sales(start, end)
+    purch = await rep_purchases(start, end)
+    grind = await rep_grinding(start, end)
+    rows = [
+        {"head": "Sales", "amount": sales["summary"][0]["value"]},
+        {"head": "Grinding charges", "amount": grind["summary"][0]["value"]},
+        {"head": "Purchases", "amount": purch["summary"][0]["value"]},
+        {"head": "Expenses", "amount": exp_total},
+        {"head": "Cash received", "amount": inflow.get("Cash", 0)},
+        {"head": "Bank received", "amount": round(sum(v for k, v in inflow.items() if k != "Cash"), 2)},
+        {"head": "Cash opening", "amount": cash["summary"][0]["value"]},
+        {"head": "Cash closing", "amount": cash["summary"][3]["value"]},
+        {"head": "Bank opening", "amount": bank["summary"][0]["value"]},
+        {"head": "Bank closing", "amount": bank["summary"][3]["value"]},
+    ]
+    return {"columns": [col("head", "Particulars"), col("amount", "Amount", "money")],
+            "rows": rows,
+            "summary": [{"label": "Total receipts", "value": round(sum(inflow.values()), 2), "type": "money"},
+                        {"label": "Total payments", "value": round(sum(outflow.values()), 2), "type": "money"},
+                        {"label": "Cash closing", "value": cash["summary"][3]["value"], "type": "money"},
+                        {"label": "Bank closing", "value": bank["summary"][3]["value"], "type": "money"}]}
+
+async def rep_bank_book(start, end, **_):
+    """Receipts and payments per bank mode, with the day's opening and closing."""
+    inflow, outflow, _ = await _money_flows(start, end)
+    bank = await rep_bank_ledger(start, end)
+    rows = []
+    for mode in BANK_MODES:
+        got, paid = inflow.get(mode, 0), outflow.get(mode, 0)
+        if got or paid:
+            rows.append({"mode": mode, "receipts": got, "payments": paid, "net": round(got - paid, 2)})
+    return {"columns": [col("mode", "Mode"), col("receipts", "Receipts", "money"),
+                        col("payments", "Payments", "money"), col("net", "Net", "money")],
+            "rows": rows,
+            "summary": [{"label": "Opening", "value": bank["summary"][0]["value"], "type": "money"},
+                        {"label": "Total receipts", "value": round(sum(r["receipts"] for r in rows), 2), "type": "money"},
+                        {"label": "Total payments", "value": round(sum(r["payments"] for r in rows), 2), "type": "money"},
+                        {"label": "Closing", "value": bank["summary"][3]["value"], "type": "money"}]}
+
+async def rep_outstanding(start, end, **_):
+    """Everything still owed, both directions. Ignores the date range on
+    purpose: a balance is what it is today, not what it was in a window."""
+    rows = []
+    for c in await db.customers.find().sort("name", 1).to_list(5000):
+        movements = await party_movements(c["name"])
+        bal = round(sum(m["debit"] - m["credit"] for m in movements) + (c.get("opening_balance", 0) or 0), 2)
+        if abs(bal) >= 0.01:
+            rows.append({"party": c["name"], "type": "Customer", "phone": c.get("phone", ""),
+                         "receivable": bal if bal > 0 else "", "payable": -bal if bal < 0 else ""})
+    for sup in await db.suppliers.find().sort("name", 1).to_list(5000):
+        movements = await party_movements(sup["name"])
+        bal = round(sum(m["debit"] - m["credit"] for m in movements) + (sup.get("opening_balance", 0) or 0), 2)
+        if abs(bal) >= 0.01:
+            rows.append({"party": sup["name"], "type": "Supplier", "phone": sup.get("phone", ""),
+                         "receivable": -bal if bal < 0 else "", "payable": bal if bal > 0 else ""})
+    return {"columns": [col("party", "Party"), col("type", "Type"), col("phone", "Mobile"),
+                        col("receivable", "Receivable", "money"), col("payable", "Payable", "money")],
+            "rows": rows,
+            "summary": [{"label": "Receivable", "value": round(sum(r["receivable"] or 0 for r in rows), 2), "type": "money"},
+                        {"label": "Payable", "value": round(sum(r["payable"] or 0 for r in rows), 2), "type": "money"}]}
+
+async def rep_day_book(start, end, **_):
+    """Every transaction in the period, in date order, whatever its kind."""
+    rows = []
+    units = {p["name"]: p.get("unit", "kg") for p in await db.products.find().to_list(2000)}
+    for d in await db.sales.find().to_list(20000):
+        if in_range(d, start, end):
+            rows.append({"date": d.get("date"), "type": "Sale", "reference": d.get("invoice_number", ""),
+                         "party": d.get("customer_name", ""),
+                         "particulars": f'{d.get("quantity", 0)} {units.get(d.get("product_name"), "")} {d.get("product_name", "")}'.strip(),
+                         "amount": d.get("total", 0)})
+    for d in await db.purchases.find().to_list(20000):
+        if in_range(d, start, end):
+            rows.append({"date": d.get("date"), "type": "Purchase", "reference": "",
+                         "party": d.get("supplier_name", ""),
+                         "particulars": f'{d.get("quantity", 0)} {d.get("product_name", "")}',
+                         "amount": d.get("total", 0)})
+    for d in await db.grinding.find().to_list(20000):
+        if in_range(d, start, end):
+            rows.append({"date": d.get("date"), "type": "Grinding", "reference": d.get("invoice_number", ""),
+                         "party": d.get("customer_name", ""),
+                         "particulars": f'{d.get("wheat_weight", 0)} kg · {normalise_method(d.get("payment_method"))}',
+                         "amount": d.get("total_charge", 0)})
+    for d in await db.oil.find().to_list(20000):
+        if in_range(d, start, end):
+            rows.append({"date": d.get("date"), "type": "Oil", "reference": d.get("invoice_number", ""),
+                         "party": d.get("customer_name", ""),
+                         "particulars": f'{d.get("quantity_received", 0)} kg {d.get("seed_type", "")}',
+                         "amount": d.get("total", 0)})
+    for d in await db.exchanges.find().to_list(20000):
+        if in_range(d, start, end):
+            rows.append({"date": d.get("date"), "type": "Exchange", "reference": d.get("invoice_number", ""),
+                         "party": d.get("customer_name", ""),
+                         "particulars": f'{d.get("wheat_qty", 0)} kg wheat for flour',
+                         "amount": d.get("grinding_charge", 0)})
+    for d in await db.expenses.find().to_list(20000):
+        if in_range(d, start, end):
+            rows.append({"date": d.get("date"), "type": "Expense", "reference": "", "party": "",
+                         "particulars": f'{d.get("category", "")} {d.get("description", "")}'.strip(),
+                         "amount": d.get("amount", 0)})
+    rows.sort(key=lambda r: (str(r.get("date") or ""), r["type"]))
+    income = sum(r["amount"] for r in rows if r["type"] in ("Sale", "Grinding", "Oil", "Exchange"))
+    return {"columns": [col("date", "Date"), col("type", "Type"), col("reference", "Reference"),
+                        col("party", "Party"), col("particulars", "Particulars"), col("amount", "Amount", "money")],
+            "rows": rows,
+            "summary": [{"label": "Entries", "value": len(rows)},
+                        {"label": "Income", "value": round(income, 2), "type": "money"},
+                        {"label": "Purchases", "value": round(sum(r["amount"] for r in rows if r["type"] == "Purchase"), 2), "type": "money"},
+                        {"label": "Expenses", "value": round(sum(r["amount"] for r in rows if r["type"] == "Expense"), 2), "type": "money"}]}
+
+async def rep_profit_loss(start, end, **_):
+    sales = [d for d in await db.sales.find().to_list(30000) if in_range(d, start, end)]
+    grind = [d for d in await db.grinding.find().to_list(30000) if in_range(d, start, end)]
+    oil = [d for d in await db.oil.find().to_list(30000) if in_range(d, start, end)]
+    exch = [d for d in await db.exchanges.find().to_list(30000) if in_range(d, start, end)]
+    expenses = [d for d in await db.expenses.find().to_list(30000) if in_range(d, start, end)]
+    products = {p["name"]: p for p in await db.products.find().to_list(2000)}
+    cost_by_name = {n: p.get("cost_per_unit", 0) or 0 for n, p in products.items()}
+
+    sale_income = round(sum(d.get("total", 0) for d in sales), 2)
+    cogs = round(sum(sale_cogs(d, cost_by_name) for d in sales), 2)
+    grind_income = round(sum(d.get("total_charge", 0) for d in grind), 2)
+    oil_income = round(sum(d.get("total", 0) for d in oil), 2)
+    exch_income = round(sum(d.get("grinding_charge", 0) for d in exch), 2)
+    exp_total = round(sum(d.get("amount", 0) for d in expenses), 2)
+
+    by_cat = {}
+    for e in expenses:
+        by_cat[e.get("category", "Other")] = round(by_cat.get(e.get("category", "Other"), 0) + e.get("amount", 0), 2)
+
+    rows = [{"head": "Sales income", "amount": sale_income},
+            {"head": "Less: cost of goods sold", "amount": -cogs},
+            {"head": "Gross profit on sales", "amount": round(sale_income - cogs, 2)},
+            {"head": "Grinding charges", "amount": grind_income},
+            {"head": "Oil extraction charges", "amount": oil_income},
+            {"head": "Exchange grinding charges", "amount": exch_income}]
+    rows += [{"head": f'Expense · {k}', "amount": -v} for k, v in sorted(by_cat.items())]
+    net = round(sale_income - cogs + grind_income + oil_income + exch_income - exp_total, 2)
+    rows.append({"head": "Net profit" if net >= 0 else "Net loss", "amount": net})
+    return {"columns": [col("head", "Particulars"), col("amount", "Amount", "money")],
+            "rows": rows,
+            "summary": [{"label": "Income", "value": round(sale_income + grind_income + oil_income + exch_income, 2), "type": "money"},
+                        {"label": "Cost of goods sold", "value": cogs, "type": "money"},
+                        {"label": "Expenses", "value": exp_total, "type": "money"},
+                        {"label": "Net profit" if net >= 0 else "Net loss", "value": net, "type": "money"}]}
+
+async def rep_trial_balance(start, end, **_):
+    """A trial balance over the accounts this app actually keeps.
+
+    The app has no chart of accounts, so this is built from the real balances it
+    does hold — cash, each bank account, party balances, stock at cost, and the
+    income and expense totals for the period — rather than inventing ledgers it
+    does not maintain.
+    """
+    cash = await rep_cash_ledger(start, end)
+    rows = [{"account": "Cash in hand", "debit": max(cash["summary"][3]["value"], 0),
+             "credit": max(-cash["summary"][3]["value"], 0)}]
+    for a in await db.bank_accounts.find().sort("bank_name", 1).to_list(200):
+        bal = await bank_balance(a["id"])
+        rows.append({"account": f'Bank · {a.get("bank_name")}', "debit": max(bal, 0), "credit": max(-bal, 0)})
+
+    out = await rep_outstanding(start, end)
+    receivable = out["summary"][0]["value"]
+    payable = out["summary"][1]["value"]
+    rows.append({"account": "Accounts receivable", "debit": receivable, "credit": 0})
+    rows.append({"account": "Accounts payable", "debit": 0, "credit": payable})
+
+    stock = await rep_stock(start, end)
+    rows.append({"account": "Closing stock (at cost)", "debit": stock["summary"][1]["value"], "credit": 0})
+
+    pl = await rep_profit_loss(start, end)
+    rows.append({"account": "Income", "debit": 0, "credit": pl["summary"][0]["value"]})
+    rows.append({"account": "Cost of goods sold", "debit": pl["summary"][1]["value"], "credit": 0})
+    rows.append({"account": "Expenses", "debit": pl["summary"][2]["value"], "credit": 0})
+
+    td = round(sum(r["debit"] for r in rows), 2)
+    tc = round(sum(r["credit"] for r in rows), 2)
+    return {"columns": [col("account", "Account"), col("debit", "Debit", "money"), col("credit", "Credit", "money")],
+            "rows": rows,
+            "summary": [{"label": "Total debit", "value": td, "type": "money"},
+                        {"label": "Total credit", "value": tc, "type": "money"},
+                        {"label": "Difference", "value": round(td - tc, 2), "type": "money"}],
+            "note": ("Built from the balances this app keeps — cash, banks, party balances, stock at cost "
+                     "and the period's income and expenses. It is not a double-entry trial balance, so the "
+                     "two sides are not expected to agree exactly.")}
+
+# Registry. `party` says which picker the filter bar should offer, so the
+# frontend does not need its own table of which report takes what.
+REPORTS = {
+    "daily-summary":    {"title": "Daily Transaction Summary", "group": "Daily",   "fn": "rep_daily_summary"},
+    "cash-book":        {"title": "Cash Book",                 "group": "Daily",   "fn": "rep_cash_ledger"},
+    "bank-book":        {"title": "Bank Book",                 "group": "Daily",   "fn": "rep_bank_book"},
+    "day-book":         {"title": "Day Book",                  "group": "Daily",   "fn": "rep_day_book"},
+    "item-wise":        {"title": "Item-wise Movement",        "group": "Stock",   "fn": "rep_item_wise", "item": True},
+    "stock":            {"title": "Stock Report",              "group": "Stock",   "fn": "rep_stock",     "item": True},
+    "sales":            {"title": "Sales Report",              "group": "Trading", "fn": "rep_sales",     "party": "customer", "item": True},
+    "purchases":        {"title": "Purchase Report",           "group": "Trading", "fn": "rep_purchases", "party": "supplier", "item": True},
+    "grinding":         {"title": "Grinding Report",           "group": "Trading", "fn": "rep_grinding",  "party": "customer"},
+    "customer-ledger":  {"title": "Customer Ledger",           "group": "Ledgers", "fn": "rep_customer_ledger", "party": "customer"},
+    "supplier-ledger":  {"title": "Supplier Ledger",           "group": "Ledgers", "fn": "rep_supplier_ledger", "party": "supplier"},
+    "cash-ledger":      {"title": "Cash Ledger",               "group": "Ledgers", "fn": "rep_cash_ledger"},
+    "bank-ledger":      {"title": "Bank Ledger",               "group": "Ledgers", "fn": "rep_bank_ledger", "bank": True},
+    "material-ledger":  {"title": "Grain / Material Ledger",   "group": "Ledgers", "fn": "rep_material_ledger", "party": "customer", "item": True},
+    "outstanding":      {"title": "Outstanding (Dues)",        "group": "Summary", "fn": "rep_outstanding"},
+    "profit-loss":      {"title": "Profit & Loss",             "group": "Summary", "fn": "rep_profit_loss"},
+    "trial-balance":    {"title": "Trial Balance",             "group": "Summary", "fn": "rep_trial_balance"},
+}
+
+@api_router.get("/reports")
+async def list_reports(user: dict = Depends(get_current_user)):
+    return [{"key": k, "title": v["title"], "group": v["group"],
+             "party": v.get("party"), "item": bool(v.get("item")), "bank": bool(v.get("bank"))}
+            for k, v in REPORTS.items()]
+
+async def run_report(key: str, preset=None, start=None, end=None, party=None,
+                     item=None, bank_id=None, mode=None):
+    spec = REPORTS.get(key)
+    if not spec:
+        raise HTTPException(status_code=404, detail=f"Unknown report: {key}")
+    s_date, e_date = date_range(preset, start, end)
+    data = await globals()[spec["fn"]](s_date, e_date, party=party, item=item,
+                                       bank_id=bank_id, mode=mode)
+    return {"key": key, "title": spec["title"], "start": s_date, "end": e_date,
+            "filters": {"party": party, "item": item, "bank_id": bank_id, "mode": mode},
+            **data}
+
+@api_router.get("/reports/{key}")
+async def get_report(key: str, preset: Optional[str] = None, start: Optional[str] = None,
+                     end: Optional[str] = None, party: Optional[str] = None,
+                     item: Optional[str] = None, bank_id: Optional[str] = None,
+                     mode: Optional[str] = None, user: dict = Depends(get_current_user)):
+    return await run_report(key, preset, start, end, party, item, bank_id, mode)
+
+def _fmt_cell(value, kind):
+    if value is None or value == "":
+        return ""
+    if kind in ("money", "qty") and isinstance(value, (int, float)):
+        return f'{value:,.2f}' if kind == "money" else f'{value:g}'
+    return str(value)
+
+def report_to_xlsx(report: dict) -> io.BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    # Excel rejects : \ / ? * [ ] in a sheet name and caps it at 31 characters,
+    # which "Grain / Material Ledger" falls foul of.
+    safe = report["title"]
+    for ch in ':\\/?*[]':
+        safe = safe.replace(ch, "-")
+    ws.title = safe[:31].strip() or "Report"
+    ws.append([report["title"]])
+    ws.append([f'{report["start"]} to {report["end"]}'])
+    applied = [f'{k}: {v}' for k, v in (report.get("filters") or {}).items() if v]
+    if applied:
+        ws.append([" · ".join(applied)])
+    ws.append([])
+    ws.append([c["label"] for c in report["columns"]])
+    for row in report["rows"]:
+        # Numbers stay numbers so Excel can sum them; only blanks are coerced.
+        ws.append([row.get(c["key"], "") if row.get(c["key"], "") != "" else "" for c in report["columns"]])
+    ws.append([])
+    for item in report.get("summary", []):
+        ws.append([item["label"], item["value"]])
+    for i, c in enumerate(report["columns"], start=1):
+        width = max(len(c["label"]) + 2,
+                    *(len(_fmt_cell(r.get(c["key"]), c["type"])) + 2 for r in report["rows"])) if report["rows"] else len(c["label"]) + 2
+        ws.column_dimensions[ws.cell(row=5, column=i).column_letter].width = min(width, 40)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+def report_to_pdf(report: dict) -> io.BytesIO:
+    buf = io.BytesIO()
+    # Landscape: these tables are wider than a portrait page can hold.
+    doc = SimpleDocTemplate(buf, pagesize=(A4[1], A4[0]), leftMargin=12*mm, rightMargin=12*mm,
+                            topMargin=12*mm, bottomMargin=12*mm)
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle("t", parent=styles["Heading1"], fontSize=15, spaceAfter=2)
+    small = ParagraphStyle("s", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
+    story = [Paragraph("Gangotri Flour &amp; Oil Mill", title),
+             Paragraph(f'<b>{report["title"]}</b> &nbsp; {report["start"]} to {report["end"]}', styles["Normal"])]
+    applied = [f'{k}: {v}' for k, v in (report.get("filters") or {}).items() if v]
+    if applied:
+        story.append(Paragraph(" · ".join(applied), small))
+    story.append(Spacer(1, 6))
+
+    head = [c["label"] for c in report["columns"]]
+    body = [[_fmt_cell(r.get(c["key"]), c["type"]) for c in report["columns"]] for r in report["rows"]]
+    if not body:
+        body = [["No entries for this period"] + [""] * (len(head) - 1)]
+    tbl = Table([head] + body, repeatRows=1)
+    style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f5132")),
+             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+             ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
+             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f6f6f6")])]
+    for i, c in enumerate(report["columns"]):
+        if c["align"] == "right":
+            style.append(("ALIGN", (i, 0), (i, -1), "RIGHT"))
+    tbl.setStyle(TableStyle(style))
+    story.append(tbl)
+
+    if report.get("summary"):
+        story.append(Spacer(1, 8))
+        srows = [[s["label"], _fmt_cell(s["value"], s.get("type", "text"))] for s in report["summary"]]
+        st = Table(srows, colWidths=[60*mm, 40*mm])
+        st.setStyle(TableStyle([("FONTSIZE", (0, 0), (-1, -1), 9),
+                                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                                ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+                                ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        story.append(st)
+    if report.get("note"):
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(report["note"], small))
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+@api_router.get("/reports/{key}/export")
+async def export_report(key: str, request: Request, format: str = "xlsx",
+                        preset: Optional[str] = None, start: Optional[str] = None,
+                        end: Optional[str] = None, party: Optional[str] = None,
+                        item: Optional[str] = None, bank_id: Optional[str] = None,
+                        mode: Optional[str] = None):
+    # Downloads open in a new tab, which cannot set an Authorization header, so
+    # the cookie is checked directly here rather than through the dependency.
+    await get_current_user(request)
+    report = await run_report(key, preset, start, end, party, item, bank_id, mode)
+    stamp = f'{report["start"]}_to_{report["end"]}'
+    if format == "pdf":
+        return StreamingResponse(report_to_pdf(report), media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{key}_{stamp}.pdf"'})
+    return StreamingResponse(report_to_xlsx(report),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{key}_{stamp}.xlsx"'})
 
 @api_router.get("/sales-analytics")
 async def sales_analytics(user: dict = Depends(get_current_user)):
