@@ -15,7 +15,7 @@ import { PartySelect } from "@/components/PartySelect";
 import { toast } from "sonner";
 
 const SEEDS = ["Mustard", "Groundnut", "Sesame", "Coconut", "Sunflower", "Other"];
-const empty = { date: today(), customer_name: "", seed_type: "Mustard", quantity_received: "", oil_extracted: "", oil_cake_produced: "", charge: "", payment_method: "Cash", retained_oil: "", retained_cake: "", cake_sold_to_shop: "", cake_rate: "", payment_status: "Pending", amount_paid: "", payment_mode: "Cash" };
+const empty = { date: today(), customer_name: "", seed_type: "Mustard", quantity_received: "", quantity_quintal: "", extraction_rate: "", oil_extracted: "", oil_cake_produced: "", charge: "", payment_method: "Cash", retained_oil: "", retained_cake: "", cake_sold_to_shop: "", cake_rate: "", payment_status: "Pending", amount_paid: "", payment_mode: "Cash" };
 
 export default function OilExtraction() {
   const oil = useList("/oil");
@@ -30,13 +30,13 @@ export default function OilExtraction() {
   const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
   const openEdit = (o) => {
     setEditingId(o.id);
-    setF({ date: o.date, customer_name: o.customer_name, seed_type: o.seed_type, quantity_received: String(o.quantity_received), oil_extracted: String(o.oil_extracted), oil_cake_produced: String(o.oil_cake_produced || ""), charge: String(o.charge), payment_method: o.payment_method || "Cash", retained_oil: String(o.retained_oil || ""), retained_cake: String(o.retained_cake || ""), cake_sold_to_shop: String(o.cake_sold_to_shop || ""), cake_rate: String(o.cake_rate || ""), payment_status: o.payment_status, amount_paid: "", payment_mode: o.payment_mode || "Cash" });
+    setF({ date: o.date, customer_name: o.customer_name, seed_type: o.seed_type, quantity_received: String(o.quantity_received), quantity_quintal: "", extraction_rate: o.extraction_rate ? String(o.extraction_rate) : "", oil_extracted: String(o.oil_extracted), oil_cake_produced: String(o.oil_cake_produced || ""), charge: String(o.charge), payment_method: o.payment_method || "Cash", retained_oil: String(o.retained_oil || ""), retained_cake: String(o.retained_cake || ""), cake_sold_to_shop: String(o.cake_sold_to_shop || ""), cake_rate: String(o.cake_rate || ""), payment_status: o.payment_status, amount_paid: "", payment_mode: o.payment_mode || "Cash" });
     setOpen(true);
   };
 
   const save = async () => {
     if (!f.customer_name || !f.quantity_received) return toast.error("Fill all fields");
-    const body = { date: f.date, customer_name: f.customer_name, seed_type: f.seed_type, quantity_received: +f.quantity_received, oil_extracted: +(f.oil_extracted || 0), oil_cake_produced: +(f.oil_cake_produced || 0), charge: +(f.charge || 0), payment_method: f.payment_method, retained_oil: +(f.retained_oil || 0), retained_cake: +(f.retained_cake || 0), cake_sold_to_shop: +(f.cake_sold_to_shop || 0), cake_rate: +(f.cake_rate || 0), payment_status: f.payment_status };
+    const body = { date: f.date, customer_name: f.customer_name, seed_type: f.seed_type, quantity_received: +f.quantity_received || 0, quantity_quintal: +f.quantity_quintal || 0, extraction_rate: +f.extraction_rate || 0, oil_extracted: +(f.oil_extracted || 0), oil_cake_produced: +(f.oil_cake_produced || 0), charge: +(f.charge || 0), payment_method: f.payment_method, retained_oil: +(f.retained_oil || 0), retained_cake: +(f.retained_cake || 0), cake_sold_to_shop: +(f.cake_sold_to_shop || 0), cake_rate: +(f.cake_rate || 0), payment_status: f.payment_status };
     if (!editingId) body.payment_mode = f.payment_mode;
     if (!editingId) body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
     try {
@@ -50,7 +50,10 @@ export default function OilExtraction() {
   };
 
   const cakeValue = (+f.cake_sold_to_shop || 0) * (+f.cake_rate || 0);
-  const netPayable = (+f.charge || 0) - cakeValue;
+  const seedKg = (+f.quantity_received || 0) + (+f.quantity_quintal || 0) * 100;
+  // Matches the backend: a rate per kg wins, a flat charge is the fallback.
+  const extractionCharge = (+f.extraction_rate || 0) ? seedKg * (+f.extraction_rate || 0) : (+f.charge || 0);
+  const netPayable = extractionCharge - cakeValue;
   const cakeOver = (+f.retained_cake || 0) + (+f.cake_sold_to_shop || 0) > (+f.oil_cake_produced || 0) + 0.009;
 
 
@@ -91,6 +94,7 @@ export default function OilExtraction() {
             </div>
             <div className="grid grid-cols-3 gap-3">
               <div><Label>Seeds (kg)</Label><Input type="number" value={f.quantity_received} onChange={(e) => setF({ ...f, quantity_received: e.target.value })} className="h-11 mt-1" data-testid="oil-qty" /></div>
+              <div><Label>Plus quintals</Label><Input type="number" value={f.quantity_quintal} onChange={(e) => setF({ ...f, quantity_quintal: e.target.value })} className="h-11 mt-1" data-testid="oil-quintal" /></div>
               <div><Label>Oil (L)</Label><Input type="number" value={f.oil_extracted} onChange={(e) => setF({ ...f, oil_extracted: e.target.value })} className="h-11 mt-1" data-testid="oil-extracted" /></div>
               <div><Label>Cake (kg)</Label><Input type="number" value={f.oil_cake_produced} onChange={(e) => setF({ ...f, oil_cake_produced: e.target.value })} className="h-11 mt-1" data-testid="oil-cake" /></div>
             </div>
@@ -101,7 +105,19 @@ export default function OilExtraction() {
               </Select>
             </div>
             <div className="grid grid-cols-2 gap-4">
-              <div><Label>Cash Charge ₹</Label><Input type="number" value={f.charge} onChange={(e) => setF({ ...f, charge: e.target.value })} className="h-11 mt-1" data-testid="oil-charge" /></div>
+              <div><Label>Extraction rate ₹/kg</Label>
+                <Input type="number" value={f.extraction_rate} onChange={(e) => setF({ ...f, extraction_rate: e.target.value })} className="h-11 mt-1" data-testid="oil-rate" />
+                <p className="text-xs text-muted-foreground mt-1">
+                  {(+f.extraction_rate || 0) > 0
+                    ? `${seedKg} kg × ₹${f.extraction_rate} = ${money(extractionCharge)}`
+                    : "Leave blank to enter a flat charge instead."}
+                </p>
+              </div>
+              <div><Label>{(+f.extraction_rate || 0) > 0 ? "Extraction charge" : "Cash Charge ₹"}</Label>
+                {(+f.extraction_rate || 0) > 0
+                  ? <div className="h-11 mt-1 flex items-center font-bold text-lg" data-testid="oil-extraction-total">{money(extractionCharge)}</div>
+                  : <Input type="number" value={f.charge} onChange={(e) => setF({ ...f, charge: e.target.value })} className="h-11 mt-1" data-testid="oil-charge" />}
+              </div>
               {f.payment_method === "Oil" && <div><Label>Oil kept (L)</Label><Input type="number" value={f.retained_oil} onChange={(e) => setF({ ...f, retained_oil: e.target.value })} className="h-11 mt-1" data-testid="oil-retained-oil" /></div>}
               {f.payment_method === "Cake" && <div><Label>Cake kept (kg)</Label><Input type="number" value={f.retained_cake} onChange={(e) => setF({ ...f, retained_cake: e.target.value })} className="h-11 mt-1" data-testid="oil-retained-cake" /></div>}
             </div>

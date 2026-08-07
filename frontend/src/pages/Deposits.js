@@ -19,7 +19,7 @@ const MATERIAL = "Material";
 
 const blankDeposit = () => ({ date: today(), customer_name: "", quantity_kg: "", quantity_quintal: "", grain: "Wheat", note: "" });
 const blankWithdrawal = () => ({
-  date: today(), customer_name: "", wheat_kg: "", wheat_quintal: "",
+  date: today(), customer_name: "", flour_kg: "", flour_quintal: "",
   grinding_type: CASH, deduction_percent: "", charge_per_kg: "",
   material_item: "", material_qty: "", material_value: "",
   payment_mode: "Cash", bank_id: "", payment_status: "Paid", note: "",
@@ -91,8 +91,8 @@ export default function Deposits() {
     try {
       const { data } = await api.post("/withdrawals", {
         ...wf,
-        wheat_kg: +wf.wheat_kg || 0,
-        wheat_quintal: +wf.wheat_quintal || 0,
+        flour_kg: +wf.flour_kg || 0,
+        flour_quintal: +wf.flour_quintal || 0,
         deduction_percent: wf.deduction_percent === "" ? null : +wf.deduction_percent,
         charge_per_kg: wf.charge_per_kg === "" ? null : +wf.charge_per_kg,
         material_qty: wf.material_qty === "" ? null : +wf.material_qty,
@@ -121,13 +121,16 @@ export default function Deposits() {
   };
 
   // Mirrors the backend so the operator sees the outcome before saving.
-  const drawn = (+wf.wheat_kg || 0) + (+wf.wheat_quintal || 0) * 100;
+  const flourAsked = (+wf.flour_kg || 0) + (+wf.flour_quintal || 0) * 100;
   const defaultPct = wf.grinding_type === FLOUR
     ? (settings.deposit_flour_deduction_percent ?? 15)
     : (settings.cash_grinding_percent ?? 5);
   const pct = wf.deduction_percent === "" ? defaultPct : +wf.deduction_percent;
-  const deducted = +(drawn * pct / 100).toFixed(3);
-  const flour = +(drawn - deducted).toFixed(3);
+  // Paying in flour takes the fee on top of what is handed over, so the
+  // balance falls by both. Cash takes no flour at all.
+  const deducted = wf.grinding_type === FLOUR ? +(flourAsked * pct / 100).toFixed(3) : 0;
+  const flour = flourAsked;
+  const drawn = +(flourAsked + deducted).toFixed(3);
   const rate = wf.charge_per_kg === "" ? (settings.grinding_rate ?? 2) : +wf.charge_per_kg;
   const charge = wf.grinding_type === FLOUR ? 0 : +(drawn * rate).toFixed(2);
   const materials = settings.materials?.length ? settings.materials : ["Wheat", "Rice", "Maize", "Mustard"];
@@ -253,8 +256,8 @@ export default function Deposits() {
             </div>
 
             <div className="grid grid-cols-2 gap-4">
-              <div><Label>Wheat quintals</Label><Input type="number" value={wf.wheat_quintal} onChange={(e) => setWf({ ...wf, wheat_quintal: e.target.value })} className="h-11 mt-1" data-testid="withdraw-quintal" /></div>
-              <div><Label>Plus kilograms</Label><Input type="number" value={wf.wheat_kg} onChange={(e) => setWf({ ...wf, wheat_kg: e.target.value })} className="h-11 mt-1" data-testid="withdraw-kg" /></div>
+              <div><Label>Flour delivered (kg)</Label><Input type="number" value={wf.flour_kg} onChange={(e) => setWf({ ...wf, flour_kg: e.target.value })} className="h-11 mt-1" data-testid="withdraw-kg" /></div>
+              <div><Label>Plus quintals</Label><Input type="number" value={wf.flour_quintal} onChange={(e) => setWf({ ...wf, flour_quintal: e.target.value })} className="h-11 mt-1" data-testid="withdraw-quintal" /></div>
             </div>
 
             <div><Label>Grinding type</Label>
@@ -319,9 +322,13 @@ export default function Deposits() {
             )}
 
             <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1" data-testid="withdraw-preview">
-              <div className="flex justify-between"><span className="text-muted-foreground">Wheat drawn</span><span>{drawn.toFixed(2)} kg</span></div>
-              <div className="flex justify-between"><span className="text-muted-foreground">Deduction at {pct}%</span><span className="text-destructive">−{deducted} kg</span></div>
-              <div className="flex justify-between font-semibold"><span>Flour delivered</span><span>{flour} kg</span></div>
+              <div className="flex justify-between font-semibold"><span>Flour delivered</span><span>{flour.toFixed(2)} kg</span></div>
+              {deducted > 0 && (
+                <div className="flex justify-between"><span className="text-muted-foreground">Kept as fee at {pct}%</span><span className="text-destructive">−{deducted} kg</span></div>
+              )}
+              <div className="flex justify-between border-t border-border/60 pt-1 mt-1">
+                <span className="text-muted-foreground">Comes off the deposit</span><span>{drawn.toFixed(2)} kg</span>
+              </div>
               <div className="flex justify-between border-t border-border/60 pt-1 mt-1">
                 <span className="text-muted-foreground">Grinding charge</span>
                 <span>{wf.grinding_type === FLOUR ? "paid in flour" : money(charge)}</span>

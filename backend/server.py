@@ -947,9 +947,17 @@ class OilBody(BaseModel):
     customer_id: Optional[str] = None
     customer_name: str
     seed_type: str
-    quantity_received: float
-    oil_extracted: float
+    # Defaulted so a job entered purely in quintals is accepted; the two are
+    # summed into kilograms below.
+    quantity_received: float = 0
+    oil_extracted: float = 0
     oil_cake_produced: float = 0
+    # Quantity may be given in quintals; the charge is quoted per kilogram.
+    quantity_quintal: float = 0
+    extraction_rate: float = 0
+    # Flat charge. Kept because every order recorded before the rate existed
+    # carries one, and it still serves as an override when a job is priced as a
+    # lump sum rather than by weight.
     charge: float = 0
     payment_method: str = "Cash"
     retained_oil: float = 0
@@ -1385,8 +1393,13 @@ async def build_invoice_data(ref_id: str):
                 "payment_method": normalise_method(g.get("payment_method"))}
     o = await db.oil.find_one({"id": ref_id})
     if o:
+        # Rate per kg when the job was priced that way, so the customer can see
+        # how the charge was arrived at rather than just the total.
+        charge = o.get("extraction_charge", o.get("charge", 0))
         items = [{"desc": f'{o["seed_type"]} Oil Extraction ({o["oil_extracted"]} L extracted)',
-                  "qty": f'{o["quantity_received"]} kg', "rate": o["charge"], "amount": o["charge"]}]
+                  "qty": f'{o["quantity_received"]} kg',
+                  "rate": o.get("extraction_rate") or charge,
+                  "amount": charge}]
         # Show the cake purchase as its own negative line, otherwise the
         # customer cannot see why the bill is lower than the extraction charge.
         if o.get("cake_sold_to_shop", 0):
@@ -1597,6 +1610,9 @@ async def dashboard(user: dict = Depends(get_current_user)):
         "supplier_dues": round(supplier_dues, 2),
         # Money handed back to customers when a by-product outweighed the charge.
         "paid_to_customers": paid_to_customers,
+        # Wheat in the shed, split into what the shop owns and what it holds
+        # for depositors.
+        "wheat_stock": await total_wheat_stock(),
         "inventory_count": len(products),
         "total_stock": round(sum(p.get("current_stock", 0) for p in products), 2),
         "low_stock": low_stock,
@@ -2114,6 +2130,12 @@ def grinding_output_name(doc: dict) -> str:
 
 async def build_oil_doc(body: OilBody):
     inv = await next_invoice_number()
+    # Seed can be entered either way; everything downstream works in kilograms.
+    seed_kg = to_kg(body.quantity_received, body.quantity_quintal)
+    # Charged by weight when a rate is given, which is how the mill quotes it.
+    # A flat charge still wins when no rate is set, so older orders and lump-sum
+    # jobs price exactly as before.
+    extraction_charge = round(seed_kg * body.extraction_rate, 2) if body.extraction_rate else round(body.charge, 2)
     allocated = round(body.retained_cake + body.cake_sold_to_shop, 3)
     if allocated > body.oil_cake_produced + 0.009:
         raise HTTPException(status_code=400, detail=(
@@ -2128,8 +2150,11 @@ async def build_oil_doc(body: OilBody):
     cake_value = round(body.cake_sold_to_shop * body.cake_rate, 2)
     d = body.model_dump()
     d.update({"id": str(uuid.uuid4()), "invoice_number": inv,
+              "quantity_received": seed_kg,
+              "extraction_charge": extraction_charge,
+              "charge": extraction_charge,
               "cake_value": cake_value,
-              "total": round(body.charge - cake_value, 2),
+              "total": round(extraction_charge - cake_value, 2),
               "customer_oil": round(body.oil_extracted - body.retained_oil, 2),
               "customer_cake": round(body.oil_cake_produced - body.retained_cake - body.cake_sold_to_shop, 2),
               "created_at": now_iso()})
@@ -3727,15 +3752,26 @@ async def rep_deposit_withdrawals(start, end, party=None, **_):
 async def rep_stock(start, end, item=None, **_):
     rows = await product_movements(start, end)
     if item: rows = [r for r in rows if r["item"] == item]
+    held = await total_wheat_stock()
+    for r in rows:
+        # Deposited wheat sits in the same shed but belongs to farmers, so it is
+        # reported beside the owned figure rather than folded into it.
+        r["held_for_others"] = held["deposited_kg"] if r["item"] == "Wheat Crop" else 0
+        r["total_on_site"] = round(r["current"] + r["held_for_others"], 3)
     return {"columns": [col("item", "Item"), col("category", "Category"), col("unit", "Unit"),
                         col("opening", "Opening", "qty"), col("purchased", "Purchased", "qty"),
                         col("produced", "Produced", "qty"), col("sold", "Sold", "qty"),
                         col("consumed", "Consumed", "qty"), col("adjusted", "Adjusted", "qty"),
-                        col("closing", "Closing", "qty"), col("current", "Available now", "qty"),
+                        col("closing", "Closing", "qty"), col("current", "Owned now", "qty"),
+                        col("held_for_others", "Held for depositors", "qty"),
+                        col("total_on_site", "Total on site", "qty"),
                         col("value", "Stock value", "money")],
             "rows": rows,
             "summary": [{"label": "Items", "value": len(rows)},
-                        {"label": "Stock value", "value": round(sum(r["value"] for r in rows), 2), "type": "money"}]}
+                        {"label": "Stock value", "value": round(sum(r["value"] for r in rows), 2), "type": "money"},
+                        {"label": "Wheat owned", "value": held["owned_kg"]},
+                        {"label": "Wheat held for depositors", "value": held["deposited_kg"]},
+                        {"label": "Total wheat on site", "value": held["total_kg"]}]}
 
 async def rep_item_wise(start, end, item=None, **_):
     """Same movements as the stock report, limited to items that actually moved."""
@@ -4490,6 +4526,14 @@ class WithdrawalBody(BaseModel):
     customer_name: str
     # Wheat drawn from the deposit. The flour handed over is this less the
     # deduction, which is what the customer actually cares about.
+    # What the customer walks out with. The balance comes off this plus
+    # anything kept as the fee, which is how a depositor reads their own
+    # account: "I left 100, I have taken 20, so 80 is left."
+    flour_kg: float = 0
+    flour_quintal: float = 0
+    # The earlier way of entering the same withdrawal, by the wheat drawn rather
+    # than the flour handed over. Still accepted so existing callers and records
+    # keep working.
     wheat_kg: float = 0
     wheat_quintal: float = 0
     grinding_type: str = "Cash"           # Cash | Flour Deduction | Material
@@ -4532,7 +4576,8 @@ async def deposit_balance(name: str):
         db.wheat_withdrawals.find({"customer_name": name}).to_list(20000),
     )
     deposited = round(sum(d.get("quantity", 0) or 0 for d in deposits), 3)
-    drawn = round(sum(w.get("wheat_drawn", 0) or 0 for w in withdrawals), 3)
+    drawn = round(sum((w.get("balance_drawn") if w.get("balance_drawn") is not None
+                       else w.get("wheat_drawn", 0)) or 0 for w in withdrawals), 3)
     flour_given = round(sum(w.get("flour_delivered", 0) or 0 for w in withdrawals), 3)
     deducted = round(sum(w.get("deducted_qty", 0) or 0 for w in withdrawals), 3)
     charges = round(sum(w.get("charge", 0) or 0 for w in withdrawals), 2)
@@ -4562,6 +4607,33 @@ async def list_deposits(customer: Optional[str] = None, user: dict = Depends(get
 async def deposits_summary(user: dict = Depends(get_current_user)):
     return await deposits_summary_data()
 
+async def total_wheat_stock():
+    """Wheat physically in the warehouse, split by who owns it.
+
+    The spec asks for deposits to count toward total wheat stock, and
+    physically they do — it is all in the same shed. They are kept as a
+    separate figure rather than added to the product's current_stock because
+    deposited wheat was never bought: folding it in would drag the weighted
+    average cost toward zero and make every later sale look more profitable
+    than it was, and would let the shop sell wheat belonging to a farmer.
+    """
+    prod, summary = await asyncio.gather(
+        db.products.find_one({"name_key": product_key("Wheat Crop")}),
+        deposits_summary_data(),
+    )
+    owned = round((prod or {}).get("current_stock", 0) or 0, 3)
+    deposited = round(summary["total_remaining_kg"], 3)
+    return {"owned_kg": owned, "deposited_kg": deposited,
+            "total_kg": round(owned + deposited, 3),
+            "owned_quintal": round(owned / QUINTAL_KG, 3),
+            "deposited_quintal": round(deposited / QUINTAL_KG, 3),
+            "total_quintal": round((owned + deposited) / QUINTAL_KG, 3),
+            "depositors": summary["depositors"]}
+
+@api_router.get("/wheat-stock")
+async def wheat_stock(user: dict = Depends(get_current_user)):
+    return await total_wheat_stock()
+
 async def deposits_summary_data():
     """Every depositor with a live balance, in a handful of queries."""
     deposits, withdrawals, customers, settings = await asyncio.gather(
@@ -4581,7 +4653,8 @@ async def deposits_summary_data():
     for w in withdrawals:
         a = agg.setdefault(w.get("customer_name", "?"), {"deposited": 0.0, "drawn": 0.0, "flour": 0.0,
                                                          "deducted": 0.0, "charges": 0.0, "last": ""})
-        a["drawn"] += w.get("wheat_drawn", 0) or 0
+        a["drawn"] += (w.get("balance_drawn") if w.get("balance_drawn") is not None
+                       else w.get("wheat_drawn", 0)) or 0
         a["flour"] += w.get("flour_delivered", 0) or 0
         a["deducted"] += w.get("deducted_qty", 0) or 0
         a["charges"] += w.get("charge", 0) or 0
@@ -4617,7 +4690,9 @@ async def deposit_statement(customer: str, user: dict = Depends(get_current_user
                         "charge": "", "note": d.get("note", "")})
     for w in withdrawals:
         entries.append({"date": w.get("date"), "kind": "Withdrawal", "id": w.get("id"),
-                        "wheat_in": 0, "wheat_out": w.get("wheat_drawn", 0),
+                        "wheat_in": 0,
+                        "wheat_out": (w.get("balance_drawn") if w.get("balance_drawn") is not None
+                                      else w.get("wheat_drawn", 0)),
                         "grinding_type": w.get("grinding_type", ""),
                         "percent": w.get("deduction_percent", ""),
                         "deducted": w.get("deducted_qty", 0),
@@ -4680,10 +4755,22 @@ async def build_withdrawal(body: WithdrawalBody, existing: dict = None) -> dict:
     """Price a withdrawal and work out what the customer walks out with."""
     settings = await get_settings_doc()
     gtype = normalise_grinding_type(body.grinding_type)
-    drawn = to_kg(body.wheat_kg, body.wheat_quintal)
     pct = await deposit_percent(gtype, body.deduction_percent)
-    deducted = round(drawn * pct / 100, 3)
-    flour = round(drawn - deducted, 3)
+
+    flour_asked = to_kg(body.flour_kg, body.flour_quintal)
+    if flour_asked > 0:
+        # Entered as flour delivered. The fee is worked out on top, so asking
+        # for 20 kg means 20 kg is handed over and the deduction comes out of
+        # the balance as well rather than out of the customer's 20.
+        flour = flour_asked
+        deducted = round(flour * pct / 100, 3) if gtype == FLOUR_DEDUCTION else 0.0
+        drawn = round(flour + deducted, 3)
+    else:
+        # Entered as wheat drawn, the earlier shape: the fee comes out of what
+        # that wheat yields, so the customer receives less than they drew.
+        drawn = to_kg(body.wheat_kg, body.wheat_quintal)
+        deducted = round(drawn * pct / 100, 3)
+        flour = round(drawn - deducted, 3)
 
     # Cash grinding bills a charge; paying in flour or material is the payment,
     # so there is nothing left to bill.
@@ -4698,7 +4785,11 @@ async def build_withdrawal(body: WithdrawalBody, existing: dict = None) -> dict:
         charge = round(drawn * rate, 2)
 
     doc = {**(existing or {}), **body.model_dump(),
-           "grinding_type": gtype, "wheat_drawn": drawn,
+           "grinding_type": gtype,
+           # What comes off the deposit: the flour handed over plus anything
+           # kept as the fee. Named separately from wheat_drawn so older
+           # records, which only have the latter, still balance.
+           "balance_drawn": drawn, "wheat_drawn": drawn,
            "deduction_percent": pct, "deducted_qty": deducted,
            "flour_delivered": flour, "charge_per_kg": round(rate, 3), "charge": charge,
            "material_qty": material_qty, "material_value": material_value}
@@ -4761,9 +4852,9 @@ async def list_withdrawals(customer: Optional[str] = None, user: dict = Depends(
 async def create_withdrawal(body: WithdrawalBody, user: dict = Depends(get_current_user)):
     doc = await build_withdrawal(body)
     balance = await deposit_balance(body.customer_name)
-    if doc["wheat_drawn"] <= 0:
+    if doc["balance_drawn"] <= 0:
         raise HTTPException(status_code=400, detail="Enter a quantity greater than zero")
-    if doc["wheat_drawn"] > balance["remaining_kg"] + 0.001:
+    if doc["balance_drawn"] > balance["remaining_kg"] + 0.001:
         raise HTTPException(status_code=400, detail=(
             f'{body.customer_name} has only {balance["remaining_kg"]} kg of wheat on deposit'))
     doc["id"] = str(uuid.uuid4())
@@ -4798,8 +4889,9 @@ async def edit_withdrawal(wid: str, body: WithdrawalBody, user: dict = Depends(g
     # The old draw is already reversed above, so the balance check sees the
     # wheat this withdrawal had taken out.
     balance = await deposit_balance(body.customer_name)
-    available = balance["remaining_kg"] + (old.get("wheat_drawn", 0) or 0)
-    if doc["wheat_drawn"] > available + 0.001:
+    available = balance["remaining_kg"] + ((old.get("balance_drawn") if old.get("balance_drawn") is not None
+                                            else old.get("wheat_drawn", 0)) or 0)
+    if doc["balance_drawn"] > available + 0.001:
         await apply_withdrawal_effects(old, 1)
         raise HTTPException(status_code=400, detail=f'Only {available} kg is on deposit')
     doc["deducted_value"] = round(doc["deducted_qty"] * await flour_unit_rate("Atta"), 2)

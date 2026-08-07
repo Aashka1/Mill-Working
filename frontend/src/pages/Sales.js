@@ -120,6 +120,10 @@ export default function Sales() {
   };
 
   const saleTotal = grandTotal;
+  // What the customer hands over now, and what is left owing.
+  const paidNow = f.payment_status === "Paid" ? grandTotal
+    : f.payment_status === "Partial" ? Math.min(+f.amount_paid || 0, grandTotal) : 0;
+  const dueNow = +(grandTotal - paidNow).toFixed(2);
 
   return (
     <div>
@@ -242,6 +246,18 @@ export default function Sales() {
               )}
             </div>
             <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1" data-testid="sale-totals">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Total quantity</span>
+                <span data-testid="sale-total-qty">
+                  {/* Grouped by unit: adding kg to litre to bags gives a number
+                      that means nothing. */}
+                  {Object.entries(priced.reduce((acc, l) => {
+                    const u = unitOf(l.product_id) || "";
+                    if (l.qty) acc[u] = +( (acc[u] || 0) + l.qty ).toFixed(3);
+                    return acc;
+                  }, {})).map(([u, q]) => `${q} ${u}`).join(" · ") || "—"}
+                </span>
+              </div>
               <div className="flex justify-between"><span className="text-muted-foreground">Subtotal</span><span>{money(subtotal)}</span></div>
               {discountTotal > 0 && <div className="flex justify-between"><span className="text-muted-foreground">Discount</span><span className="text-destructive">−{money(discountTotal)}</span></div>}
               {gstTotal > 0 && <div className="flex justify-between"><span className="text-muted-foreground">GST</span><span>{money(gstTotal)}</span></div>}
@@ -249,8 +265,12 @@ export default function Sales() {
                 <div className="flex justify-between"><span className="text-muted-foreground">Rounding</span><span>{money(grandTotal - net)}</span></div>
               )}
               <div className="flex justify-between font-bold text-base border-t border-border/60 pt-1 mt-1">
-                <span>Total</span><span data-testid="sale-grand-total">{money(grandTotal)}</span>
+                <span>Grand total</span><span data-testid="sale-grand-total">{money(grandTotal)}</span>
               </div>
+              <div className="flex justify-between"><span className="text-muted-foreground">Paid</span>
+                <span data-testid="sale-paid">{money(paidNow)}</span></div>
+              <div className="flex justify-between font-semibold"><span>Due</span>
+                <span className={dueNow > 0 ? "text-destructive" : ""} data-testid="sale-due">{money(dueNow)}</span></div>
             </div>
             <p className="text-sm text-muted-foreground">
               {!editingId && f.payment_status === "Partial" && (
