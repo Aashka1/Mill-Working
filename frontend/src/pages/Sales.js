@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useList, useFilter, PageToolbar, StatusBadge } from "@/components/common";
-import api, { money, today, downloadFile } from "@/lib/api";
+import api, { money, today, downloadFile, formatApiErrorDetail } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,7 +14,12 @@ import { PaymentDialog } from "@/components/PaymentDialog";
 import { PartySelect } from "@/components/PartySelect";
 import { toast } from "sonner";
 
-const empty = { date: today(), customer_name: "", product_id: "", product_name: "", quantity: "", price: "", payment_status: "Paid", amount_paid: "", payment_mode: "Cash" };
+const blankLine = () => ({ product_id: "", quantity: "", rate: "", discount_percent: "", gst_percent: "" });
+
+const empty = () => ({
+  date: today(), customer_name: "", items: [blankLine()],
+  payment_status: "Paid", amount_paid: "", payment_mode: "Cash", round_off: true,
+});
 
 export default function Sales() {
   const sales = useList("/sales");
@@ -24,38 +29,97 @@ export default function Sales() {
   const filtered = useFilter(sales.items, q, ["customer_name", "product_name", "invoice_number", "payment_status", "date"]);
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
-  const [f, setF] = useState(empty);
+  const [f, setF] = useState(empty());
   const [payFor, setPayFor] = useState(null);
 
   // Products are not all measured in kg — oil is litres, packing is bags — so
   // every quantity is labelled with the unit of the product it belongs to.
   const unitOf = (productId, fallback = "") => products.items.find((p) => p.id === productId)?.unit || fallback;
-  const selectedUnit = unitOf(f.product_id, "unit");
 
-  const openNew = () => { setEditingId(null); setF(empty); setOpen(true); };
+  // A sale from before invoices could hold several products has no items array,
+  // so fall back to its single product.
+  const linesOf = (s) => (s.items?.length ? s.items
+    : [{ product_id: s.product_id, product_name: s.product_name, quantity: s.quantity, unit: unitOf(s.product_id) }]);
+  const lineSummary = (s) => {
+    const l = linesOf(s);
+    return l.length === 1 ? l[0].product_name : `${l[0].product_name} +${l.length - 1} more`;
+  };
+  const lineQty = (s) => {
+    const l = linesOf(s);
+    return l.length === 1
+      ? `${l[0].quantity} ${l[0].unit || unitOf(l[0].product_id)}`.trim()
+      : `${l.reduce((t, i) => t + (i.quantity || 0), 0)} across ${l.length}`;
+  };
+
+  const openNew = () => { setEditingId(null); setF(empty()); setOpen(true); };
   const openEdit = (s) => {
     setEditingId(s.id);
-    setF({ date: s.date, customer_name: s.customer_name, product_id: s.product_id, product_name: s.product_name, quantity: String(s.quantity), price: String(s.price), payment_status: s.payment_status, amount_paid: "", payment_mode: s.payment_mode || "Cash" });
+    // Sales made before invoices could hold several products have no items
+    // array, so present the single product as one line.
+    const lines = (s.items?.length ? s.items : [{ product_id: s.product_id, quantity: s.quantity, rate: s.price }])
+      .map((i) => ({
+        product_id: i.product_id || "",
+        quantity: String(i.quantity ?? ""),
+        rate: String(i.rate ?? ""),
+        discount_percent: i.discount_percent ? String(i.discount_percent) : "",
+        gst_percent: i.gst_percent ? String(i.gst_percent) : "",
+      }));
+    setF({ date: s.date, customer_name: s.customer_name, items: lines,
+           payment_status: s.payment_status, amount_paid: "",
+           payment_mode: s.payment_mode || "Cash", round_off: s.round_off !== undefined });
     setOpen(true);
   };
 
+  const setLine = (idx, patch) =>
+    setF((prev) => ({ ...prev, items: prev.items.map((l, i) => (i === idx ? { ...l, ...patch } : l)) }));
+  const addLine = () => setF((prev) => ({ ...prev, items: [...prev.items, blankLine()] }));
+  const removeLine = (idx) =>
+    setF((prev) => ({ ...prev, items: prev.items.length === 1 ? prev.items : prev.items.filter((_, i) => i !== idx) }));
+
+  // Mirrors the backend so the operator sees the invoice before saving.
+  const priced = f.items.map((l) => {
+    const qty = +l.quantity || 0;
+    const rate = +l.rate || 0;
+    const amount = qty * rate;
+    const discount = amount * (+l.discount_percent || 0) / 100;
+    const taxable = amount - discount;
+    const gst = taxable * (+l.gst_percent || 0) / 100;
+    return { ...l, qty, rate, amount, discount, taxable, gst, total: taxable + gst };
+  });
+  const subtotal = priced.reduce((t, l) => t + l.amount, 0);
+  const discountTotal = priced.reduce((t, l) => t + l.discount, 0);
+  const gstTotal = priced.reduce((t, l) => t + l.gst, 0);
+  const net = subtotal - discountTotal + gstTotal;
+  const grandTotal = f.round_off ? Math.round(net) : +net.toFixed(2);
+
   const save = async () => {
-    const prod = products.items.find((p) => p.id === f.product_id);
-    if (!prod || !f.customer_name || !f.quantity || !f.price) return toast.error("Fill all fields");
-    if (!editingId && +f.quantity > prod.current_stock) return toast.error(`Only ${prod.current_stock} ${prod.unit} in stock`);
-    const body = { date: f.date, customer_name: f.customer_name, product_id: prod.id, product_name: prod.name, quantity: +f.quantity, price: +f.price, payment_status: f.payment_status };
+    if (!f.customer_name) return toast.error("Choose the customer");
+    const lines = f.items.filter((l) => l.product_id && +l.quantity > 0);
+    if (!lines.length) return toast.error("Add at least one product");
+    const body = {
+      date: f.date, customer_name: f.customer_name, payment_status: f.payment_status,
+      round_off: f.round_off,
+      items: lines.map((l) => ({
+        product_id: l.product_id, quantity: +l.quantity, rate: +l.rate || 0,
+        discount_percent: +l.discount_percent || 0, gst_percent: +l.gst_percent || 0,
+      })),
+    };
     // Only sent when creating: edits must not re-credit a bill that already has payments.
     if (!editingId) {
       body.amount_paid = f.payment_status === "Paid" ? null : (f.payment_status === "Partial" ? +f.amount_paid || 0 : 0);
       body.payment_mode = f.payment_mode;
     }
-    if (editingId) { await api.put(`/sales/${editingId}`, body); toast.success("Sale updated"); }
-    else { await api.post("/sales", body); toast.success("Sale recorded, stock deducted"); }
-    setOpen(false); setEditingId(null); setF(empty);
+    try {
+      if (editingId) { await api.put(`/sales/${editingId}`, body); toast.success("Sale updated"); }
+      else { await api.post("/sales", body); toast.success("Sale recorded, stock deducted"); }
+    } catch (e) {
+      return toast.error(formatApiErrorDetail(e.response?.data?.detail) || e.message);
+    }
+    setOpen(false); setEditingId(null); setF(empty());
     sales.load(); products.load();
   };
 
-  const saleTotal = (+f.quantity || 0) * (+f.price || 0);
+  const saleTotal = grandTotal;
 
   return (
     <div>
@@ -83,15 +147,70 @@ export default function Sales() {
                     testid="sale-customer" />
               </div>
             </div>
-            <div><Label>Product</Label>
-              <Select value={f.product_id} onValueChange={(v) => setF({ ...f, product_id: v, price: products.items.find((p) => p.id === v)?.rate || "" })}>
-                <SelectTrigger className="h-11 mt-1" data-testid="sale-product"><SelectValue placeholder="Select product" /></SelectTrigger>
-                <SelectContent>{products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div><Label>Quantity ({selectedUnit})</Label><Input type="number" value={f.quantity} onChange={(e) => setF({ ...f, quantity: e.target.value })} className="h-11 mt-1" data-testid="sale-qty" /></div>
-              <div><Label>Price ₹/{selectedUnit}</Label><Input type="number" value={f.price} onChange={(e) => setF({ ...f, price: e.target.value })} className="h-11 mt-1" data-testid="sale-price" /></div>
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <Label>Products</Label>
+                <Button type="button" variant="outline" size="sm" onClick={addLine} data-testid="add-line-btn">
+                  <Plus className="h-4 w-4 mr-1" /> Add product
+                </Button>
+              </div>
+
+              <div className="space-y-3">
+                {f.items.map((line, idx) => {
+                  const unit = unitOf(line.product_id, "");
+                  const inStock = products.items.find((p) => p.id === line.product_id)?.current_stock;
+                  return (
+                    <div key={idx} className="rounded-lg border border-border/60 p-3 space-y-2" data-testid={`sale-line-${idx}`}>
+                      <div className="flex gap-2 items-start">
+                        <div className="flex-1">
+                          <Select value={line.product_id}
+                            onValueChange={(v) => setLine(idx, { product_id: v, rate: String(products.items.find((p) => p.id === v)?.rate ?? "") })}>
+                            <SelectTrigger className="h-11" data-testid={`sale-product-${idx}`}><SelectValue placeholder="Select product" /></SelectTrigger>
+                            <SelectContent>
+                              {products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        {f.items.length > 1 && (
+                          <Button type="button" variant="ghost" size="icon" className="h-11 w-11"
+                            onClick={() => removeLine(idx)} data-testid={`remove-line-${idx}`}>
+                            <Trash2 className="h-4 w-4 text-destructive" />
+                          </Button>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        <div>
+                          <Label className="text-xs">Qty {unit && `(${unit})`}</Label>
+                          <Input type="number" value={line.quantity} onChange={(e) => setLine(idx, { quantity: e.target.value })} className="h-10 mt-1" data-testid={`sale-qty-${idx}`} />
+                        </div>
+                        <div>
+                          <Label className="text-xs">Rate ₹{unit && `/${unit}`}</Label>
+                          <Input type="number" value={line.rate} onChange={(e) => setLine(idx, { rate: e.target.value })} className="h-10 mt-1" data-testid={`sale-rate-${idx}`} />
+                        </div>
+                        <div>
+                          <Label className="text-xs">Discount %</Label>
+                          <Input type="number" value={line.discount_percent} onChange={(e) => setLine(idx, { discount_percent: e.target.value })} className="h-10 mt-1" data-testid={`sale-discount-${idx}`} />
+                        </div>
+                        <div>
+                          <Label className="text-xs">GST %</Label>
+                          <Input type="number" value={line.gst_percent} onChange={(e) => setLine(idx, { gst_percent: e.target.value })} className="h-10 mt-1" data-testid={`sale-gst-${idx}`} />
+                        </div>
+                      </div>
+
+                      <div className="flex justify-between text-xs text-muted-foreground">
+                        <span>
+                          {inStock != null && `${inStock} ${unit} in stock`}
+                          {inStock != null && +line.quantity > inStock && (
+                            <span className="text-destructive font-medium"> — not enough</span>
+                          )}
+                        </span>
+                        <span className="font-semibold text-foreground">{money(priced[idx]?.total || 0)}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div><Label>Payment</Label>
@@ -122,8 +241,18 @@ export default function Sales() {
                 </div>
               )}
             </div>
+            <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1" data-testid="sale-totals">
+              <div className="flex justify-between"><span className="text-muted-foreground">Subtotal</span><span>{money(subtotal)}</span></div>
+              {discountTotal > 0 && <div className="flex justify-between"><span className="text-muted-foreground">Discount</span><span className="text-destructive">−{money(discountTotal)}</span></div>}
+              {gstTotal > 0 && <div className="flex justify-between"><span className="text-muted-foreground">GST</span><span>{money(gstTotal)}</span></div>}
+              {f.round_off && Math.abs(grandTotal - net) > 0.004 && (
+                <div className="flex justify-between"><span className="text-muted-foreground">Rounding</span><span>{money(grandTotal - net)}</span></div>
+              )}
+              <div className="flex justify-between font-bold text-base border-t border-border/60 pt-1 mt-1">
+                <span>Total</span><span data-testid="sale-grand-total">{money(grandTotal)}</span>
+              </div>
+            </div>
             <p className="text-sm text-muted-foreground">
-              Total: <span className="font-bold text-foreground">{money(saleTotal)}</span>
               {!editingId && f.payment_status === "Partial" && (
                 <> · Balance after payment: <span className="font-bold text-foreground">{money(Math.max(saleTotal - (+f.amount_paid || 0), 0))}</span></>
               )}
@@ -146,8 +275,14 @@ export default function Sales() {
             {filtered.map((s) => (
               <TableRow key={s.id} className="hover:bg-muted/50" data-testid={`sale-row-${s.id}`}>
                 <TableCell className="font-mono text-xs">{s.invoice_number}</TableCell><TableCell>{s.date}</TableCell>
-                <TableCell className="font-medium">{s.customer_name}</TableCell><TableCell>{s.product_name}</TableCell>
-                <TableCell className="text-right">{s.quantity} {unitOf(s.product_id)}</TableCell><TableCell className="text-right font-medium">{money(s.total)}</TableCell>
+                <TableCell className="font-medium">{s.customer_name}</TableCell>
+                <TableCell>
+                  {lineSummary(s)}
+                  {(s.items?.length || 1) > 1 && (
+                    <Badge variant="outline" className="ml-1 text-[10px]">{s.items.length} items</Badge>
+                  )}
+                </TableCell>
+                <TableCell className="text-right">{lineQty(s)}</TableCell><TableCell className="text-right font-medium">{money(s.total)}</TableCell>
                 <TableCell className="space-x-1">
                   <StatusBadge status={s.payment_status} balance={s.balance_due} />
                   {s.payment_status !== "Pending" && s.payment_mode && <Badge variant="outline" className="text-[10px]">{s.payment_mode}</Badge>}

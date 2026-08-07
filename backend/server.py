@@ -711,6 +711,13 @@ def sale_totals(items: list, round_off: bool = True) -> dict:
             "quantity_by_unit": by_unit, "line_count": len(items),
             "total_quantity": round(sum(i["quantity"] for i in items), 3)}
 
+def sale_summary(items: list) -> str:
+    """One-line description of an invoice, for audit lines and list views."""
+    if not items:
+        return "no items"
+    first = f'{items[0]["quantity"]} {items[0].get("unit", "")} {items[0]["product_name"]}'.replace("  ", " ").strip()
+    return first if len(items) == 1 else f'{first} +{len(items) - 1} more'
+
 async def resolve_sale_items(body: SaleBody) -> list:
     """Validate and cost every line, filling name and unit from the catalogue."""
     raw = [i.model_dump() for i in body.items] if body.items else []
@@ -797,6 +804,14 @@ def sale_cogs(sale: dict, cost_by_name: dict) -> float:
     """
     if sale.get("cogs") is not None:
         return sale.get("cogs", 0) or 0
+    # A multi-line sale without a stored total costs each line separately, since
+    # the lines can have different cost bases.
+    lines = sale.get("items")
+    if lines:
+        return round(sum((i.get("quantity", 0) or 0)
+                         * (i.get("unit_cost") if i.get("unit_cost") is not None
+                            else cost_by_name.get(i.get("product_name"), 0) or 0)
+                         for i in lines), 2)
     unit = sale.get("unit_cost")
     if unit is None:
         unit = cost_by_name.get(sale.get("product_name"), 0)
@@ -808,16 +823,25 @@ async def get_sales(user: dict = Depends(get_current_user)):
 
 @api_router.post("/sales")
 async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
-    total = round(body.quantity * body.price, 2)
+    items = await resolve_sale_items(body)
+    await check_sale_stock(items)
+    totals = sale_totals(items, body.round_off)
+    total = totals["total"]
     inv = await next_invoice_number()
-    # Snapshot what this stock cost at the moment it left the shop. cost_per_unit
-    # on the product is a running weighted average, so reading it later would let
-    # a future purchase silently rewrite the profit on a sale already made.
-    unit_cost = await product_cost(body.product_id)
-    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "total": total, "invoice_number": inv,
-           "unit_cost": unit_cost, "cogs": round(body.quantity * unit_cost, 2), "created_at": now_iso()}
+    doc = {"id": str(uuid.uuid4()), **body.model_dump(), "items": items, **totals,
+           "invoice_number": inv,
+           # Cost is snapshotted per line inside resolve_sale_items, because
+           # cost_per_unit is a running average and reading it later would let a
+           # future purchase rewrite the profit on a sale already made.
+           "cogs": round(sum(i["cogs"] for i in items), 2),
+           # The first line is mirrored to the old top-level fields so anything
+           # still reading a single product keeps working on new records too.
+           "product_id": items[0]["product_id"], "product_name": items[0]["product_name"],
+           "quantity": items[0]["quantity"], "price": items[0]["rate"],
+           "unit_cost": items[0]["unit_cost"],
+           "created_at": now_iso()}
     await db.sales.insert_one(doc)
-    await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": -body.quantity}})
+    await move_sale_stock(items, 1)
     await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": inv, "type": "Sale",
         "ref_id": doc["id"], "customer_name": body.customer_name, "date": body.date,
         "total": total, "payment_status": body.payment_status, "created_at": now_iso()})
@@ -825,14 +849,14 @@ async def create_sale(body: SaleBody, user: dict = Depends(get_current_user)):
     await add_credit("customer", body.customer_name, min(received, total), body.date, doc["id"], f"Sale {inv}", mode=body.payment_mode, bank_id=body.bank_id)
     await sync_payment_state("sales", doc["id"])
     doc = await db.sales.find_one({"id": doc["id"]})
-    await log_audit(user, "Created sale", f"{body.customer_name} · {body.product_name} {body.quantity} {await product_unit(body.product_id)} · Rs {total}")
+    await log_audit(user, "Created sale", f'{body.customer_name} · {sale_summary(items)} · Rs {total}')
     return clean(doc)
 
 @api_router.delete("/sales/{sid}")
 async def delete_sale(sid: str, user: dict = Depends(require_admin)):
     s = await db.sales.find_one({"id": sid})
     if s:
-        await db.products.update_one({"id": s["product_id"]}, {"$inc": {"current_stock": s["quantity"]}})
+        await move_sale_stock(sale_items(s), -1)
         await db.sales.delete_one({"id": sid})
         await db.invoices.delete_one({"ref_id": sid})
         for row in await db.payments.find({"ref_id": sid}).to_list(500):
@@ -1298,11 +1322,23 @@ def grinding_invoice_items(g: dict) -> list:
 async def build_invoice_data(ref_id: str):
     sale = await db.sales.find_one({"id": ref_id})
     if sale:
-        unit = await product_unit(sale.get("product_id"))
+        lines = sale_items(sale)
+        items = []
+        for it in lines:
+            unit = it.get("unit") or await product_unit(it.get("product_id"))
+            items.append({"desc": it["product_name"], "qty": f'{it["quantity"]} {unit}'.strip(),
+                          "rate": it.get("rate", 0), "amount": it.get("line_amount", 0)})
+        # Only shown when they actually apply, so a plain cash bill stays plain.
+        if sale.get("total_discount"):
+            items.append({"desc": "Less: discount", "qty": "", "rate": "",
+                          "amount": -abs(sale["total_discount"])})
+        if sale.get("total_gst"):
+            items.append({"desc": "GST", "qty": "", "rate": "", "amount": sale["total_gst"]})
+        if sale.get("round_off"):
+            items.append({"desc": "Rounding", "qty": "", "rate": "", "amount": sale["round_off"]})
         return {"type": "Sale", "invoice_number": sale["invoice_number"], "date": sale["date"],
                 "customer_name": sale["customer_name"], "payment_status": sale["payment_status"],
-                "items": [{"desc": sale["product_name"], "qty": f'{sale["quantity"]} {unit}',
-                           "rate": sale["price"], "amount": sale["total"]}], "total": sale["total"]}
+                "items": items, "total": sale.get("total", 0)}
     w = await db.wheat_withdrawals.find_one({"id": ref_id})
     if w:
         gtype = normalise_grinding_type(w.get("grinding_type"))
@@ -2507,10 +2543,21 @@ async def edit_sale(sid: str, body: SaleBody, user: dict = Depends(get_current_u
     old = await db.sales.find_one({"id": sid})
     if not old:
         raise HTTPException(status_code=404, detail="Not found")
-    await db.products.update_one({"id": old["product_id"]}, {"$inc": {"current_stock": old["quantity"]}})
-    total = round(body.quantity * body.price, 2)
-    await db.sales.update_one({"id": sid}, {"$set": {**body.model_dump(), "total": total}})
-    await db.products.update_one({"id": body.product_id}, {"$inc": {"current_stock": -body.quantity}})
+    previous = sale_items(old)
+    items = await resolve_sale_items(body)
+    # What this invoice had already taken out is available to it again, so a line
+    # can be corrected without the check failing on stock it is itself holding.
+    await check_sale_stock(items, allowance=stock_needed(previous))
+    await move_sale_stock(previous, -1)
+    totals = sale_totals(items, body.round_off)
+    total = totals["total"]
+    await db.sales.update_one({"id": sid}, {"$set": {
+        **body.model_dump(), "items": items, **totals,
+        "cogs": round(sum(i["cogs"] for i in items), 2),
+        "product_id": items[0]["product_id"], "product_name": items[0]["product_name"],
+        "quantity": items[0]["quantity"], "price": items[0]["rate"],
+        "unit_cost": items[0]["unit_cost"]}})
+    await move_sale_stock(items, 1)
     await db.invoices.update_one({"ref_id": sid}, {"$set": {"customer_name": body.customer_name,
         "date": body.date, "total": total}})
     await retag_bill_payments(sid, body.payment_mode, body.bank_id)
@@ -3380,7 +3427,10 @@ async def product_movements(start: str, end: str):
     for d in purchases_r:
         touch(d.get("product_name"), d.get("quantity", 0) or 0, "purchased", d.get("date"))
     for d in sales_r:
-        touch(d.get("product_name"), -(d.get("quantity", 0) or 0), "sold", d.get("date"))
+        # Each line separately: a five-product invoice moves five products, and
+        # reading the mirrored top-level field would count only the first.
+        for it in sale_items(d):
+            touch(it.get("product_name"), -(it.get("quantity", 0) or 0), "sold", d.get("date"))
     for d in production_r:
         touch(d.get("input_product_name"), -(d.get("input_quantity", 0) or 0), "consumed", d.get("date"))
         for o in d.get("outputs", []):
@@ -3427,13 +3477,22 @@ async def rep_sales(start, end, party=None, item=None, **_):
     rows = [clean(d) for d in await db.sales.find().sort("date", -1).to_list(20000)]
     rows = [r for r in rows if in_range(r, start, end)]
     if party: rows = [r for r in rows if r.get("customer_name") == party]
-    if item: rows = [r for r in rows if r.get("product_name") == item]
+    if item:
+        rows = [r for r in rows if any(i.get("product_name") == item for i in sale_items(r))]
     units = {p["name"]: p.get("unit", "kg") for p in await db.products.find().to_list(2000)}
-    out = [{"date": r.get("date"), "invoice": r.get("invoice_number", ""), "customer": r.get("customer_name", ""),
-            "item": r.get("product_name", ""), "qty": f'{r.get("quantity", 0)} {units.get(r.get("product_name"), "")}'.strip(),
-            "rate": r.get("price", 0), "total": r.get("total", 0),
-            "paid": r.get("amount_paid", 0) or 0, "balance": r.get("balance_due", 0) or 0,
-            "status": r.get("payment_status", "")} for r in rows]
+    out = []
+    for r in rows:
+        lines = sale_items(r)
+        shown = [i for i in lines if not item or i.get("product_name") == item]
+        out.append({"date": r.get("date"), "invoice": r.get("invoice_number", ""),
+                    "customer": r.get("customer_name", ""),
+                    "item": sale_summary(shown),
+                    "qty": " · ".join(f'{i["quantity"]} {i.get("unit") or units.get(i.get("product_name"), "")}'.strip()
+                                      for i in shown),
+                    "rate": shown[0].get("rate", 0) if len(shown) == 1 else "",
+                    "total": r.get("total", 0),
+                    "paid": r.get("amount_paid", 0) or 0, "balance": r.get("balance_due", 0) or 0,
+                    "status": r.get("payment_status", "")})
     return {"columns": [col("date", "Date"), col("invoice", "Invoice"), col("customer", "Customer"),
                         col("item", "Item"), col("qty", "Qty", "qty"), col("rate", "Rate", "money"),
                         col("total", "Total", "money"), col("paid", "Paid", "money"),
@@ -3786,7 +3845,7 @@ async def rep_day_book(start, end, **_):
         if in_range(d, start, end):
             rows.append({"date": d.get("date"), "type": "Sale", "reference": d.get("invoice_number", ""),
                          "party": d.get("customer_name", ""),
-                         "particulars": f'{d.get("quantity", 0)} {units.get(d.get("product_name"), "")} {d.get("product_name", "")}'.strip(),
+                         "particulars": sale_summary(sale_items(d)),
                          "amount": d.get("total", 0)})
     for d in await db.purchases.find().to_list(20000):
         if in_range(d, start, end):
@@ -4068,9 +4127,9 @@ SEARCH_SCOPES = {
     "sales": {
         "title": "Sales", "coll": "sales", "route": "/sales", "invoice": True,
         "text": ("invoice_number", "customer_name", "product_name"),
-        "party": "customer_name", "item": "product_name",
+        "party": "customer_name", "item": "product_name", "item_in_lines": True,
         "columns": [col("date", "Date"), col("invoice_number", "Invoice"), col("customer_name", "Customer"),
-                    col("product_name", "Item"), col("quantity", "Qty", "qty"),
+                    col("item_summary", "Items"),
                     col("total", "Total", "money"), col("balance_due", "Balance", "money"),
                     col("payment_status", "Status")],
     },
@@ -4218,14 +4277,21 @@ async def run_search(q="", scopes=None, preset=None, start=None, end=None, party
             query["date"] = {"$gte": s_date, "$lte": e_date}
         if party and spec.get("party"):
             query[spec["party"]] = party
-        if item and spec.get("item"):
+        if item and spec.get("item") and not spec.get("item_in_lines"):
             query[spec["item"]] = item
 
         rows = [clean(r) for r in await db[spec["coll"]].find(query).to_list(20000)]
 
+        if item and spec.get("item_in_lines"):
+            # An invoice can hold several products, so the filter has to look at
+            # every line rather than the one mirrored to the top level.
+            rows = [r for r in rows if any(i.get("product_name") == item for i in sale_items(r))]
         if needle:
             rows = [r for r in rows
-                    if any(needle in str(r.get(f, "") or "").lower() for f in spec["text"])]
+                    if any(needle in str(r.get(f, "") or "").lower() for f in spec["text"])
+                    or (spec.get("item_in_lines")
+                        and any(needle in str(i.get("product_name", "") or "").lower()
+                                for i in sale_items(r)))]
         if mode:
             rows = [r for r in rows if matches_mode(r, mode)]
         if status:
@@ -4240,6 +4306,9 @@ async def run_search(q="", scopes=None, preset=None, start=None, end=None, party
             r["_scope"] = key
             r["_route"] = spec["route"]
             r["_invoice"] = bool(spec.get("invoice")) and bool(r.get("invoice_number"))
+            if spec.get("item_in_lines"):
+                # "Atta +2 more" rather than just the first product's name.
+                r["item_summary"] = sale_summary(sale_items(r))
             if key == "grinding" and r.get("payment_method"):
                 r["payment_method"] = normalise_method(r["payment_method"])
         if total:
@@ -4775,13 +4844,21 @@ async def sales_analytics(user: dict = Depends(get_current_user)):
     cost_by_name = {n: p.get("cost_per_unit", 0) or 0 for n, p in products.items()}
     agg = {}
     for s in sales:
-        n = s.get("product_name", "?")
-        a = agg.setdefault(n, {"name": n, "qty": 0.0, "revenue": 0.0, "cogs": 0.0, "profit": 0.0})
-        a["qty"] += s.get("quantity", 0)
-        a["revenue"] += s.get("total", 0)
-        cogs = sale_cogs(s, cost_by_name)
-        a["cogs"] += cogs
-        a["profit"] += s.get("total", 0) - cogs
+        # Per line, so a mixed invoice credits each product with its own share
+        # rather than putting the whole invoice against the first one.
+        for it in sale_items(s):
+            n = it.get("product_name", "?")
+            a = agg.setdefault(n, {"name": n, "qty": 0.0, "revenue": 0.0, "cogs": 0.0, "profit": 0.0})
+            qty = it.get("quantity", 0) or 0
+            revenue = it.get("taxable", it.get("line_amount", 0)) or 0
+            unit_cost = it.get("unit_cost")
+            if unit_cost is None:
+                unit_cost = cost_by_name.get(n, 0) or 0
+            cogs = round(qty * unit_cost, 2)
+            a["qty"] += qty
+            a["revenue"] += revenue
+            a["cogs"] += cogs
+            a["profit"] += revenue - cogs
     rows = sorted(agg.values(), key=lambda r: r["revenue"], reverse=True)
     for r in rows:
         r["qty"] = round(r["qty"], 2)
