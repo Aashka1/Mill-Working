@@ -387,7 +387,7 @@ async def next_invoice_number():
     A counter document incremented atomically never reuses a number, whatever
     is deleted afterwards.
     """
-    year = datetime.now().year
+    year = local_now().year
     doc = await db.counters.find_one_and_update(
         {"id": f"invoice-{year}"},
         {"$inc": {"seq": 1}},
@@ -401,7 +401,7 @@ async def seed_invoice_counter():
     the counter has to begin past the highest of them or the first number it
     issues collides with one already on a customer's bill.
     """
-    year = datetime.now().year
+    year = local_now().year
     if await db.counters.find_one({"id": f"invoice-{year}"}):
         return
     highest = 0
@@ -532,7 +532,7 @@ async def adjust_product_stock(pid: str, body: StockAdjustBody, user: dict = Dep
     await db.stock_adjustments.insert_one({
         "id": str(uuid.uuid4()), "product_id": pid, "product_name": p["name"],
         "delta": round(body.delta, 3), "reason": body.reason or "",
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "created_at": now_iso()})
+        "date": local_today(), "created_at": now_iso()})
     await log_audit(user, "Adjusted stock", (
         f'{p["name"]}: {p.get("current_stock", 0)} → {new_stock} {p.get("unit")} '
         f'({body.delta:+g}){" · " + body.reason if body.reason else ""}'))
@@ -1094,6 +1094,7 @@ CUSTOMER_BILLING = (
     Billing("oil", "total", "customer_name", "Oil extraction", True),
     Billing("exchanges", "grinding_charge", "customer_name", "Exchange", True),
     Billing("wheat_withdrawals", "charge", "customer_name", "Deposit withdrawal", True),
+    Billing("wheat_deposits", "charge", "customer_name", "Milling charge", True),
 )
 
 SUPPLIER_BILLING = (
@@ -1571,8 +1572,8 @@ async def dashboard(user: dict = Depends(get_current_user)):
     grinding = by_coll["grinding"]
     oil = by_coll["oil"]
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    month = datetime.now().strftime("%Y-%m")
+    today = local_today()
+    month = today[:7]
 
     total_sales = sum(s.get("total", 0) for s in sales)
     total_purchases = sum(p.get("total", 0) for p in purchases)
@@ -1684,8 +1685,8 @@ async def notifications(user: dict = Depends(get_current_user)):
         due = p.get("balance_due", p.get("total", 0))
         notes.append({"type": "supplier_due", "level": "info",
                       "message": f'Supplier due: {p.get("supplier_name","?")} - Rs {due:.0f}'})
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    soon = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    today_str = local_today()
+    soon = (local_now() + timedelta(days=7)).strftime("%Y-%m-%d")
     for m in await db.maintenance.find().to_list(1000):
         nd = m.get("next_due_date", "")
         if nd and nd <= soon:
@@ -2113,6 +2114,10 @@ async def add_stock_with_cost(pid, qty, total_cost):
         "current_stock": round(new_stock, 3), "cost_per_unit": round(new_cost, 4)}})
 
 # ---- build helpers ----
+# Minutes the mill is ahead of UTC. Asia/Kolkata by default; a mill elsewhere
+# sets MILL_UTC_OFFSET_MINUTES rather than needing a code change.
+MILL_UTC_OFFSET_MINUTES = int(os.environ.get("MILL_UTC_OFFSET_MINUTES", "330"))
+
 # ---------------- Paying in kind ----------------
 # Many customers settle grinding by leaving flour or grain behind rather than
 # handing over cash. The charge is still a charge: it is computed and shown
@@ -3430,7 +3435,7 @@ async def reconcile_txn(tid: str, body: ReconcileBody, user: dict = Depends(get_
         raise HTTPException(status_code=404, detail="Not found")
     await db.bank_txns.update_one({"id": tid}, {"$set": {
         "reconciled": body.reconciled,
-        "reconciled_date": (body.reconciled_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")) if body.reconciled else None}})
+        "reconciled_date": (body.reconciled_date or local_today()) if body.reconciled else None}})
     return clean(await db.bank_txns.find_one({"id": tid}))
 
 @api_router.get("/bank-reconciliation")
@@ -3483,9 +3488,24 @@ async def bank_summary(user: dict = Depends(get_current_user)):
 # filters and the print, PDF and Excel exports are written once rather than
 # fourteen times. A new report is a builder function and a registry entry.
 
+def local_now() -> datetime:
+    """Now, where the mill is.
+
+    The server runs on UTC and the mill does not. India is five and a half
+    hours ahead, so between midnight and 05:30 local — which is when a flour
+    mill starts work — UTC is still on yesterday's date. Anything recorded then
+    carries the local date and fell outside every range ending "today",
+    disappearing from Today, this week, this month and the day book until the
+    server caught up.
+    """
+    return datetime.now(timezone.utc) + timedelta(minutes=MILL_UTC_OFFSET_MINUTES)
+
+def local_today() -> str:
+    return local_now().strftime("%Y-%m-%d")
+
 def date_range(preset: str = None, start: str = None, end: str = None):
     """Resolve a preset or an explicit range into (start, end) inclusive."""
-    today = datetime.now(timezone.utc).date()
+    today = local_now().date()
     p = (preset or "").lower().replace(" ", "-")
     if p == "today":
         return str(today), str(today)
@@ -4668,6 +4688,38 @@ class DepositBody(BaseModel):
     quantity_quintal: float = 0
     grain: str = "Wheat"
     note: str = ""
+    # How the milling is paid for, which decides the conversion applied now
+    # rather than when the customer comes back for the flour.
+    #   Cash  — the charge is billed, and only the milling loss comes off.
+    #   Flour Deduction — the fee is taken in flour, so more comes off.
+    milling_payment: str = "Cash"
+    conversion_percent: Optional[float] = None
+    # Charge for the milling itself, quoted per kilogram of wheat.
+    pisai_rate: Optional[float] = None
+    payment_mode: str = "Cash"
+    bank_id: Optional[str] = None
+    payment_status: str = "Paid"
+
+class IssueFlourBody(BaseModel):
+    date: str
+    customer_name: str
+    flour_kg: float = 0
+    flour_quintal: float = 0
+    note: str = ""
+
+async def conversion_percent(milling_payment: str, override=None) -> float:
+    """Share of the wheat that does not come back as flour.
+
+    Two rates because they cover different things: paying the milling charge in
+    cash loses only what milling costs in weight, while paying in flour loses
+    that plus the fee itself.
+    """
+    if override is not None:
+        return max(float(override), 0)
+    settings = await get_settings_doc()
+    if normalise_grinding_type(milling_payment) == FLOUR_DEDUCTION:
+        return float(settings.get("deposit_flour_deduction_percent", 15) or 0)
+    return float(settings.get("cash_grinding_percent", 5) or 0)
 
 class WithdrawalBody(BaseModel):
     date: str
@@ -4723,25 +4775,39 @@ async def deposit_balance(name: str):
         db.wheat_deposits.find({"customer_name": name}).to_list(20000),
         db.wheat_withdrawals.find({"customer_name": name}).to_list(20000),
     )
-    deposited = round(sum(d.get("quantity", 0) or 0 for d in deposits), 3)
-    drawn = round(sum((w.get("balance_drawn") if w.get("balance_drawn") is not None
-                       else w.get("wheat_drawn", 0)) or 0 for w in withdrawals), 3)
-    flour_given = round(sum(w.get("flour_delivered", 0) or 0 for w in withdrawals), 3)
-    deducted = round(sum(w.get("deducted_qty", 0) or 0 for w in withdrawals), 3)
-    charges = round(sum(w.get("charge", 0) or 0 for w in withdrawals), 2)
-    settings = await get_settings_doc()
-    remaining = round(deposited - drawn, 3)
-    # What the balance would yield today. An estimate, because the percentage
-    # can change before the customer comes back for it.
-    rate = float(settings.get("cash_grinding_percent", 5) or 0)
+    wheat_in = round(sum(d.get("quantity", 0) or 0 for d in deposits), 3)
+    # Wheat is converted the moment it arrives, so the account is kept in flour.
+    # Deposits recorded before conversion existed hold no flour figure; their
+    # wheat stood in for it one for one, which is what the old balance did.
+    flour_made = round(sum((d.get("flour_generated") if d.get("flour_generated") is not None
+                            else d.get("quantity", 0)) or 0 for d in deposits), 3)
+    wastage = round(sum(d.get("wastage", 0) or 0 for d in deposits), 3)
+
+    # Flour handed over. Older withdrawals also took the milling fee out of the
+    # balance at collection time, which is what balance_drawn recorded.
+    given = 0.0
+    for w in withdrawals:
+        if w.get("balance_drawn") is not None and w.get("deducted_qty"):
+            given += w["balance_drawn"]
+        else:
+            given += (w.get("flour_delivered") or w.get("balance_drawn")
+                      or w.get("wheat_drawn", 0) or 0)
+    given = round(given, 3)
+
+    deposit_charges = round(sum(d.get("charge", 0) or 0 for d in deposits), 2)
+    withdrawal_charges = round(sum(w.get("charge", 0) or 0 for w in withdrawals), 2)
+    remaining = round(flour_made - given, 3)
     return {
         "customer_name": name,
-        "deposited_kg": deposited, "deposited_quintal": round(deposited / QUINTAL_KG, 3),
-        "withdrawn_kg": drawn, "remaining_kg": remaining,
-        "remaining_quintal": round(remaining / QUINTAL_KG, 3),
-        "flour_delivered": flour_given, "flour_deducted": deducted,
-        "grinding_charges": charges,
-        "flour_estimate_at_current_rate": round(remaining * (1 - rate / 100), 3),
+        "wheat_deposited_kg": wheat_in,
+        "deposited_kg": wheat_in, "deposited_quintal": round(wheat_in / QUINTAL_KG, 3),
+        "flour_generated": flour_made, "wastage": wastage,
+        "flour_delivered": given, "withdrawn_kg": given,
+        "remaining_kg": remaining, "remaining_quintal": round(remaining / QUINTAL_KG, 3),
+        "flour_balance": remaining,
+        "flour_deducted": wastage,
+        "grinding_charges": round(deposit_charges + withdrawal_charges, 2),
+        "flour_estimate_at_current_rate": remaining,
         "deposits": len(deposits), "withdrawals": len(withdrawals),
     }
 
@@ -4792,34 +4858,45 @@ async def deposits_summary_data():
     )
     phones = {c["name"]: {"phone": c.get("phone", ""), "address": c.get("address", "")} for c in customers}
     rate = float(settings.get("cash_grinding_percent", 5) or 0)
+    blank = {"wheat": 0.0, "flour_made": 0.0, "wastage": 0.0, "given": 0.0, "charges": 0.0, "last": ""}
     agg = {}
     for d in deposits:
-        a = agg.setdefault(d.get("customer_name", "?"), {"deposited": 0.0, "drawn": 0.0, "flour": 0.0,
-                                                         "deducted": 0.0, "charges": 0.0, "last": ""})
-        a["deposited"] += d.get("quantity", 0) or 0
+        a = agg.setdefault(d.get("customer_name", "?"), dict(blank))
+        a["wheat"] += d.get("quantity", 0) or 0
+        a["flour_made"] += (d.get("flour_generated") if d.get("flour_generated") is not None
+                            else d.get("quantity", 0)) or 0
+        a["wastage"] += d.get("wastage", 0) or 0
+        a["charges"] += d.get("charge", 0) or 0
         a["last"] = max(a["last"], str(d.get("date") or ""))
     for w in withdrawals:
-        a = agg.setdefault(w.get("customer_name", "?"), {"deposited": 0.0, "drawn": 0.0, "flour": 0.0,
-                                                         "deducted": 0.0, "charges": 0.0, "last": ""})
-        a["drawn"] += (w.get("balance_drawn") if w.get("balance_drawn") is not None
-                       else w.get("wheat_drawn", 0)) or 0
-        a["flour"] += w.get("flour_delivered", 0) or 0
-        a["deducted"] += w.get("deducted_qty", 0) or 0
+        a = agg.setdefault(w.get("customer_name", "?"), dict(blank))
+        if w.get("balance_drawn") is not None and w.get("deducted_qty"):
+            a["given"] += w["balance_drawn"]
+        else:
+            a["given"] += (w.get("flour_delivered") or w.get("balance_drawn")
+                           or w.get("wheat_drawn", 0) or 0)
         a["charges"] += w.get("charge", 0) or 0
         a["last"] = max(a["last"], str(w.get("date") or ""))
     rows = []
     for name, a in sorted(agg.items()):
-        remaining = round(a["deposited"] - a["drawn"], 3)
+        remaining = round(a["flour_made"] - a["given"], 3)
         rows.append({"customer_name": name, "phone": phones.get(name, {}).get("phone", ""),
                      "address": phones.get(name, {}).get("address", ""),
-                     "deposited_kg": round(a["deposited"], 3), "withdrawn_kg": round(a["drawn"], 3),
-                     "remaining_kg": remaining, "remaining_quintal": round(remaining / QUINTAL_KG, 3),
-                     "flour_delivered": round(a["flour"], 3), "flour_deducted": round(a["deducted"], 3),
+                     "wheat_deposited_kg": round(a["wheat"], 3),
+                     "deposited_kg": round(a["wheat"], 3),
+                     "flour_generated": round(a["flour_made"], 3),
+                     "wastage": round(a["wastage"], 3),
+                     "flour_delivered": round(a["given"], 3), "withdrawn_kg": round(a["given"], 3),
+                     "remaining_kg": remaining, "flour_balance": remaining,
+                     "remaining_quintal": round(remaining / QUINTAL_KG, 3),
+                     "flour_deducted": round(a["wastage"], 3),
                      "grinding_charges": round(a["charges"], 2),
-                     "flour_estimate_at_current_rate": round(remaining * (1 - rate / 100), 3),
+                     "flour_estimate_at_current_rate": remaining,
                      "last_activity": a["last"]})
     return {"rows": rows,
             "total_remaining_kg": round(sum(r["remaining_kg"] for r in rows), 3),
+            "total_wheat_in": round(sum(r["wheat_deposited_kg"] for r in rows), 3),
+            "total_wastage": round(sum(r["wastage"] for r in rows), 3),
             "depositors": len(rows)}
 
 @api_router.get("/deposits/{customer}/statement")
@@ -4866,11 +4943,51 @@ async def create_deposit(body: DepositBody, user: dict = Depends(get_current_use
     # Keeps the depositor on the one customer master rather than a name that
     # exists only here.
     await ensure_party("customers", body.customer_name)
+
+    settings = await get_settings_doc()
+    method = normalise_grinding_type(body.milling_payment)
+    pct = await conversion_percent(body.milling_payment, body.conversion_percent)
+    wastage = round(qty * pct / 100, 3)
+    flour = round(qty - wastage, 3)
+
+    # Billed on the wheat that came in. Taking the fee in flour is itself the
+    # payment, so nothing is owed in money.
+    rate = body.pisai_rate if body.pisai_rate is not None else (settings.get("grinding_rate", 2) or 0)
+    charge = 0.0 if method == FLOUR_DEDUCTION else round(qty * rate, 2)
+
     doc = {"id": str(uuid.uuid4()), **body.model_dump(), "quantity": qty,
-           "quantity_quintal_display": round(qty / QUINTAL_KG, 3), "created_at": now_iso()}
+           "quantity_quintal_display": round(qty / QUINTAL_KG, 3),
+           "milling_payment": method, "conversion_percent": pct,
+           "wastage": wastage, "flour_generated": flour,
+           "pisai_rate": round(rate, 3), "charge": charge,
+           "invoice_number": await next_invoice_number(), "created_at": now_iso()}
     await db.wheat_deposits.insert_one(doc)
-    await log_audit(user, "Wheat deposit", f'{body.customer_name}: {qty} kg')
-    return {**clean(doc), "balance": await deposit_balance(body.customer_name)}
+
+    if charge > 0:
+        await db.invoices.insert_one({"id": str(uuid.uuid4()), "invoice_number": doc["invoice_number"],
+            "type": "Wheat Deposit", "ref_id": doc["id"], "customer_name": doc["customer_name"],
+            "date": doc["date"], "total": charge,
+            "payment_status": body.payment_status, "created_at": now_iso()})
+        if body.payment_status == "Paid":
+            await add_credit("customer", body.customer_name, charge, body.date, doc["id"],
+                             f'Milling charge {doc["invoice_number"]}',
+                             mode=body.payment_mode, bank_id=body.bank_id)
+        await sync_payment_state("wheat_deposits", doc["id"])
+    elif method == FLOUR_DEDUCTION and wastage > 0:
+        # The flour kept as the fee becomes the mill's, so it goes to mill stock
+        # and the material ledger. The customer's own flour never does.
+        await adjust_stock_by_name("Atta", wastage)
+        await post_material_ledger(
+            date=body.date, party_name=body.customer_name, item="Atta",
+            qty=wastage, unit="kg", value=round(wastage * await flour_unit_rate("Atta"), 2),
+            direction="in", ref_id=doc["id"], source="deposit",
+            note=f'Milling fee taken in flour on deposit {doc["invoice_number"]}')
+
+    await log_audit(user, "Wheat deposit",
+                    f'{body.customer_name}: {qty} kg wheat became {flour} kg flour '
+                    f'({pct}% conversion, {method})')
+    return {**clean(await db.wheat_deposits.find_one({"id": doc["id"]})),
+            "balance": await deposit_balance(body.customer_name)}
 
 @api_router.put("/deposits/{did}")
 async def edit_deposit(did: str, body: DepositBody, user: dict = Depends(get_current_user)):
@@ -4994,6 +5111,31 @@ async def settle_withdrawal(doc: dict, body: WithdrawalBody):
     # Credit (Due) leaves the charge on the customer's account, which the
     # ledger already shows as a debit with no matching credit.
 
+@api_router.post("/issue-flour")
+async def issue_flour(body: IssueFlourBody, user: dict = Depends(get_current_user)):
+    """Hand flour over from a customer's balance.
+
+    The wheat was converted when it arrived, so this only moves flour out of
+    the customer's account. It touches no mill stock: the flour was never the
+    mill's to sell.
+    """
+    qty = to_kg(body.flour_kg, body.flour_quintal)
+    if qty <= 0:
+        raise HTTPException(status_code=400, detail="Enter a quantity greater than zero")
+    balance = await deposit_balance(body.customer_name)
+    if qty > balance["remaining_kg"] + 0.001:
+        raise HTTPException(status_code=400, detail=(
+            f'{body.customer_name} has only {balance["remaining_kg"]} kg of flour on account'))
+    doc = {"id": str(uuid.uuid4()), "date": body.date, "customer_name": body.customer_name,
+           "flour_delivered": qty, "grinding_type": "Issue", "deducted_qty": 0,
+           "deduction_percent": 0, "charge": 0, "wheat_drawn": qty, "balance_drawn": qty,
+           "note": body.note, "payment_status": "Paid",
+           "invoice_number": await next_invoice_number(), "created_at": now_iso()}
+    await db.wheat_withdrawals.insert_one(doc)
+    await log_audit(user, "Flour issued",
+                    f'{body.customer_name}: {qty} kg, {round(balance["remaining_kg"] - qty, 3)} kg left')
+    return {**clean(doc), "balance": await deposit_balance(body.customer_name)}
+
 @api_router.get("/withdrawals")
 async def list_withdrawals(customer: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = {"customer_name": customer} if customer else {}
@@ -5078,7 +5220,7 @@ async def delete_withdrawal(wid: str, user: dict = Depends(require_admin)):
 async def sales_analytics(user: dict = Depends(get_current_user)):
     sales = await db.sales.find().to_list(30000)
     products = {p["name"]: p for p in await db.products.find().to_list(1000)}
-    t = datetime.now().strftime("%Y-%m-%d")
+    t = local_today()
     m = t[:7]
     y = t[:4]
     def rev(prefix):
