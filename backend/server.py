@@ -375,8 +375,47 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 async def next_invoice_number():
-    count = await db.invoices.count_documents({})
-    return f"INV-{datetime.now().year}-{count + 1:04d}"
+    """Issue the next number, once.
+
+    This counted the invoices collection, which repeats a number in two
+    ordinary situations: a record that takes a number without writing an
+    invoice row — a grinding job settled in flour owes nothing, so no bill is
+    raised — and any deletion, which lowers the count so the next number
+    collides with one already issued. Two customers holding the same invoice
+    number is not something a mill can explain away.
+
+    A counter document incremented atomically never reuses a number, whatever
+    is deleted afterwards.
+    """
+    year = datetime.now().year
+    doc = await db.counters.find_one_and_update(
+        {"id": f"invoice-{year}"},
+        {"$inc": {"seq": 1}},
+        upsert=True, return_document=ReturnDocument.AFTER)
+    return f'INV-{year}-{doc["seq"]:04d}'
+
+async def seed_invoice_counter():
+    """Start the counter above whatever has already been issued.
+
+    Existing databases carry numbers allocated by the old counting scheme, so
+    the counter has to begin past the highest of them or the first number it
+    issues collides with one already on a customer's bill.
+    """
+    year = datetime.now().year
+    if await db.counters.find_one({"id": f"invoice-{year}"}):
+        return
+    highest = 0
+    for coll in ("invoices", "sales", "grinding", "oil", "exchanges", "wheat_withdrawals"):
+        async for row in db[coll].find({"invoice_number": {"$regex": f"^INV-{year}-"}},
+                                       {"invoice_number": 1}):
+            try:
+                highest = max(highest, int(str(row["invoice_number"]).rsplit("-", 1)[1]))
+            except (ValueError, IndexError):
+                continue
+    await db.counters.update_one({"id": f"invoice-{year}"},
+                                 {"$setOnInsert": {"seq": highest}}, upsert=True)
+    if highest:
+        logger.warning("Invoice counter for %s started at %d, past the numbers already issued", year, highest)
 
 # ---------------- Products / Inventory ----------------
 
@@ -1712,6 +1751,7 @@ async def startup():
         await db[coll].create_index("phone")
     await db.bank_txns.create_index("mode")
     await consolidate_parties()
+    await seed_invoice_counter()
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@agrimill.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
     existing = await db.users.find_one({"email": admin_email})
@@ -2552,6 +2592,13 @@ async def pay_grinding(rid: str, body: PayBody, user: dict = Depends(get_current
 async def pay_oil(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
     state = await take_payment("oil", rid, body.payment_method, body.amount, body.date, mode=body.payment_mode, bank_id=body.bank_id)
     await log_audit(user, "Recorded payment", f'oil {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
+    return state
+
+@api_router.patch("/withdrawals/{rid}/pay")
+async def pay_withdrawal(rid: str, body: PayBody, user: dict = Depends(get_current_user)):
+    state = await take_payment("wheat_withdrawals", rid, body.payment_method, body.amount, body.date,
+                               mode=body.payment_mode, bank_id=body.bank_id)
+    await log_audit(user, "Recorded payment", f'deposit withdrawal {rid}: Rs {body.amount if body.amount is not None else "full balance"}')
     return state
 
 @api_router.patch("/purchases/{rid}/pay")
@@ -4698,6 +4745,9 @@ async def deposit_statement(customer: str, user: dict = Depends(get_current_user
                         "deducted": w.get("deducted_qty", 0),
                         "flour": w.get("flour_delivered", 0),
                         "charge": w.get("charge", 0),
+                        "amount_paid": w.get("amount_paid", 0) or 0,
+                        "balance_due": w.get("balance_due", 0) or 0,
+                        "payment_status": w.get("payment_status", ""),
                         "invoice_number": w.get("invoice_number", ""),
                         "note": w.get("note", "")})
     entries.sort(key=lambda e: (str(e.get("date") or ""), e["kind"] != "Deposit"))

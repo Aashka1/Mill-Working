@@ -10,7 +10,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Wheat, Download, Trash2, History, ArrowDownToLine } from "lucide-react";
+import { Plus, Wheat, Download, Trash2, History, ArrowDownToLine, IndianRupee } from "lucide-react";
+import { PaymentDialog } from "@/components/PaymentDialog";
 import { toast } from "sonner";
 
 const CASH = "Cash";
@@ -36,6 +37,7 @@ export default function Deposits() {
   const [wdOpen, setWdOpen] = useState(false);
   const [wf, setWf] = useState(blankWithdrawal());
   const [statement, setStatement] = useState(null);
+  const [payFor, setPayFor] = useState(null);
 
   const loadSummary = useCallback(async () => {
     try {
@@ -339,6 +341,10 @@ export default function Deposits() {
         </DialogContent>
       </Dialog>
 
+      <PaymentDialog open={!!payFor} onOpenChange={(o) => !o && setPayFor(null)} record={payFor}
+        path="withdrawals" totalField="charge"
+        onDone={() => { loadSummary(); if (statement) openStatement(statement.balance.customer_name); }} />
+
       {/* Statement */}
       <Dialog open={!!statement} onOpenChange={(o) => !o && setStatement(null)}>
         <DialogContent className="max-w-4xl max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
@@ -370,6 +376,15 @@ export default function Deposits() {
                     <TableCell className="text-right">{e.charge ? money(e.charge) : ""}</TableCell>
                     <TableCell className="text-right font-semibold tabular-nums">{e.balance} kg</TableCell>
                     <TableCell className="text-right flex gap-1 justify-end">
+                      {/* A charge left on credit can be settled from here, the
+                          same as any other bill. */}
+                      {e.kind === "Withdrawal" && e.charge > 0 && e.payment_status !== "Paid" && (
+                        <Button variant="ghost" size="icon" title="Record a payment"
+                          onClick={() => setPayFor({ id: e.id, charge: e.charge, amount_paid: e.amount_paid || 0, date: e.date })}
+                          data-testid={`pay-withdrawal-${e.id}`}>
+                          <IndianRupee className="h-4 w-4 text-secondary" />
+                        </Button>
+                      )}
                       {e.invoice_number && (
                         <Button variant="ghost" size="icon" title="Invoice"
                           onClick={() => downloadFile(`/invoices/${e.id}/pdf`, `${e.invoice_number}.pdf`)}>
