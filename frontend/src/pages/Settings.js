@@ -25,13 +25,17 @@ export default function Settings() {
   const [savingUser, setSavingUser] = useState(false);
   const [costPreview, setCostPreview] = useState(null);
   const [costBusy, setCostBusy] = useState(false);
+  // Products whose cost went to zero are one problem; costs inflated by stock
+  // taken as a fee are another, and those are not zero, so they need the wider
+  // scope to be found at all.
+  const [costAll, setCostAll] = useState(false);
 
   const previewCosts = async () => {
     setCostBusy(true);
     try {
-      const { data } = await api.get("/products/cost-repair/preview");
+      const { data } = await api.get(`/products/cost-repair/preview?only_zero=${!costAll}`);
       setCostPreview(data);
-      if (data.count === 0) toast.success("Every product already has a cost — nothing to repair");
+      if (data.count === 0) toast.success("Nothing to repair — every cost already matches what was paid");
     } catch (err) {
       toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
     } finally {
@@ -42,7 +46,7 @@ export default function Settings() {
   const applyCosts = async () => {
     setCostBusy(true);
     try {
-      const { data } = await api.post("/products/cost-repair");
+      const { data } = await api.post(`/products/cost-repair?only_zero=${!costAll}`);
       toast.success(`Rebuilt ${data.count} product cost${data.count === 1 ? "" : "s"}`);
       setCostPreview({ ...data, applied: true });
     } catch (err) {
@@ -203,11 +207,21 @@ export default function Settings() {
         <Card className="p-6 border-border/60 mb-6">
           <div className="flex items-center gap-2 mb-4"><Wrench className="h-5 w-5 text-primary" /><h3 className="font-heading font-bold text-lg">Rebuild Cost Basis</h3></div>
           <p className="text-sm text-muted-foreground mb-4">
-            An earlier bug set a product&apos;s cost to zero whenever the product was edited, which makes every
-            sale of it report its full price as profit. This rebuilds each cost from what the shop actually
-            paid — purchases, production, and stock taken as grinding fees — and corrects the profit already
-            recorded on those sales. Preview first; nothing is written until you apply.
+            Rebuilds each product&apos;s cost from what the shop actually paid — purchases, production, and
+            the wheat taken in on exchanges — while stock kept as a fee counts toward the quantity at no
+            cost, because none was paid for it. Profit already recorded on sales that carry no cost is
+            corrected too. Preview first; nothing is written until you apply.
           </p>
+          <p className="text-sm text-muted-foreground mb-4">
+            The rebuilt figure is the average across everything ever acquired, which is not always the same
+            as the running average a product carries today. Check the preview against what you know you paid
+            before applying it.
+          </p>
+          <label className="flex items-center gap-2 text-sm mb-4 cursor-pointer">
+            <input type="checkbox" checked={costAll} onChange={(e) => { setCostAll(e.target.checked); setCostPreview(null); }}
+              className="h-4 w-4" data-testid="cost-scope" />
+            Check every product, not only those left with no cost at all
+          </label>
           <div className="flex gap-2">
             <Button variant="outline" className="h-11" onClick={previewCosts} disabled={costBusy} data-testid="cost-preview-btn">
               Preview changes
@@ -220,7 +234,7 @@ export default function Settings() {
           </div>
 
           {costPreview && costPreview.count === 0 && (
-            <p className="text-sm text-secondary mt-4" data-testid="cost-clean">Nothing to repair — every product has a cost.</p>
+            <p className="text-sm text-secondary mt-4" data-testid="cost-clean">Nothing to repair — every cost already matches what was paid.</p>
           )}
 
           {costPreview?.count > 0 && (
@@ -247,8 +261,11 @@ export default function Settings() {
                 </TableBody>
               </Table>
               <p className="text-xs text-muted-foreground mt-2">
-                Stock value moves by ₹{costPreview.stock_value_change} and previously overstated profit
-                falls by ₹{costPreview.profit_correction} across {costPreview.sales_restamped} sale(s).
+                Stock value moves by ₹{costPreview.stock_value_change}
+                {costPreview.sales_restamped > 0 && (
+                  <> and profit already recorded is corrected by ₹{costPreview.profit_correction} across{" "}
+                  {costPreview.sales_restamped} sale(s)</>
+                )}.
               </p>
             </div>
           )}
