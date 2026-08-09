@@ -1696,22 +1696,123 @@ async def notifications(user: dict = Depends(get_current_user)):
 
 @api_router.get("/export/{kind}")
 async def export_excel(kind: str, request: Request):
+    """Spreadsheet export for a module.
+
+    This used to dump each stored document's raw fields into cells. That broke
+    the moment a sale could hold several products, because a list of line items
+    is not a cell value and openpyxl refuses it — the download returned a 500
+    rather than a file. Each kind now declares the columns a person actually
+    wants, and a sale contributes one row per product so quantities and rates
+    stay readable.
+    """
     await get_current_user(request)
-    coll_map = {"sales": "sales", "purchases": "purchases", "grinding": "grinding",
-                "oil": "oil", "expenses": "expenses"}
-    if kind not in coll_map:
+    if kind not in ("sales", "purchases", "grinding", "oil", "expenses",
+                    "deposits", "withdrawals", "exchanges"):
         raise HTTPException(status_code=404, detail="Unknown report")
-    docs = [clean(d) for d in await db[coll_map[kind]].find().to_list(5000)]
+
+    units = {p["name"]: p.get("unit", "kg") for p in await db.products.find().to_list(2000)}
+    headers, rows = [], []
+
+    if kind == "sales":
+        headers = ["Invoice", "Date", "Customer", "Product", "Quantity", "Unit", "Rate",
+                   "Discount", "Tax", "Line Total", "Invoice Total", "Paid", "Balance",
+                   "Payment Mode", "Status"]
+        for d in await db.sales.find().sort("date", -1).to_list(20000):
+            lines = sale_items(d)
+            for i, it in enumerate(lines):
+                rows.append([
+                    d.get("invoice_number", ""), d.get("date", ""), d.get("customer_name", ""),
+                    it.get("product_name", ""), it.get("quantity", 0),
+                    it.get("unit") or units.get(it.get("product_name"), ""),
+                    it.get("rate", 0), it.get("discount", 0), it.get("gst_amount", 0),
+                    it.get("line_total", it.get("line_amount", 0)),
+                    # Invoice-level figures on the first line only, so totals are
+                    # not summed several times over when the sheet is added up.
+                    d.get("total", 0) if i == 0 else "",
+                    (d.get("amount_paid", 0) or 0) if i == 0 else "",
+                    (d.get("balance_due", 0) or 0) if i == 0 else "",
+                    clean_mode(d.get("payment_mode")) if i == 0 else "",
+                    d.get("payment_status", "") if i == 0 else "",
+                ])
+    elif kind == "purchases":
+        headers = ["Date", "Supplier", "Product", "Quantity", "Rate", "Total", "Paid",
+                   "Balance", "Payment Mode", "Status"]
+        for d in await db.purchases.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("date", ""), d.get("supplier_name", ""), d.get("product_name", ""),
+                         d.get("quantity", 0), d.get("rate", 0), d.get("total", 0),
+                         d.get("amount_paid", 0) or 0, d.get("balance_due", 0) or 0,
+                         clean_mode(d.get("payment_mode")), d.get("payment_status", "")])
+    elif kind == "grinding":
+        headers = ["Invoice", "Date", "Customer", "Item", "Weight In", "Output", "Paid By",
+                   "Deduction %", "Flour Kept", "Delivered", "Charge", "Paid", "Balance", "Status"]
+        for d in await db.grinding.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("invoice_number", ""), d.get("date", ""), d.get("customer_name", ""),
+                         d.get("grain_type", "Wheat"), d.get("wheat_weight", 0), d.get("output_atta", 0),
+                         normalise_method(d.get("payment_method")),
+                         d.get("deduction_percent", 0) or 0, d.get("deducted_flour", 0) or 0,
+                         d.get("final_flour_delivered", d.get("customer_receives", 0)) or 0,
+                         d.get("total_charge", 0), d.get("amount_paid", 0) or 0,
+                         d.get("balance_due", 0) or 0, d.get("payment_status", "")])
+    elif kind == "oil":
+        headers = ["Invoice", "Date", "Customer", "Seed", "Seed Qty", "Rate/kg", "Oil", "Cake",
+                   "Extraction Charge", "Cake Bought", "Net Total", "Paid", "Balance", "Status"]
+        for d in await db.oil.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("invoice_number", ""), d.get("date", ""), d.get("customer_name", ""),
+                         d.get("seed_type", ""), d.get("quantity_received", 0),
+                         d.get("extraction_rate", 0) or 0, d.get("oil_extracted", 0),
+                         d.get("oil_cake_produced", 0) or 0,
+                         d.get("extraction_charge", d.get("charge", 0)),
+                         d.get("cake_value", 0) or 0, d.get("total", 0),
+                         d.get("amount_paid", 0) or 0, d.get("balance_due", 0) or 0,
+                         d.get("payment_status", "")])
+    elif kind == "exchanges":
+        headers = ["Invoice", "Date", "Customer", "Wheat In", "Flour Produced", "Deducted",
+                   "Delivered", "Rate", "Grinding Charge", "Paid By"]
+        for d in await db.exchanges.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("invoice_number", ""), d.get("date", ""), d.get("customer_name", ""),
+                         d.get("wheat_qty", 0), d.get("flour_produced", d.get("atta_given", 0)),
+                         d.get("deducted_flour", 0) or 0,
+                         d.get("final_flour_delivered", d.get("atta_given", 0)),
+                         d.get("grinding_rate", 0) or 0, d.get("grinding_charge", 0) or 0,
+                         normalise_method(d.get("payment_method"))])
+    elif kind == "deposits":
+        headers = ["Date", "Depositor", "Grain", "Quantity (kg)", "Quantity (qt)", "Note"]
+        for d in await db.wheat_deposits.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("date", ""), d.get("customer_name", ""), d.get("grain", "Wheat"),
+                         d.get("quantity", 0), round((d.get("quantity", 0) or 0) / QUINTAL_KG, 3),
+                         d.get("note", "")])
+    elif kind == "withdrawals":
+        headers = ["Invoice", "Date", "Depositor", "Grinding Type", "Deduction %", "Deducted",
+                   "Flour Delivered", "Off Deposit", "Charge", "Paid", "Balance", "Status"]
+        for d in await db.wheat_withdrawals.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("invoice_number", ""), d.get("date", ""), d.get("customer_name", ""),
+                         d.get("grinding_type", ""), d.get("deduction_percent", 0) or 0,
+                         d.get("deducted_qty", 0) or 0, d.get("flour_delivered", 0) or 0,
+                         d.get("balance_drawn", d.get("wheat_drawn", 0)) or 0,
+                         d.get("charge", 0) or 0, d.get("amount_paid", 0) or 0,
+                         d.get("balance_due", 0) or 0, d.get("payment_status", "")])
+    else:
+        headers = ["Date", "Category", "Description", "Amount"]
+        for d in await db.expenses.find().sort("date", -1).to_list(20000):
+            rows.append([d.get("date", ""), d.get("category", ""), d.get("description", ""),
+                         d.get("amount", 0)])
+
     wb = Workbook()
     ws = wb.active
-    ws.title = kind
-    if docs:
-        headers = [k for k in docs[0].keys() if k not in ("created_at",)]
-        ws.append(headers)
-        for d in docs:
-            ws.append([d.get(h, "") for h in headers])
-    else:
-        ws.append(["No data"])
+    ws.title = kind.title()[:31]
+    ws.append(headers)
+    for row in rows:
+        # Anything that is not a number or a string cannot be a cell; coerce it
+        # rather than letting one odd value fail the whole download.
+        ws.append([v if isinstance(v, (int, float, str)) else ("" if v is None else str(v))
+                   for v in row])
+    if not rows:
+        ws.append(["No data for this period"])
+    for i, h in enumerate(headers, start=1):
+        widest = max([len(str(h))] + [len(str(r[i - 1])) for r in rows[:500]]) if rows else len(str(h))
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(widest + 2, 40)
+    ws.freeze_panes = "A2"
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
