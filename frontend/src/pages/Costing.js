@@ -34,7 +34,7 @@ export default function Costing() {
         title="Product Costing" subtitle="Production cost vs selling price — set prices with confidence"
         search={q} setSearch={setQ} searchTestid="search-costing"
       />
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Finished Good</TableHead><TableHead>Category</TableHead>

@@ -139,7 +139,7 @@ export default function Production() {
         </DialogContent>
       </Dialog>
 
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Date</TableHead><TableHead>Mill</TableHead><TableHead>Input Used</TableHead>

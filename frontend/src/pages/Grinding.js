@@ -132,7 +132,7 @@ export default function Grinding() {
             and an uncapped dialog pushes Save Order below the fold. Header and
             footer stay pinned via explicit grid rows; minmax(0,1fr) lets the
             middle row shrink below its content so it can actually overflow. */}
-        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-lg dialog-scroll">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "New"} Grinding Order</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">
@@ -298,7 +298,7 @@ export default function Grinding() {
       <PaymentDialog open={!!payFor} onOpenChange={(o) => !o && setPayFor(null)} record={payFor} path="grinding" totalField="total_charge" onDone={() => grinding.load()} />
 
       <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4 bg-muted/50 rounded-lg p-3"><Info className="h-4 w-4" /> Customer-owned grain — only shop's retained grain (grain payment) affects inventory.</div>
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Invoice</TableHead><TableHead>Date</TableHead><TableHead>Customer</TableHead>

@@ -74,7 +74,7 @@ export default function OilExtraction() {
       <Dialog open={open} onOpenChange={setOpen}>
         {/* See Grinding.js: same capped-height layout, needed here too now the
             form carries the cake-purchase and part-payment fields. */}
-        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-lg dialog-scroll">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "New"} Oil Extraction Order</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">
@@ -185,7 +185,7 @@ export default function OilExtraction() {
       <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4 bg-muted/50 rounded-lg p-3"><Info className="h-4 w-4" /> Customer-owned seeds — only retained oil/cake affects shop inventory.</div>
       <PaymentDialog open={!!payFor} onOpenChange={(o) => !o && setPayFor(null)} record={payFor} path="oil" onDone={() => oil.load()} />
 
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Invoice</TableHead><TableHead>Date</TableHead><TableHead>Customer</TableHead><TableHead>Seed</TableHead>

@@ -197,7 +197,7 @@ export default function Exchange() {
         }
       />
       <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4 bg-muted/50 rounded-lg p-3"><Info className="h-4 w-4" /> Shop <b className="mx-1">Wheat Crop</b> stock increases, <b className="mx-1">Atta</b> stock decreases.</div>
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Date</TableHead><TableHead>Customer</TableHead><TableHead>Washed</TableHead>

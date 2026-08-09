@@ -73,7 +73,7 @@ export default function Maintenance() {
         </DialogContent>
       </Dialog>
 
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Machine</TableHead><TableHead>Task</TableHead><TableHead>Last Serviced</TableHead>

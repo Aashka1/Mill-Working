@@ -217,7 +217,7 @@ export default function Inventory() {
               </DialogContent>
             </Dialog>
           </div>
-          <Card className="border-border/60">
+          <Card className="border-border/60 scroll-x">
             <Table>
               <TableHeader><TableRow>
                 <TableHead>Product</TableHead><TableHead>Category</TableHead><TableHead className="text-right">Stock</TableHead>
@@ -332,7 +332,7 @@ export default function Inventory() {
               </DialogContent>
             </Dialog>
           </div>
-          <Card className="border-border/60">
+          <Card className="border-border/60 scroll-x">
             <Table>
               <TableHeader><TableRow>
                 <TableHead>Date</TableHead><TableHead>Supplier</TableHead><TableHead>Product</TableHead>

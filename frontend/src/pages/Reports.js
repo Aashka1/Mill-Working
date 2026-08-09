@@ -230,7 +230,7 @@ export default function Reports() {
             </div>
           )}
 
-          <Card className="border-border/60 overflow-x-auto">
+          <Card className="border-border/60 scroll-x">
             <Table>
               <TableHeader>
                 <TableRow>

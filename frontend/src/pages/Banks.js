@@ -215,7 +215,7 @@ export default function Banks() {
         </TabsList>
 
         <TabsContent value="accounts">
-          <Card className="border-border/60">
+          <Card className="border-border/60 scroll-x">
             <Table>
               <TableHeader><TableRow>
                 <TableHead>Bank</TableHead><TableHead>Account</TableHead><TableHead>IFSC</TableHead>
@@ -273,7 +273,7 @@ export default function Banks() {
             </div>
           </Card>
 
-          <Card className="border-border/60">
+          <Card className="border-border/60 scroll-x">
             <Table>
               <TableHeader><TableRow>
                 <TableHead>Date</TableHead><TableHead>Account</TableHead><TableHead>Type</TableHead>
@@ -362,7 +362,7 @@ export default function Banks() {
                 </Card>
               )}
 
-              <Card className="border-border/60">
+              <Card className="border-border/60 scroll-x">
                 <div className="p-4 pb-0 text-sm text-muted-foreground">
                   {recon.unreconciled_count} not yet reconciled · {recon.reconciled_count} reconciled
                 </div>
@@ -397,7 +397,7 @@ export default function Banks() {
 
       {/* Add / edit account */}
       <Dialog open={accOpen} onOpenChange={(o) => { setAccOpen(o); if (!o) setEditingAcc(null); }}>
-        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-lg dialog-scroll">
           <DialogHeader><DialogTitle>{editingAcc ? "Edit" : "Add"} Bank Account</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div><Label>Bank name</Label><Input value={af.bank_name} onChange={(e) => setAf({ ...af, bank_name: e.target.value })} className="h-11 mt-1" data-testid="bank-name" /></div>
@@ -428,7 +428,7 @@ export default function Banks() {
 
       {/* Manual transaction */}
       <Dialog open={txnOpen} onOpenChange={setTxnOpen}>
-        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-lg dialog-scroll">
           <DialogHeader><DialogTitle>Bank Transaction</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <p className="text-xs text-muted-foreground">

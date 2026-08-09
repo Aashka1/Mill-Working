@@ -191,7 +191,7 @@ export default function Search() {
       )}
 
       {data?.groups?.map((group) => (
-        <Card key={group.scope} className="border-border/60 mb-6 overflow-x-auto" data-testid={`search-group-${group.scope}`}>
+        <Card key={group.scope} className="border-border/60 mb-6 scroll-x" data-testid={`search-group-${group.scope}`}>
           <div className="p-4 pb-2 flex items-center gap-2">
             <h3 className="font-heading font-bold text-lg">{group.title}</h3>
             <Badge variant="outline">{group.count}</Badge>

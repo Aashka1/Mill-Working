@@ -224,7 +224,7 @@ export default function Settings() {
           )}
 
           {costPreview?.count > 0 && (
-            <div className="mt-4">
+            <div className="mt-4 scroll-x">
               {costPreview.applied && <p className="text-sm text-secondary mb-2">Applied.</p>}
               <Table>
                 <TableHeader><TableRow>
@@ -256,7 +256,7 @@ export default function Settings() {
       )}
 
       {isAdmin && (
-        <Card className="p-6 border-border/60 mb-6">
+        <Card className="p-6 border-border/60 mb-6 scroll-x">
           <div className="flex items-center gap-2 mb-4"><Users className="h-5 w-5 text-primary" /><h3 className="font-heading font-bold text-lg">Users</h3></div>
 
           <form onSubmit={addUser} className="grid grid-cols-1 sm:grid-cols-5 gap-3 items-end mb-6">
@@ -315,7 +315,7 @@ export default function Settings() {
         </Card>
       )}
 
-      <Card className="p-6 border-border/60">
+      <Card className="p-6 border-border/60 scroll-x">
         <div className="flex items-center gap-2 mb-4"><ShieldCheck className="h-5 w-5 text-primary" /><h3 className="font-heading font-bold text-lg">Audit Log</h3></div>
         <Table>
           <TableHeader><TableRow><TableHead>Time</TableHead><TableHead>User</TableHead><TableHead>Action</TableHead><TableHead>Detail</TableHead></TableRow></TableHeader>

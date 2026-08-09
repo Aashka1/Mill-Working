@@ -20,7 +20,7 @@ export default function Invoices() {
         title="Invoices" subtitle="All generated bills — download as PDF"
         search={q} setSearch={setQ} searchTestid="search-invoices"
       />
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Invoice No.</TableHead><TableHead>Type</TableHead><TableHead>Date</TableHead>

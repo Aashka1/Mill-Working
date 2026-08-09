@@ -18,7 +18,13 @@ const CASH = "Cash";
 const FLOUR = "Flour Deduction";
 const MATERIAL = "Material";
 
-const blankDeposit = () => ({ date: today(), customer_name: "", quantity_kg: "", quantity_quintal: "", grain: "Wheat", note: "" });
+const blankDeposit = () => ({
+  date: today(), customer_name: "", quantity_kg: "", quantity_quintal: "", grain: "Wheat", note: "",
+  milling_payment: CASH, conversion_percent: "", pisai_rate: "",
+  payment_mode: "Cash", bank_id: "", payment_status: "Paid",
+});
+
+const blankIssue = () => ({ date: today(), customer_name: "", flour_kg: "", flour_quintal: "", note: "" });
 const blankWithdrawal = () => ({
   date: today(), customer_name: "", flour_kg: "", flour_quintal: "",
   grinding_type: CASH, deduction_percent: "", charge_per_kg: "",
@@ -37,6 +43,8 @@ export default function Deposits() {
   const [wdOpen, setWdOpen] = useState(false);
   const [wf, setWf] = useState(blankWithdrawal());
   const [statement, setStatement] = useState(null);
+  const [issueOpen, setIssueOpen] = useState(false);
+  const [isf, setIsf] = useState(blankIssue());
   const [payFor, setPayFor] = useState(null);
 
   const loadSummary = useCallback(async () => {
@@ -69,12 +77,15 @@ export default function Deposits() {
   const saveDeposit = async () => {
     if (!df.customer_name) return toast.error("Choose or add the depositor");
     try {
-      await api.post("/deposits", {
+      const { data } = await api.post("/deposits", {
         ...df,
         quantity_kg: +df.quantity_kg || 0,
         quantity_quintal: +df.quantity_quintal || 0,
+        conversion_percent: df.conversion_percent === "" ? null : +df.conversion_percent,
+        pisai_rate: df.pisai_rate === "" ? null : +df.pisai_rate,
+        bank_id: df.milling_payment === FLOUR ? null : (df.bank_id || null),
       });
-      toast.success("Deposit recorded");
+      toast.success(`${data.quantity} kg wheat became ${data.flour_generated} kg flour · balance ${data.balance.remaining_kg} kg`);
       setDepOpen(false); setDf(blankDeposit());
       loadSummary();
     } catch (e) {
@@ -110,6 +121,23 @@ export default function Deposits() {
     }
   };
 
+  const openIssue = (name = "") => { setIsf({ ...blankIssue(), customer_name: name }); setIssueOpen(true); };
+
+  const saveIssue = async () => {
+    if (!isf.customer_name) return toast.error("Choose the customer");
+    try {
+      const { data } = await api.post("/issue-flour", {
+        ...isf, flour_kg: +isf.flour_kg || 0, flour_quintal: +isf.flour_quintal || 0,
+      });
+      toast.success(`${data.flour_delivered} kg issued · ${data.balance.remaining_kg} kg left`);
+      setIssueOpen(false); setIsf(blankIssue());
+      loadSummary();
+      if (statement) openStatement(data.customer_name);
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e.response?.data?.detail) || e.message);
+    }
+  };
+
   const removeEntry = async (entry) => {
     const path = entry.kind === "Deposit" ? "deposits" : "withdrawals";
     try {
@@ -121,6 +149,19 @@ export default function Deposits() {
       toast.error(formatApiErrorDetail(e.response?.data?.detail) || e.message);
     }
   };
+
+  // The conversion the deposit will apply, shown before it is saved.
+  const depWheat = (+df.quantity_kg || 0) + (+df.quantity_quintal || 0) * 100;
+  const depPctDefault = df.milling_payment === FLOUR
+    ? (settings.deposit_flour_deduction_percent ?? 15)
+    : (settings.cash_grinding_percent ?? 5);
+  const depPct = df.conversion_percent === "" ? depPctDefault : +df.conversion_percent;
+  const depWastage = +(depWheat * depPct / 100).toFixed(3);
+  const depFlour = +(depWheat - depWastage).toFixed(3);
+  const depRate = df.pisai_rate === "" ? (settings.grinding_rate ?? 2) : +df.pisai_rate;
+  const depCharge = df.milling_payment === FLOUR ? 0 : +(depWheat * depRate).toFixed(2);
+  const issueQty = (+isf.flour_kg || 0) + (+isf.flour_quintal || 0) * 100;
+  const issueBal = summary.rows.find((r) => r.customer_name === isf.customer_name)?.remaining_kg ?? 0;
 
   // Mirrors the backend so the operator sees the outcome before saving.
   const flourAsked = (+wf.flour_kg || 0) + (+wf.flour_quintal || 0) * 100;
@@ -143,8 +184,12 @@ export default function Deposits() {
         title="Deposit Wheat" subtitle="Wheat held for farmers, and flour drawn against it"
         actions={
           <>
-            <Button variant="outline" className="h-11" onClick={() => openWithdrawal()} data-testid="add-withdrawal-btn">
-              <ArrowDownToLine className="h-4 w-4 mr-1" /> Withdraw Flour
+            <Button variant="outline" className="h-11" onClick={() => openIssue()} data-testid="issue-flour-btn">
+              <ArrowDownToLine className="h-4 w-4 mr-1" /> Give Flour
+            </Button>
+            <Button variant="ghost" className="h-11" onClick={() => openWithdrawal()} data-testid="add-withdrawal-btn"
+              title="For wheat deposited before it was ground on arrival — grinds and charges at collection">
+              Grind on collection
             </Button>
             <Button className="h-11 active:scale-95 transition-transform" onClick={() => { setDf(blankDeposit()); setDepOpen(true); }} data-testid="add-deposit-btn">
               <Plus className="h-4 w-4 mr-1" /> New Deposit
@@ -170,15 +215,16 @@ export default function Deposits() {
         </Card>
       </div>
 
-      <Card className="border-border/60 overflow-x-auto">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Depositor</TableHead><TableHead>Mobile</TableHead>
-            <TableHead className="text-right">Deposited</TableHead>
-            <TableHead className="text-right">Withdrawn</TableHead>
-            <TableHead className="text-right">Balance</TableHead>
+            <TableHead className="text-right">Wheat deposited</TableHead>
+            <TableHead className="text-right">Flour made</TableHead>
+            <TableHead className="text-right">Conversion</TableHead>
             <TableHead className="text-right">Flour given</TableHead>
-            <TableHead className="text-right">Charges</TableHead>
+            <TableHead className="text-right">Pisai charge</TableHead>
+            <TableHead className="text-right">Flour balance</TableHead>
             <TableHead></TableHead>
           </TableRow></TableHeader>
           <TableBody>
@@ -186,21 +232,20 @@ export default function Deposits() {
               <TableRow key={r.customer_name} className="hover:bg-muted/50" data-testid={`deposit-row-${r.customer_name}`}>
                 <TableCell className="font-medium">{r.customer_name}</TableCell>
                 <TableCell className="text-sm text-muted-foreground">{r.phone || "—"}</TableCell>
-                <TableCell className="text-right">{r.deposited_kg} kg</TableCell>
-                <TableCell className="text-right">{r.withdrawn_kg} kg</TableCell>
-                <TableCell className="text-right font-semibold">
-                  {r.remaining_kg} kg
-                  <div className="text-xs text-muted-foreground font-normal">
-                    {r.remaining_quintal} qt · ≈{r.flour_estimate_at_current_rate} kg flour
-                  </div>
-                </TableCell>
+                <TableCell className="text-right">{r.wheat_deposited_kg} kg</TableCell>
+                <TableCell className="text-right">{r.flour_generated} kg</TableCell>
+                <TableCell className="text-right text-muted-foreground">−{r.wastage} kg</TableCell>
                 <TableCell className="text-right">{r.flour_delivered} kg</TableCell>
                 <TableCell className="text-right">{money(r.grinding_charges)}</TableCell>
+                <TableCell className="text-right font-semibold">
+                  {r.remaining_kg} kg
+                  <div className="text-xs text-muted-foreground font-normal">{r.remaining_quintal} qt of flour</div>
+                </TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   <Button variant="ghost" size="icon" title="Statement" onClick={() => openStatement(r.customer_name)} data-testid={`statement-${r.customer_name}`}>
                     <History className="h-4 w-4" />
                   </Button>
-                  <Button variant="ghost" size="icon" title="Withdraw flour" onClick={() => openWithdrawal(r.customer_name)} data-testid={`withdraw-${r.customer_name}`}>
+                  <Button variant="ghost" size="icon" title="Give flour" onClick={() => openIssue(r.customer_name)} data-testid={`withdraw-${r.customer_name}`}>
                     <ArrowDownToLine className="h-4 w-4" />
                   </Button>
                 </TableCell>
@@ -233,9 +278,64 @@ export default function Deposits() {
               <div><Label>Quintals</Label><Input type="number" value={df.quantity_quintal} onChange={(e) => setDf({ ...df, quantity_quintal: e.target.value })} className="h-11 mt-1" data-testid="deposit-quintal" /></div>
               <div><Label>Plus kilograms</Label><Input type="number" value={df.quantity_kg} onChange={(e) => setDf({ ...df, quantity_kg: e.target.value })} className="h-11 mt-1" data-testid="deposit-kg" /></div>
             </div>
-            <p className="text-sm text-muted-foreground">
-              Total: <b className="text-foreground">{((+df.quantity_kg || 0) + (+df.quantity_quintal || 0) * 100).toFixed(2)} kg</b>
-              {" "}— held for the depositor, so it does not enter shop stock.
+            <div><Label>Milling charge paid by</Label>
+              <Select value={df.milling_payment} onValueChange={(v) => setDf({ ...df, milling_payment: v })}>
+                <SelectTrigger className="h-11 mt-1" data-testid="deposit-milling"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={CASH}>Cash / UPI / Bank — charged separately</SelectItem>
+                  <SelectItem value={FLOUR}>Deducted from the flour</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Conversion %</Label>
+                <Input type="number" value={df.conversion_percent} onChange={(e) => setDf({ ...df, conversion_percent: e.target.value })}
+                  placeholder={String(depPctDefault)} className="h-11 mt-1" data-testid="deposit-conversion" />
+                <p className="text-xs text-muted-foreground mt-1">Blank uses the {depPctDefault}% in Settings.</p>
+              </div>
+              {df.milling_payment !== FLOUR && (
+                <div><Label>Pisai rate ₹/kg</Label>
+                  <Input type="number" value={df.pisai_rate} onChange={(e) => setDf({ ...df, pisai_rate: e.target.value })}
+                    placeholder={String(settings.grinding_rate ?? 2)} className="h-11 mt-1" data-testid="deposit-rate" />
+                </div>
+              )}
+            </div>
+
+            {df.milling_payment !== FLOUR && (
+              <div className="grid grid-cols-2 gap-4">
+                <div><Label>Payment</Label>
+                  <Select value={df.payment_status === "Pending" ? "Credit" : df.payment_mode}
+                    onValueChange={(v) => setDf({ ...df, payment_status: v === "Credit" ? "Pending" : "Paid", payment_mode: v === "Credit" ? "Cash" : v })}>
+                    <SelectTrigger className="h-11 mt-1" data-testid="deposit-payment"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {["Cash", "UPI", "Bank", "NEFT", "RTGS", "IMPS", "Cheque"].map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
+                      <SelectItem value="Credit">Credit (udhar)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {df.payment_status !== "Pending" && df.payment_mode !== "Cash" && (
+                  <div><Label>Into which account</Label>
+                    <Select value={df.bank_id} onValueChange={(v) => setDf({ ...df, bank_id: v })}>
+                      <SelectTrigger className="h-11 mt-1" data-testid="deposit-bank"><SelectValue placeholder="Choose" /></SelectTrigger>
+                      <SelectContent>{banks.map((b) => <SelectItem key={b.id} value={b.id}>{b.bank_name}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1" data-testid="deposit-preview">
+              <div className="flex justify-between"><span className="text-muted-foreground">Wheat deposited</span><span>{depWheat.toFixed(2)} kg</span></div>
+              <div className="flex justify-between"><span className="text-muted-foreground">Conversion at {depPct}%</span><span className="text-destructive">−{depWastage} kg</span></div>
+              <div className="flex justify-between font-semibold border-t border-border/60 pt-1 mt-1">
+                <span>Flour credited to the customer</span><span>{depFlour} kg</span>
+              </div>
+              <div className="flex justify-between"><span className="text-muted-foreground">Milling charge</span>
+                <span>{df.milling_payment === FLOUR ? "taken in flour" : money(depCharge)}</span></div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              The customer&apos;s flour is theirs — it is never counted as the mill&apos;s saleable stock.
             </p>
             <div><Label>Note</Label><Input value={df.note} onChange={(e) => setDf({ ...df, note: e.target.value })} className="h-11 mt-1" /></div>
           </div>
@@ -245,7 +345,7 @@ export default function Deposits() {
 
       {/* Withdraw flour */}
       <Dialog open={wdOpen} onOpenChange={setWdOpen}>
-        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-lg dialog-scroll">
           <DialogHeader><DialogTitle>Withdraw Flour</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">
@@ -345,13 +445,46 @@ export default function Deposits() {
         path="withdrawals" totalField="charge"
         onDone={() => { loadSummary(); if (statement) openStatement(statement.balance.customer_name); }} />
 
+      {/* Give flour from the customer's balance */}
+      <Dialog open={issueOpen} onOpenChange={setIssueOpen}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Give Flour to Customer</DialogTitle></DialogHeader>
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Date</Label><Input type="date" value={isf.date} onChange={(e) => setIsf({ ...isf, date: e.target.value })} className="h-11 mt-1" /></div>
+              <div><Label>Customer</Label>
+                <PartySelect kind="customer" value={isf.customer_name}
+                  onChange={(v) => setIsf({ ...isf, customer_name: v })}
+                  items={customers} onCreated={loadCustomers} testid="issue-customer" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div><Label>Flour given (kg)</Label><Input type="number" value={isf.flour_kg} onChange={(e) => setIsf({ ...isf, flour_kg: e.target.value })} className="h-11 mt-1" data-testid="issue-kg" /></div>
+              <div><Label>Plus quintals</Label><Input type="number" value={isf.flour_quintal} onChange={(e) => setIsf({ ...isf, flour_quintal: e.target.value })} className="h-11 mt-1" data-testid="issue-quintal" /></div>
+            </div>
+            <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1" data-testid="issue-preview">
+              <div className="flex justify-between"><span className="text-muted-foreground">Flour on account</span><span>{issueBal} kg</span></div>
+              <div className="flex justify-between"><span className="text-muted-foreground">Giving</span><span className="text-destructive">−{issueQty.toFixed(2)} kg</span></div>
+              <div className="flex justify-between font-semibold border-t border-border/60 pt-1 mt-1">
+                <span>Balance after</span>
+                <span className={issueQty > issueBal ? "text-destructive" : ""}>
+                  {(issueBal - issueQty).toFixed(2)} kg{issueQty > issueBal && " — more than they have"}
+                </span>
+              </div>
+            </div>
+            <div><Label>Note</Label><Input value={isf.note} onChange={(e) => setIsf({ ...isf, note: e.target.value })} className="h-11 mt-1" /></div>
+          </div>
+          <DialogFooter><Button onClick={saveIssue} data-testid="save-issue-btn">Give Flour</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Statement */}
       <Dialog open={!!statement} onOpenChange={(o) => !o && setStatement(null)}>
-        <DialogContent className="max-w-4xl max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-4xl dialog-scroll">
           <DialogHeader><DialogTitle>
             {statement?.balance?.customer_name} — {statement?.balance?.remaining_kg} kg on deposit
           </DialogTitle></DialogHeader>
-          <div className="overflow-y-auto pr-1">
+          <div className="overflow-y-auto scroll-x pr-1">
             <Table>
               <TableHeader><TableRow>
                 <TableHead>Date</TableHead><TableHead>Entry</TableHead>

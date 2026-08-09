@@ -96,7 +96,7 @@ export default function Expenses() {
         <StatCard label="This Week" value={money(summary.weekly)} icon={CalendarDays} accent="primary" />
         <StatCard label="This Month" value={money(summary.monthly)} icon={CalendarRange} accent="secondary" />
       </div>
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Date</TableHead><TableHead>Category</TableHead><TableHead>Description</TableHead>

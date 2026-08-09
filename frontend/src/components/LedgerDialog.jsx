@@ -43,7 +43,7 @@ export function LedgerDialog({ open, onOpenChange, entity, partyType, onChanged 
               <div className="rounded-lg bg-muted/50 p-3"><p className="text-muted-foreground">Total Paid</p><p className="font-bold text-lg text-secondary">{money(data.total_credit)}</p></div>
               <div className="rounded-lg bg-muted/50 p-3"><p className="text-muted-foreground">Balance Due</p><p className={`font-bold text-lg ${data.balance > 0 ? "text-destructive" : "text-secondary"}`}>{money(data.balance)}</p></div>
             </div>
-            <div className="max-h-64 overflow-y-auto rounded-lg border border-border/60">
+            <div className="max-h-64 overflow-y-auto scroll-x rounded-lg border border-border/60">
               <Table>
                 <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Type</TableHead><TableHead>Ref</TableHead><TableHead className="text-right">Debit</TableHead><TableHead className="text-right">Credit</TableHead><TableHead className="text-right">Balance</TableHead></TableRow></TableHeader>
                 <TableBody>

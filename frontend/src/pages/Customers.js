@@ -79,7 +79,7 @@ export default function Customers() {
           </Dialog>
         }
       />
-      <Card className="border-border/60">
+      <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Name</TableHead><TableHead>Phone</TableHead><TableHead>Address</TableHead>
