@@ -2574,13 +2574,23 @@ async def build_exchange_doc(body: ExchangeBody, existing: dict = None) -> dict:
             output_qty=body.atta_given, total_charge=charge, basis=body.deduction_basis,
             percent=percent, weight=body.deduction_weight, unit_rate=unit_rate)
 
+    # An exchange is a barter: flour leaves at what it cost, so the wheat that
+    # replaces it arrives carrying that same cost. Anything else changes what
+    # the shelf is worth without a rupee moving. Snapshotted here rather than
+    # looked up when the movement is applied, so reversing an edit or a
+    # deletion takes out exactly the cost the original put in.
+    delivered = round(body.atta_given - deducted, 3)
+    atta = await db.products.find_one({"name_key": product_key("Atta")})
+    atta_cost = round((atta or {}).get("cost_per_unit", 0) or 0, 4)
+
     doc = {**(existing or {}), **body.model_dump(),
            "loss_kg": round(body.wheat_qty * body.loss_percent / 100, 2),
            "grinding_rate": round(rate, 2), "grinding_charge": charge,
            "payment_method": method,
            "flour_produced": round(body.atta_given, 3),
            "deducted_flour": deducted, "flour_unit_rate": unit_rate, "flour_value": value,
-           "final_flour_delivered": round(body.atta_given - deducted, 3)}
+           "final_flour_delivered": delivered,
+           "wheat_in_cost": round(delivered * atta_cost, 2)}
     return doc
 
 async def apply_exchange_effects(doc: dict, sign: int):
@@ -2589,9 +2599,17 @@ async def apply_exchange_effects(doc: dict, sign: int):
     The fee stays with the shop, so only what the customer actually takes comes
     off stock — the deduction is netted against the flour going out.
     """
-    await adjust_stock_by_name("Wheat Crop", sign * doc.get("wheat_qty", 0))
     delivered = doc.get("final_flour_delivered", doc.get("atta_given", 0)) or 0
+    # Flour out moves quantity only: issuing stock does not change what the
+    # rest of it cost.
     await adjust_stock_by_name("Atta", -sign * delivered)
+    if doc.get("wheat_in_cost") is not None:
+        await add_stock_by_name_with_cost("Wheat Crop", sign * doc.get("wheat_qty", 0),
+                                          sign * doc["wheat_in_cost"])
+    else:
+        # Written before the cost was carried across. Reverse it the way it was
+        # applied, or the undo would take out a cost that was never put in.
+        await adjust_stock_by_name("Wheat Crop", sign * doc.get("wheat_qty", 0))
     if normalise_method(doc.get("payment_method")) == FLOUR_DEDUCTION and doc.get("deducted_flour"):
         if sign > 0:
             await post_material_ledger(
@@ -4616,6 +4634,12 @@ async def cost_inflows(name: str, pid: str):
 
     Only inflows carry cost. Sales and production consumption take stock out at
     whatever the average already was, so they cannot help rebuild it.
+
+    Stock kept as a fee is listed at nothing, because nothing was paid for it.
+    Carrying its notional value here was what inflated the average in the first
+    place, and leaving it out altogether would be just as wrong the other way:
+    the quantity is real and has to dilute the cost of the stock that was
+    bought.
     """
     lots = []
     for d in await db.purchases.find({"$or": [{"product_id": pid}, {"product_name": name}]}).to_list(20000):
@@ -4633,9 +4657,41 @@ async def cost_inflows(name: str, pid: str):
     for d in await db.grinding.find().to_list(20000):
         method = normalise_method(d.get("payment_method"))
         if method == GRAIN_DEDUCTION and (d.get("grain_item") or "") == name and d.get("grain_qty"):
-            lots.append((d["grain_qty"], d.get("grain_value", 0) or 0, "grain fee"))
+            lots.append((d["grain_qty"], 0, "grain fee"))
         elif method == FLOUR_DEDUCTION and grinding_output_name(d) == name and d.get("deducted_flour"):
-            lots.append((d["deducted_flour"], d.get("flour_value", 0) or 0, "flour fee"))
+            lots.append((d["deducted_flour"], 0, "flour fee"))
+    # Oil and cake the mill kept as its extraction fee.
+    for d in await db.oil.find().to_list(20000):
+        if name == "Mustard Oil" and (d.get("retained_oil", 0) or 0) > 0:
+            lots.append((d["retained_oil"], 0, "oil fee"))
+        if name == "Mustard Oil Cake" and (d.get("retained_cake", 0) or 0) > 0:
+            lots.append((d["retained_cake"], 0, "cake fee"))
+    # Flour kept when a deposit's milling charge is taken in flour.
+    for d in await db.wheat_deposits.find().to_list(20000):
+        if name == "Atta" and (d.get("wastage", 0) or 0) > 0 and \
+                normalise_grinding_type(d.get("milling_payment")) == FLOUR_DEDUCTION:
+            lots.append((d["wastage"], 0, "deposit fee"))
+    for d in await db.wheat_withdrawals.find().to_list(20000):
+        gtype = normalise_grinding_type(d.get("grinding_type"))
+        if gtype == FLOUR_DEDUCTION and name == "Atta" and (d.get("deducted_qty", 0) or 0) > 0:
+            lots.append((d["deducted_qty"], 0, "collection fee"))
+        elif gtype == GRAIN_DEDUCTION and (d.get("material_item") or "Wheat Crop") == name \
+                and (d.get("material_qty", 0) or 0) > 0:
+            lots.append((d["material_qty"], 0, "collection fee"))
+    # Wheat taken in on an exchange, costed at the flour handed over for it.
+    # Records written before that was carried across are valued at what the
+    # flour costs now, which is the closest figure still available.
+    if name == "Wheat Crop":
+        atta = await db.products.find_one({"name_key": product_key("Atta")})
+        atta_cost = round((atta or {}).get("cost_per_unit", 0) or 0, 4)
+        for d in await db.exchanges.find().to_list(20000):
+            qty = d.get("wheat_qty", 0) or 0
+            if qty <= 0:
+                continue
+            cost = d.get("wheat_in_cost")
+            if cost is None:
+                cost = round((d.get("final_flour_delivered", d.get("atta_given", 0)) or 0) * atta_cost, 2)
+            lots.append((qty, cost, "exchange"))
     return lots
 
 async def rebuild_costs(only_zero: bool = True, apply: bool = False):
