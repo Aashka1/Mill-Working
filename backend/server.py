@@ -1087,15 +1087,23 @@ class Billing(NamedTuple):
     party: str         # field holding the party's name
     label: str         # how it reads in a ledger line or an alert
     invoice: bool      # whether its rows carry an invoice number
+    income_head: str = ""   # how it reads as a line of income in the P&L
 
 CUSTOMER_BILLING = (
-    Billing("sales", "total", "customer_name", "Sale", True),
-    Billing("grinding", "total_charge", "customer_name", "Grinding", True),
-    Billing("oil", "total", "customer_name", "Oil extraction", True),
-    Billing("exchanges", "grinding_charge", "customer_name", "Exchange", True),
-    Billing("wheat_withdrawals", "charge", "customer_name", "Deposit withdrawal", True),
-    Billing("wheat_deposits", "charge", "customer_name", "Milling charge", True),
+    Billing("sales", "total", "customer_name", "Sale", True, "Sales income"),
+    Billing("grinding", "total_charge", "customer_name", "Grinding", True, "Grinding charges"),
+    Billing("oil", "total", "customer_name", "Oil extraction", True, "Oil extraction charges"),
+    Billing("exchanges", "grinding_charge", "customer_name", "Exchange", True, "Exchange grinding charges"),
+    Billing("wheat_withdrawals", "charge", "customer_name", "Deposit withdrawal", True, "Deposit collection charges"),
+    Billing("wheat_deposits", "charge", "customer_name", "Milling charge", True, "Deposit milling charges"),
 )
+
+# Everything the shop earns for a service, as opposed to for goods. Sales are
+# excluded because they carry a cost of goods; these do not. Deriving this from
+# the registry is what stops a newly added billable module from being charged to
+# the customer but left out of the income figures — which is exactly how the
+# deposit and exchange charges went missing before.
+SERVICE_BILLING = tuple(b for b in CUSTOMER_BILLING if b.coll != "sales")
 
 SUPPLIER_BILLING = (
     Billing("purchases", "total", "supplier_name", "Purchase", False),
@@ -1580,7 +1588,11 @@ async def dashboard(user: dict = Depends(get_current_user)):
     grinding_income = sum(g.get("total_charge", 0) for g in grinding)
     oil_income = sum(o.get("total", 0) for o in oil)
     total_expenses = sum(e.get("amount", 0) for e in expenses)
-    service_income = grinding_income + oil_income
+    # Driven off the registry so this agrees with the profit & loss report.
+    # Adding up only grinding and oil left the exchange and deposit charges out
+    # of income while still billing them to the customer.
+    service_income = sum(sum(d.get(bl.amount, 0) or 0 for d in by_coll[bl.coll])
+                         for bl in SERVICE_BILLING)
     total_income = total_sales + service_income
 
     # Profit charges the cost of what was actually sold, not everything bought.
@@ -1596,8 +1608,8 @@ async def dashboard(user: dict = Depends(get_current_user)):
     def month_sum(items, field):
         return sum(i.get(field, 0) for i in items if str(i.get("date", "")).startswith(month))
 
-    daily_income = day_sum(sales, "total") + day_sum(grinding, "total_charge") + day_sum(oil, "total")
-    monthly_income = month_sum(sales, "total") + month_sum(grinding, "total_charge") + month_sum(oil, "total")
+    daily_income = day_sum(sales, "total") + sum(day_sum(by_coll[bl.coll], bl.amount) for bl in SERVICE_BILLING)
+    monthly_income = month_sum(sales, "total") + sum(month_sum(by_coll[bl.coll], bl.amount) for bl in SERVICE_BILLING)
 
     # Outstanding is the unpaid balance, so a part-paid bill contributes only
     # what is still owed. Records written before part payment existed have no
@@ -1624,10 +1636,13 @@ async def dashboard(user: dict = Depends(get_current_user)):
     # last 6 months income vs expense
     trend = []
     for i in range(5, -1, -1):
-        d = (datetime.now().replace(day=1) - timedelta(days=i * 30))
+        # Local time, so a month does not turn over early for a mill running
+        # ahead of UTC and drop the day's takings into the wrong bar.
+        d = (local_now().replace(day=1) - timedelta(days=i * 30))
         m = d.strftime("%Y-%m")
         label = d.strftime("%b")
-        inc = month_income_for(sales, "total", m) + month_income_for(grinding, "total_charge", m) + month_income_for(oil, "total", m)
+        inc = month_income_for(sales, "total", m) + sum(
+            month_income_for(by_coll[bl.coll], bl.amount, m) for bl in SERVICE_BILLING)
         # Cost of goods sold that month, not stock bought that month, so the
         # line tracks the same profit the headline figure reports.
         month_cogs = sum(sale_cogs(s, cost_by_name) for s in sales if str(s.get("date", "")).startswith(m))
@@ -2087,16 +2102,32 @@ async def adjust_stock_by_name(name, delta):
 async def add_stock_by_name_with_cost(name, qty, total_cost):
     """Move stock by name while folding the money paid into the cost basis.
 
-    adjust_stock_by_name only touches quantity, which is right for stock that
-    arrived free. Stock the shop actually bought must go through here, or its
-    cost_per_unit stays stale and sales-analytics reports the whole sale price
-    as profit.
+    Stock the shop bought must go through here, or its cost_per_unit stays
+    stale and sales-analytics reports the whole sale price as profit. Stock
+    that arrived free goes through adjust_free_stock_by_name, which is this
+    with nothing paid.
     """
     p = await db.products.find_one({"name_key": product_key(name)})
     if not p:
         logger.warning("add_stock_by_name_with_cost: no product named %r; %+g not applied", name, qty)
         return
     await add_stock_with_cost(p["id"], qty, total_cost)
+
+async def adjust_free_stock_by_name(name, delta):
+    """Move stock the mill was given rather than bought — the flour, grain, oil
+    or cake it keeps as its fee.
+
+    Moving the quantity alone leaves cost_per_unit at the rate paid for bought
+    stock, which values free stock as though money had changed hands: 15 kg
+    kept as a fee against stock costing 35/kg invented 525 of inventory value
+    and hid the same amount of profit when it sold. Folding it in at zero cost
+    keeps the shelf worth exactly what was paid for it, and the profit shows up
+    on the sale, where it was earned.
+
+    A negative delta reverses an earlier addition and restores the average the
+    product had before it.
+    """
+    await add_stock_by_name_with_cost(name, delta, 0)
 
 async def add_stock_with_cost(pid, qty, total_cost):
     p = await db.products.find_one({"id": pid})
@@ -2311,7 +2342,7 @@ async def apply_grinding_effects(doc, sign):
     if method == FLOUR_DEDUCTION:
         kept = doc.get("deducted_flour", doc.get("grain_fee_kg", 0)) or 0
         if kept:
-            await adjust_stock_by_name(grinding_output_name(doc), sign * kept)
+            await adjust_free_stock_by_name(grinding_output_name(doc), sign * kept)
             if sign > 0:
                 await post_material_ledger(
                     date=doc.get("date"), party_name=doc.get("customer_name", ""),
@@ -2325,7 +2356,7 @@ async def apply_grinding_effects(doc, sign):
         qty = doc.get("grain_qty", 0) or 0
         item = doc.get("grain_item") or doc.get("grain_type") or "Wheat Crop"
         if qty:
-            await adjust_stock_by_name(item, sign * qty)
+            await adjust_free_stock_by_name(item, sign * qty)
             if sign > 0:
                 await post_material_ledger(
                     date=doc.get("date"), party_name=doc.get("customer_name", ""),
@@ -2337,10 +2368,10 @@ async def apply_grinding_effects(doc, sign):
 
 async def apply_oil_effects(doc, sign):
     if doc.get("retained_oil", 0):
-        await adjust_stock_by_name("Mustard Oil", sign * doc["retained_oil"])
+        await adjust_free_stock_by_name("Mustard Oil", sign * doc["retained_oil"])
     if doc.get("retained_cake", 0):
         # Kept as the processing fee: quantity only, nothing was paid for it.
-        await adjust_stock_by_name("Mustard Oil Cake", sign * doc["retained_cake"])
+        await adjust_free_stock_by_name("Mustard Oil Cake", sign * doc["retained_cake"])
     if doc.get("cake_sold_to_shop", 0):
         # Bought from the customer: the value must enter the weighted-average
         # cost basis, and sign flips both quantity and cost together so an edit
@@ -4091,19 +4122,24 @@ async def rep_day_book(start, end, **_):
                         {"label": "Expenses", "value": round(sum(r["amount"] for r in rows if r["type"] == "Expense"), 2), "type": "money"}]}
 
 async def rep_profit_loss(start, end, **_):
-    sales = [d for d in await db.sales.find().to_list(30000) if in_range(d, start, end)]
-    grind = [d for d in await db.grinding.find().to_list(30000) if in_range(d, start, end)]
-    oil = [d for d in await db.oil.find().to_list(30000) if in_range(d, start, end)]
-    exch = [d for d in await db.exchanges.find().to_list(30000) if in_range(d, start, end)]
-    expenses = [d for d in await db.expenses.find().to_list(30000) if in_range(d, start, end)]
-    products = {p["name"]: p for p in await db.products.find().to_list(2000)}
+    sales, expenses, products, *serviced = await asyncio.gather(
+        db.sales.find().to_list(30000), db.expenses.find().to_list(30000),
+        db.products.find().to_list(2000),
+        *[db[bl.coll].find().to_list(30000) for bl in SERVICE_BILLING],
+    )
+    sales = [d for d in sales if in_range(d, start, end)]
+    expenses = [d for d in expenses if in_range(d, start, end)]
+    products = {p["name"]: p for p in products}
     cost_by_name = {n: p.get("cost_per_unit", 0) or 0 for n, p in products.items()}
 
     sale_income = round(sum(d.get("total", 0) for d in sales), 2)
     cogs = round(sum(sale_cogs(d, cost_by_name) for d in sales), 2)
-    grind_income = round(sum(d.get("total_charge", 0) for d in grind), 2)
-    oil_income = round(sum(d.get("total", 0) for d in oil), 2)
-    exch_income = round(sum(d.get("grinding_charge", 0) for d in exch), 2)
+    # Every service the registry knows how to bill, so a module added later
+    # cannot be charged to a customer and left out of income.
+    service = [(bl.income_head,
+                round(sum(d.get(bl.amount, 0) or 0 for d in rows if in_range(d, start, end)), 2))
+               for bl, rows in zip(SERVICE_BILLING, serviced)]
+    service_income = round(sum(v for _, v in service), 2)
     exp_total = round(sum(d.get("amount", 0) for d in expenses), 2)
 
     by_cat = {}
@@ -4112,16 +4148,14 @@ async def rep_profit_loss(start, end, **_):
 
     rows = [{"head": "Sales income", "amount": sale_income},
             {"head": "Less: cost of goods sold", "amount": -cogs},
-            {"head": "Gross profit on sales", "amount": round(sale_income - cogs, 2)},
-            {"head": "Grinding charges", "amount": grind_income},
-            {"head": "Oil extraction charges", "amount": oil_income},
-            {"head": "Exchange grinding charges", "amount": exch_income}]
+            {"head": "Gross profit on sales", "amount": round(sale_income - cogs, 2)}]
+    rows += [{"head": head, "amount": amount} for head, amount in service]
     rows += [{"head": f'Expense · {k}', "amount": -v} for k, v in sorted(by_cat.items())]
-    net = round(sale_income - cogs + grind_income + oil_income + exch_income - exp_total, 2)
+    net = round(sale_income - cogs + service_income - exp_total, 2)
     rows.append({"head": "Net profit" if net >= 0 else "Net loss", "amount": net})
     return {"columns": [col("head", "Particulars"), col("amount", "Amount", "money")],
             "rows": rows,
-            "summary": [{"label": "Income", "value": round(sale_income + grind_income + oil_income + exch_income, 2), "type": "money"},
+            "summary": [{"label": "Income", "value": round(sale_income + service_income, 2), "type": "money"},
                         {"label": "Cost of goods sold", "value": cogs, "type": "money"},
                         {"label": "Expenses", "value": exp_total, "type": "money"},
                         {"label": "Net profit" if net >= 0 else "Net loss", "value": net, "type": "money"}]}
@@ -4976,7 +5010,7 @@ async def create_deposit(body: DepositBody, user: dict = Depends(get_current_use
     elif method == FLOUR_DEDUCTION and wastage > 0:
         # The flour kept as the fee becomes the mill's, so it goes to mill stock
         # and the material ledger. The customer's own flour never does.
-        await adjust_stock_by_name("Atta", wastage)
+        await adjust_free_stock_by_name("Atta", wastage)
         await post_material_ledger(
             date=body.date, party_name=body.customer_name, item="Atta",
             qty=wastage, unit="kg", value=round(wastage * await flour_unit_rate("Atta"), 2),
@@ -5072,7 +5106,7 @@ async def apply_withdrawal_effects(doc: dict, sign: int):
     """
     gtype = normalise_grinding_type(doc.get("grinding_type"))
     if gtype == FLOUR_DEDUCTION and doc.get("deducted_qty"):
-        await adjust_stock_by_name("Atta", sign * doc["deducted_qty"])
+        await adjust_free_stock_by_name("Atta", sign * doc["deducted_qty"])
         if sign > 0:
             await post_material_ledger(
                 date=doc.get("date"), party_name=doc.get("customer_name", ""),
@@ -5084,7 +5118,7 @@ async def apply_withdrawal_effects(doc: dict, sign: int):
             await unpost_material_ledger(doc["id"])
     elif gtype == GRAIN_DEDUCTION and doc.get("material_qty"):
         item = doc.get("material_item") or "Wheat Crop"
-        await adjust_stock_by_name(item, sign * doc["material_qty"])
+        await adjust_free_stock_by_name(item, sign * doc["material_qty"])
         if sign > 0:
             await post_material_ledger(
                 date=doc.get("date"), party_name=doc.get("customer_name", ""),
