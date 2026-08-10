@@ -74,7 +74,7 @@ export default function OilExtraction() {
       <Dialog open={open} onOpenChange={setOpen}>
         {/* See Grinding.js: same capped-height layout, needed here too now the
             form carries the cake-purchase and part-payment fields. */}
-        <DialogContent className="max-w-lg dialog-scroll">
+        <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "New"} Oil Extraction Order</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">

@@ -132,7 +132,7 @@ export default function Grinding() {
             and an uncapped dialog pushes Save Order below the fold. Header and
             footer stay pinned via explicit grid rows; minmax(0,1fr) lets the
             middle row shrink below its content so it can actually overflow. */}
-        <DialogContent className="max-w-lg dialog-scroll">
+        <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "New"} Grinding Order</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">

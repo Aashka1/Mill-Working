@@ -99,7 +99,7 @@ export function PartySelect({
       </Select>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-lg max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]">
+        <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>Add {label}</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <p className="text-xs text-muted-foreground">

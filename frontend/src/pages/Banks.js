@@ -397,7 +397,7 @@ export default function Banks() {
 
       {/* Add / edit account */}
       <Dialog open={accOpen} onOpenChange={(o) => { setAccOpen(o); if (!o) setEditingAcc(null); }}>
-        <DialogContent className="max-w-lg dialog-scroll">
+        <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>{editingAcc ? "Edit" : "Add"} Bank Account</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div><Label>Bank name</Label><Input value={af.bank_name} onChange={(e) => setAf({ ...af, bank_name: e.target.value })} className="h-11 mt-1" data-testid="bank-name" /></div>
@@ -428,7 +428,7 @@ export default function Banks() {
 
       {/* Manual transaction */}
       <Dialog open={txnOpen} onOpenChange={setTxnOpen}>
-        <DialogContent className="max-w-lg dialog-scroll">
+        <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>Bank Transaction</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <p className="text-xs text-muted-foreground">

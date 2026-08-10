@@ -345,7 +345,7 @@ export default function Deposits() {
 
       {/* Withdraw flour */}
       <Dialog open={wdOpen} onOpenChange={setWdOpen}>
-        <DialogContent className="max-w-lg dialog-scroll">
+        <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>Withdraw Flour</DialogTitle></DialogHeader>
           <div className="space-y-4 overflow-y-auto pr-1">
             <div className="grid grid-cols-2 gap-4">
@@ -480,7 +480,7 @@ export default function Deposits() {
 
       {/* Statement */}
       <Dialog open={!!statement} onOpenChange={(o) => !o && setStatement(null)}>
-        <DialogContent className="max-w-4xl dialog-scroll">
+        <DialogContent className="max-w-4xl">
           <DialogHeader><DialogTitle>
             {statement?.balance?.customer_name} — {statement?.balance?.remaining_kg} kg on deposit
           </DialogTitle></DialogHeader>

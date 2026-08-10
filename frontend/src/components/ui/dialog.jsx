@@ -29,7 +29,11 @@ const DialogContent = React.forwardRef(({ className, children, ...props }, ref) 
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg",
+        // A dialog taller than the screen used to run off both ends of it with
+        // nothing to scroll: the box is fixed and centred, so the page behind
+        // it cannot move and the buttons at the bottom were simply out of
+        // reach. Adding a product line to a sale hit this first.
+        "fixed left-[50%] top-[50%] z-50 grid max-h-[90dvh] w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 overflow-y-auto overscroll-contain border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg",
         className
       )}
       {...props}>
@@ -59,7 +63,11 @@ const DialogFooter = ({
   ...props
 }) => (
   <div
-    className={cn("flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2", className)}
+    // Pinned to the bottom of the dialog so Save stays on screen however long
+    // the form gets, rather than waiting at the end of a scroll.
+    className={cn(
+      "sticky bottom-0 z-10 -mx-6 -mb-6 mt-1 flex flex-col-reverse border-t border-border/60 bg-background px-6 py-4 sm:flex-row sm:justify-end sm:space-x-2",
+      className)}
     {...props} />
 )
 DialogFooter.displayName = "DialogFooter"
