@@ -4,7 +4,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { CommandItem } from "@/components/ui/command";
+import { SearchSelect } from "@/components/SearchSelect";
 import { toast } from "sonner";
 
 // Sentinel for the "add new" row. A real name could never collide with it.
@@ -40,6 +41,13 @@ export function PartySelect({
 
   const label = kind === "supplier" ? "Supplier" : "Customer";
   const path = kind === "supplier" ? "/suppliers" : "/customers";
+
+  // With nobody on file yet there is still someone to bill, so the walk-in
+  // stands in until a real party is added.
+  const walkIn = kind === "supplier" ? "Walk-in Supplier" : "Walk-in Customer";
+  const options = items.length
+    ? items.map((p) => ({ value: p.name, label: p.name, hint: p.phone || "" }))
+    : [{ value: kind === "supplier" ? "Walk-in" : "Walk-in Customer", label: walkIn }];
 
   const pick = (v) => {
     if (v === ADD_NEW) {
@@ -80,23 +88,28 @@ export function PartySelect({
 
   return (
     <>
-      <Select value={value} onValueChange={pick}>
-        <SelectTrigger className="h-11 mt-1" data-testid={testid}><SelectValue placeholder={placeholder} /></SelectTrigger>
-        <SelectContent>
-          {items.map((p) => (
-            <SelectItem key={p.id} value={p.name}>
-              {p.name}{p.phone ? ` · ${p.phone}` : ""}
-            </SelectItem>
-          ))}
-          {items.length === 0 && (
-            <SelectItem value={kind === "supplier" ? "Walk-in" : "Walk-in Customer"}>
-              {kind === "supplier" ? "Walk-in Supplier" : "Walk-in Customer"}
-            </SelectItem>
+      <div className="mt-1">
+        <SearchSelect
+          value={value}
+          onChange={pick}
+          options={options}
+          placeholder={placeholder}
+          searchPlaceholder={`Type a name or number…`}
+          emptyText={`No ${kind} by that name.`}
+          testid={testid}
+          // Pinned under the results rather than listed among them, so it is
+          // still one tap away when a search has narrowed the list to nothing.
+          footer={({ close }) => (
+            <CommandItem
+              value="__add_new__"
+              onSelect={() => { close(); pick(ADD_NEW); }}
+              data-testid={testid ? `${testid}-add` : undefined}
+            >
+              ＋ Add new {kind}…
+            </CommandItem>
           )}
-          {/* Last, so the parties someone actually uses stay at the top. */}
-          <SelectItem value={ADD_NEW}>＋ Add new {kind}…</SelectItem>
-        </SelectContent>
-      </Select>
+        />
+      </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-lg">

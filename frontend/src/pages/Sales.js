@@ -8,6 +8,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { SearchSelect } from "@/components/SearchSelect";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Plus, Trash2, Download, FileDown, Pencil, IndianRupee } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
@@ -167,13 +168,17 @@ export default function Sales() {
                     <div key={idx} className="rounded-lg border border-border/60 p-3 space-y-2" data-testid={`sale-line-${idx}`}>
                       <div className="flex gap-2 items-start">
                         <div className="flex-1">
-                          <Select value={line.product_id}
-                            onValueChange={(v) => setLine(idx, { product_id: v, rate: String(products.items.find((p) => p.id === v)?.rate ?? "") })}>
-                            <SelectTrigger className="h-11" data-testid={`sale-product-${idx}`}><SelectValue placeholder="Select product" /></SelectTrigger>
-                            <SelectContent>
-                              {products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}
-                            </SelectContent>
-                          </Select>
+                          <SearchSelect
+                            value={line.product_id}
+                            onChange={(v) => setLine(idx, { product_id: v, rate: String(products.items.find((p) => p.id === v)?.rate ?? "") })}
+                            options={products.items.map((p) => ({
+                              value: p.id, label: p.name, hint: `${p.current_stock} ${p.unit}`,
+                            }))}
+                            placeholder="Select product"
+                            searchPlaceholder="Type a product name…"
+                            emptyText="No product by that name."
+                            testid={`sale-product-${idx}`}
+                          />
                         </div>
                         {f.items.length > 1 && (
                           <Button type="button" variant="ghost" size="icon" className="h-11 w-11"

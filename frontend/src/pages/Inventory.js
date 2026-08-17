@@ -10,6 +10,8 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { CommandItem } from "@/components/ui/command";
+import { SearchSelect } from "@/components/SearchSelect";
 import { Badge } from "@/components/ui/badge";
 import { Plus, Trash2, Pencil, Scale, IndianRupee } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
@@ -266,14 +268,28 @@ export default function Inventory() {
                     </div>
                   </div>
                   <div><Label>Product</Label>
-                    <Select value={buf.product_id} onValueChange={(v) => setBuf({ ...buf, product_id: v })}>
-                      <SelectTrigger className="h-11 mt-1" data-testid="purchase-product"><SelectValue placeholder="Select product" /></SelectTrigger>
-                      <SelectContent>
-                        {products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name} ({p.current_stock} {p.unit})</SelectItem>)}
-                        {/* Last in the list, so the catalogue stays on top. */}
-                        <SelectItem value={NEW_PRODUCT}>＋ Buying something new…</SelectItem>
-                      </SelectContent>
-                    </Select>
+                    <div className="mt-1">
+                      <SearchSelect
+                        value={buf.product_id}
+                        onChange={(v) => setBuf({ ...buf, product_id: v })}
+                        options={products.items.map((p) => ({
+                          value: p.id, label: p.name, hint: `${p.current_stock} ${p.unit}`,
+                        }))}
+                        placeholder="Select product"
+                        searchPlaceholder="Type a product name…"
+                        emptyText="Not in the catalogue yet."
+                        testid="purchase-product"
+                        // Pinned below the results so it survives a search that
+                        // matches nothing — which is exactly when it is needed.
+                        footer={({ close }) => (
+                          <CommandItem value="__new_product__"
+                            onSelect={() => { close(); setBuf({ ...buf, product_id: NEW_PRODUCT }); }}
+                            data-testid="purchase-product-new">
+                            ＋ Buying something new…
+                          </CommandItem>
+                        )}
+                      />
+                    </div>
                     {buyingNew && (
                       <div className="mt-3 rounded-lg border border-border/60 p-3 space-y-3">
                         <p className="text-xs text-muted-foreground">It is added to Current Stock with this quantity.</p>
