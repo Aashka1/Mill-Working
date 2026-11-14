@@ -10,8 +10,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Wheat, Download, Trash2, History, ArrowDownToLine, IndianRupee } from "lucide-react";
+import { Plus, Wheat, Download, Trash2, History, ArrowDownToLine, IndianRupee, HandCoins } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
+import { AdvanceAttaDialog } from "@/components/AdvanceAttaDialog";
 import { toast } from "sonner";
 
 const CASH = "Cash";
@@ -46,11 +47,14 @@ export default function Deposits() {
   const [issueOpen, setIssueOpen] = useState(false);
   const [isf, setIsf] = useState(blankIssue());
   const [payFor, setPayFor] = useState(null);
+  const [advanceFor, setAdvanceFor] = useState(null);
+  const [stock, setStock] = useState(null);
 
   const loadSummary = useCallback(async () => {
     try {
       const { data } = await api.get("/deposits/summary");
       setSummary(data);
+      api.get("/wheat-stock").then((r) => setStock(r.data)).catch(() => {});
     } catch { /* keep whatever is on screen */ }
   }, []);
 
@@ -85,7 +89,9 @@ export default function Deposits() {
         pisai_rate: df.pisai_rate === "" ? null : +df.pisai_rate,
         bank_id: df.milling_payment === FLOUR ? null : (df.bank_id || null),
       });
-      toast.success(`${data.quantity} kg wheat became ${data.flour_generated} kg flour · balance ${data.balance.remaining_kg} kg`);
+      toast.success(`${data.quantity} kg wheat became ${data.flour_generated} kg flour`
+        + (data.advance_settled_kg ? ` · ${data.advance_settled_kg} kg advance atta adjusted` : "")
+        + ` · balance ${data.balance.remaining_kg} kg`);
       setDepOpen(false); setDf(blankDeposit());
       loadSummary();
     } catch (e) {
@@ -184,6 +190,9 @@ export default function Deposits() {
         title="Deposit Wheat" subtitle="Wheat held for farmers, and flour drawn against it"
         actions={
           <>
+            <Button variant="outline" className="h-11" onClick={() => setAdvanceFor("")} data-testid="deposit-advance-btn">
+              <HandCoins className="h-4 w-4 mr-1" /> Advance Atta
+            </Button>
             <Button variant="outline" className="h-11" onClick={() => openIssue()} data-testid="issue-flour-btn">
               <ArrowDownToLine className="h-4 w-4 mr-1" /> Give Flour
             </Button>
@@ -198,15 +207,27 @@ export default function Deposits() {
         }
       />
 
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <Card className="p-4 border-border/60">
           <p className="text-xs text-muted-foreground">Depositors</p>
           <p className="text-2xl font-bold font-heading mt-1" data-testid="depositor-count">{summary.depositors}</p>
         </Card>
         <Card className="p-4 border-border/60">
-          <p className="text-xs text-muted-foreground">Wheat on deposit</p>
-          <p className="text-2xl font-bold font-heading mt-1" data-testid="total-on-deposit">{summary.total_remaining_kg} kg</p>
-          <p className="text-xs text-muted-foreground">{(summary.total_remaining_kg / 100).toFixed(2)} quintals</p>
+          <p className="text-xs text-muted-foreground">Total wheat stock</p>
+          <p className="text-2xl font-bold font-heading mt-1" data-testid="total-wheat-stock">{stock?.wheat_stock_kg ?? "—"} kg</p>
+          <p className="text-xs text-muted-foreground">Mill's own + deposited wheat</p>
+        </Card>
+        <Card className="p-4 border-border/60">
+          <p className="text-xs text-muted-foreground">Total atta stock</p>
+          <p className="text-2xl font-bold font-heading mt-1" data-testid="total-atta-stock">{stock?.atta_stock_kg ?? "—"} kg</p>
+          <p className="text-xs text-muted-foreground">Goes down as atta is given out</p>
+        </Card>
+        <Card className="p-4 border-border/60">
+          <p className="text-xs text-muted-foreground">Atta owed to customers</p>
+          <p className="text-2xl font-bold font-heading mt-1" data-testid="total-on-deposit">{summary.total_owed_kg ?? summary.total_remaining_kg} kg</p>
+          {summary.total_advance_kg > 0 && (
+            <p className="text-xs text-destructive">{summary.total_advance_kg} kg given in advance</p>
+          )}
         </Card>
         <Card className="p-4 border-border/60">
           <p className="text-xs text-muted-foreground">Current deductions</p>
@@ -238,8 +259,17 @@ export default function Deposits() {
                 <TableCell className="text-right">{r.flour_delivered} kg</TableCell>
                 <TableCell className="text-right">{money(r.grinding_charges)}</TableCell>
                 <TableCell className="text-right font-semibold">
-                  {r.remaining_kg} kg
-                  <div className="text-xs text-muted-foreground font-normal">{r.remaining_quintal} qt of flour</div>
+                  {r.remaining_kg < 0 ? (
+                    <>
+                      <Badge variant="outline" className="text-destructive border-destructive/30">Advance {-r.remaining_kg} kg</Badge>
+                      <div className="text-xs text-muted-foreground font-normal">adjusts on next deposit</div>
+                    </>
+                  ) : (
+                    <>
+                      {r.remaining_kg} kg
+                      <div className="text-xs text-muted-foreground font-normal">{r.remaining_quintal} qt of flour</div>
+                    </>
+                  )}
                 </TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   <Button variant="ghost" size="icon" title="Statement" onClick={() => openStatement(r.customer_name)} data-testid={`statement-${r.customer_name}`}>
@@ -247,6 +277,9 @@ export default function Deposits() {
                   </Button>
                   <Button variant="ghost" size="icon" title="Give flour" onClick={() => openIssue(r.customer_name)} data-testid={`withdraw-${r.customer_name}`}>
                     <ArrowDownToLine className="h-4 w-4" />
+                  </Button>
+                  <Button variant="ghost" size="icon" title="Advance atta" onClick={() => setAdvanceFor(r.customer_name)} data-testid={`advance-${r.customer_name}`}>
+                    <HandCoins className="h-4 w-4" />
                   </Button>
                 </TableCell>
               </TableRow>
@@ -478,11 +511,17 @@ export default function Deposits() {
         </DialogContent>
       </Dialog>
 
+      <AdvanceAttaDialog open={advanceFor !== null} onOpenChange={(o) => !o && setAdvanceFor(null)}
+        customerName={advanceFor || ""}
+        onDone={(d) => { loadSummary(); if (statement) openStatement(d.customer_name); }} />
+
       {/* Statement */}
       <Dialog open={!!statement} onOpenChange={(o) => !o && setStatement(null)}>
         <DialogContent className="max-w-4xl">
           <DialogHeader><DialogTitle>
-            {statement?.balance?.customer_name} — {statement?.balance?.remaining_kg} kg on deposit
+            {statement?.balance?.customer_name} — {statement?.balance?.remaining_kg < 0
+              ? `${-statement.balance.remaining_kg} kg atta given in advance`
+              : `${statement?.balance?.remaining_kg} kg atta on account`}
           </DialogTitle></DialogHeader>
           <div className="overflow-y-auto scroll-x pr-1">
             <Table>
@@ -501,7 +540,7 @@ export default function Deposits() {
                       <Badge variant="outline">{e.kind}</Badge>
                       {e.note && <div className="text-xs text-muted-foreground mt-1">{e.note}</div>}
                     </TableCell>
-                    <TableCell className="text-right text-secondary">{e.wheat_in || ""}</TableCell>
+                    <TableCell className="text-right text-secondary">{e.flour_in ? `${e.flour_in}` : ""}{e.wheat_in ? <div className="text-xs text-muted-foreground">from {e.wheat_in} kg wheat</div> : null}</TableCell>
                     <TableCell className="text-right text-destructive">{e.wheat_out || ""}</TableCell>
                     <TableCell className="text-sm">{e.grinding_type}{e.percent !== "" && e.percent != null ? ` · ${e.percent}%` : ""}</TableCell>
                     <TableCell className="text-right">{e.deducted || ""}</TableCell>
@@ -511,7 +550,7 @@ export default function Deposits() {
                     <TableCell className="text-right flex gap-1 justify-end">
                       {/* A charge left on credit can be settled from here, the
                           same as any other bill. */}
-                      {e.kind === "Withdrawal" && e.charge > 0 && e.payment_status !== "Paid" && (
+                      {e.kind !== "Deposit" && e.charge > 0 && e.payment_status !== "Paid" && (
                         <Button variant="ghost" size="icon" title="Record a payment"
                           onClick={() => setPayFor({ id: e.id, charge: e.charge, amount_paid: e.amount_paid || 0, date: e.date })}
                           data-testid={`pay-withdrawal-${e.id}`}>

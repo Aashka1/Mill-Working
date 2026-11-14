@@ -8,7 +8,8 @@ import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { Save, ShieldCheck, Trash2, UserPlus, Users, Wrench, Building2 } from "lucide-react";
+import { Save, ShieldCheck, Trash2, UserPlus, Users, Wrench, Building2, AlertTriangle } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 
 const BLANK_USER = { name: "", email: "", password: "", role: "staff" };
@@ -29,6 +30,24 @@ export default function Settings() {
   // taken as a fee are another, and those are not zero, so they need the wider
   // scope to be found at all.
   const [costAll, setCostAll] = useState(false);
+  const [wipe, setWipe] = useState({ password: "", confirm: "", keep_parties: true });
+  const [wiping, setWiping] = useState(false);
+
+  const clearAllData = async () => {
+    if (wipe.confirm.trim().toUpperCase() !== "DELETE") return toast.error("Type DELETE to confirm");
+    if (!wipe.password) return toast.error("Enter your password");
+    setWiping(true);
+    try {
+      await api.post("/admin/reset-data", wipe);
+      toast.success("All transactions cleared. Stock is now zero.");
+      setWipe({ password: "", confirm: "", keep_parties: true });
+      setTimeout(() => window.location.reload(), 800);
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e.response?.data?.detail) || e.message);
+    } finally {
+      setWiping(false);
+    }
+  };
 
   const previewCosts = async () => {
     setCostBusy(true);
@@ -348,6 +367,32 @@ export default function Settings() {
           </TableBody>
         </Table>
       </Card>
+
+      {isAdmin && (
+        <Card className="p-6 border-destructive/40 mt-6" data-testid="danger-zone">
+          <h3 className="font-heading font-semibold text-lg flex items-center gap-2 text-destructive">
+            <AlertTriangle className="h-5 w-5" /> Clear all data (सभी डेटा साफ़ करें)
+          </h3>
+          <p className="text-sm text-muted-foreground mt-1">
+            Deletes every sale, purchase, grinding, oil job, deposit, advance atta, production run, expense,
+            payment, invoice and bank entry, and sets all stock to zero. Users, settings, the product list and
+            bank accounts are kept. This cannot be undone — download any Excel reports you need first.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4 items-end">
+            <div><Label>Type DELETE to confirm</Label>
+              <Input value={wipe.confirm} onChange={(e) => setWipe({ ...wipe, confirm: e.target.value })} className="h-11 mt-1" data-testid="wipe-confirm" /></div>
+            <div><Label>Your password</Label>
+              <Input type="password" value={wipe.password} onChange={(e) => setWipe({ ...wipe, password: e.target.value })} className="h-11 mt-1" data-testid="wipe-password" /></div>
+            <Button variant="destructive" className="h-11" disabled={wiping} onClick={clearAllData} data-testid="wipe-btn">
+              <Trash2 className="h-4 w-4 mr-1" /> Clear all data
+            </Button>
+          </div>
+          <div className="flex items-center gap-2 mt-4 text-sm">
+            <Switch checked={wipe.keep_parties} onCheckedChange={(v) => setWipe({ ...wipe, keep_parties: v })} data-testid="wipe-keep-parties" />
+            <span>Keep customer and supplier names (their balances are reset to zero)</span>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

@@ -42,7 +42,7 @@ export default function Production() {
     setMill(m);
     const cfg = MILL_CONFIG[m];
     setInputId(byName(cfg.input)?.id || "");
-    setOuts(cfg.outputs.map((n) => ({ product_id: byName(n)?.id || "", quantity: "" })));
+    setOuts(cfg.outputs.map((n) => ({ product_id: byName(n)?.id || "", quantity: "", cost_rate: "", selling_rate: "" })));
   };
 
   const openNew = () => { setEditingId(null); applyMill(mill); setDate(today()); setInputQty(""); setOpen(true); };
@@ -57,6 +57,9 @@ export default function Production() {
     setOuts((run.outputs || []).map((o) => ({
       product_id: o.product_id || byName(o.product_name)?.id || "",
       quantity: String(o.quantity),
+      // Only rates the operator set are brought back; the rest were worked out.
+      cost_rate: o.cost_rate_set ? String(o.cost_per_unit) : "",
+      selling_rate: o.selling_rate != null ? String(o.selling_rate) : "",
     })));
     setOpen(true);
   };
@@ -70,7 +73,11 @@ export default function Production() {
     const body = {
       date, mill, input_product_id: inputId, input_product_name: inputProduct?.name,
       input_quantity: +inputQty,
-      outputs: validOuts.map((o) => ({ product_id: o.product_id, product_name: products.items.find((p) => p.id === o.product_id)?.name, quantity: +o.quantity })),
+      outputs: validOuts.map((o) => ({
+        product_id: o.product_id, product_name: products.items.find((p) => p.id === o.product_id)?.name, quantity: +o.quantity,
+        cost_rate: o.cost_rate === "" || o.cost_rate == null ? null : +o.cost_rate,
+        selling_rate: o.selling_rate === "" || o.selling_rate == null ? null : +o.selling_rate,
+      })),
     };
     try {
       if (editingId) {
@@ -89,6 +96,18 @@ export default function Production() {
   };
 
   const inputCost = (+inputQty || 0) * (inputProduct?.cost_per_unit || 0);
+  // Mirrors the backend: priced outputs take their rate, the rest share what
+  // is left of the input cost by weight.
+  const live = outs.filter((o) => +o.quantity > 0);
+  const totalOut = live.reduce((a, o) => a + (+o.quantity), 0);
+  const lossKg = +((+inputQty || 0) - totalOut).toFixed(3);
+  const pricedCost = live.filter((o) => o.cost_rate !== "" && o.cost_rate != null).reduce((a, o) => a + (+o.quantity) * (+o.cost_rate), 0);
+  const unpricedQty = live.filter((o) => o.cost_rate === "" || o.cost_rate == null).reduce((a, o) => a + (+o.quantity), 0);
+  const costOf = (o) => {
+    if (!(+o.quantity > 0)) return null;
+    if (o.cost_rate !== "" && o.cost_rate != null) return (+o.quantity) * (+o.cost_rate);
+    return unpricedQty ? (inputCost - pricedCost) * (+o.quantity) / unpricedQty : 0;
+  };
 
   return (
     <div>
@@ -99,7 +118,7 @@ export default function Production() {
       />
 
       <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setEditingId(null); }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="max-w-2xl">
           <DialogHeader><DialogTitle>{editingId ? "Edit" : "Record"} Production Run</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-4">
@@ -122,18 +141,41 @@ export default function Production() {
             </div>
             <div className="flex items-center justify-center text-muted-foreground text-sm gap-2"><ArrowRight className="h-4 w-4" /> produces</div>
             <div className="space-y-3">
-              {outs.map((o, i) => (
-                <div key={i} className="grid grid-cols-2 gap-4">
-                  <Select value={o.product_id} onValueChange={(v) => setOut(i, "product_id", v)}>
-                    <SelectTrigger className="h-11" data-testid={`production-output-${i}`}><SelectValue placeholder="Output product" /></SelectTrigger>
-                    <SelectContent>{products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}</SelectContent>
-                  </Select>
-                  <Input type="number" placeholder="Qty produced" value={o.quantity} onChange={(e) => setOut(i, "quantity", e.target.value)} className="h-11" data-testid={`production-output-qty-${i}`} />
-                </div>
-              ))}
-              <Button variant="outline" size="sm" onClick={() => setOuts([...outs, { product_id: "", quantity: "" }])} data-testid="add-output-row">+ Add output</Button>
+              <div className="grid grid-cols-12 gap-2 text-xs text-muted-foreground">
+                <span className="col-span-4">Output</span><span className="col-span-2">Qty (kg)</span>
+                <span className="col-span-3">Cost ₹/kg</span><span className="col-span-3">Selling ₹/kg</span>
+              </div>
+              {outs.map((o, i) => {
+                const c = costOf(o);
+                return (
+                  <div key={i}>
+                    <div className="grid grid-cols-12 gap-2">
+                      <div className="col-span-4">
+                        <Select value={o.product_id} onValueChange={(v) => setOut(i, "product_id", v)}>
+                          <SelectTrigger className="h-11" data-testid={`production-output-${i}`}><SelectValue placeholder="Output product" /></SelectTrigger>
+                          <SelectContent>{products.items.map((p) => <SelectItem key={p.id} value={p.id}>{p.name === "Wheat Bran" ? "Wheat Bran (Chokar)" : p.name}</SelectItem>)}</SelectContent>
+                        </Select>
+                      </div>
+                      <Input type="number" placeholder="Qty" value={o.quantity} onChange={(e) => setOut(i, "quantity", e.target.value)} className="h-11 col-span-2" data-testid={`production-output-qty-${i}`} />
+                      <Input type="number" placeholder="Auto" value={o.cost_rate ?? ""} onChange={(e) => setOut(i, "cost_rate", e.target.value)} className="h-11 col-span-3" data-testid={`production-output-cost-${i}`} />
+                      <Input type="number" placeholder={String(products.items.find((p) => p.id === o.product_id)?.rate || "")} value={o.selling_rate ?? ""} onChange={(e) => setOut(i, "selling_rate", e.target.value)} className="h-11 col-span-3" data-testid={`production-output-sell-${i}`} />
+                    </div>
+                    {c != null && (
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Cost {money(c)} · {(c / (+o.quantity)).toFixed(2)} ₹/kg{(o.cost_rate === "" || o.cost_rate == null) ? " (remainder of input cost)" : ""}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+              <Button variant="outline" size="sm" onClick={() => setOuts([...outs, { product_id: "", quantity: "", cost_rate: "", selling_rate: "" }])} data-testid="add-output-row">+ Add output</Button>
             </div>
-            <p className="text-sm text-muted-foreground">Estimated input cost: <span className="font-bold text-foreground">{money(inputCost)}</span> (allocated across outputs)</p>
+            <div className="rounded-lg bg-muted/50 p-3 text-sm space-y-1">
+              <div className="flex justify-between"><span>Input cost ({inputProduct?.name || "input"})</span><span className="font-bold">{money(inputCost)}</span></div>
+              <div className="flex justify-between"><span>Total output</span><span>{+totalOut.toFixed(3)} kg</span></div>
+              <div className="flex justify-between"><span>Loss / other</span><span className={lossKg < 0 ? "text-destructive" : ""}>{lossKg} kg</span></div>
+              <p className="text-xs text-muted-foreground pt-1">Set Chokar's cost rate lower than Atta's — any output left on "Auto" takes the rest of the input cost. Selling rate, if filled, updates the product's sale price.</p>
+            </div>
           </div>
           <DialogFooter><Button onClick={save} data-testid="save-production-btn">Save Production</Button></DialogFooter>
         </DialogContent>
@@ -151,7 +193,10 @@ export default function Production() {
                 <TableCell>{p.date}</TableCell>
                 <TableCell><Badge variant="outline">{p.mill}</Badge></TableCell>
                 <TableCell className="font-medium">{p.input_quantity} × {p.input_product_name}</TableCell>
-                <TableCell>{p.outputs.map((o, i) => <span key={i} className="block text-sm">{o.quantity} {o.product_name} <span className="text-muted-foreground">({money(o.cost)})</span></span>)}</TableCell>
+                <TableCell>
+                  {p.outputs.map((o, i) => <span key={i} className="block text-sm">{o.quantity} {o.product_name} <span className="text-muted-foreground">({money(o.cost)} · {o.cost_per_unit} ₹/kg)</span></span>)}
+                  {p.loss_kg > 0 && <span className="block text-xs text-muted-foreground">Loss {p.loss_kg} kg</span>}
+                </TableCell>
                 <TableCell className="text-right font-medium">{money(p.input_cost)}</TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
                   <Button variant="ghost" size="icon" onClick={() => openEdit(p)} data-testid={`edit-production-${p.id}`}><Pencil className="h-4 w-4" /></Button>

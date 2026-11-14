@@ -10,9 +10,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Download, FileDown, Info, Pencil, IndianRupee } from "lucide-react";
+import { Plus, Trash2, Download, FileDown, Info, Pencil, IndianRupee, ArrowDownToLine } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
 import { PartySelect } from "@/components/PartySelect";
+import { AdvanceAttaDialog } from "@/components/AdvanceAttaDialog";
 import { toast } from "sonner";
 
 const ADD_NEW = "__add_new__";
@@ -43,6 +44,7 @@ export default function Grinding() {
   const [grainTypes, setGrainTypes] = useState([]);
   const [banks, setBanks] = useState([]);
   const [newGrain, setNewGrain] = useState({ name: "", output: "" });
+  const [advanceOpen, setAdvanceOpen] = useState(false);
 
   useEffect(() => { api.get("/settings").then((r) => setSettings(r.data)).catch(() => {}); }, []);
   const loadGrainTypes = () => api.get("/grain-types").then((r) => setGrainTypes(r.data)).catch(() => {});
@@ -121,10 +123,13 @@ export default function Grinding() {
         actions={
           <>
             <Button variant="outline" className="h-11" onClick={() => downloadFile("/export/grinding", "grinding_report.xlsx")} data-testid="export-grinding-btn"><FileDown className="h-4 w-4 mr-1" /> Excel</Button>
+            <Button variant="outline" className="h-11" onClick={() => setAdvanceOpen(true)} data-testid="advance-atta-btn"><ArrowDownToLine className="h-4 w-4 mr-1" /> Advance Atta</Button>
             <Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-grinding-btn"><Plus className="h-4 w-4 mr-1" /> New Order</Button>
           </>
         }
       />
+
+      <AdvanceAttaDialog open={advanceOpen} onOpenChange={setAdvanceOpen} />
 
       <Dialog open={open} onOpenChange={setOpen}>
         {/* Capped height with the fields scrolling: the form grows with the

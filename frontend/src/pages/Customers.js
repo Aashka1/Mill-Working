@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useList, useFilter, PageToolbar } from "@/components/common";
-import api, { money } from "@/lib/api";
+import api, { money, downloadFile } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -8,9 +8,10 @@ import { Card } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, History, Phone, MapPin, Pencil } from "lucide-react";
+import { Plus, Trash2, History, Phone, MapPin, Pencil, FileBarChart, FileSpreadsheet } from "lucide-react";
 import { toast } from "sonner";
 import { LedgerDialog } from "@/components/LedgerDialog";
+import { CustomerReportDialog } from "@/components/CustomerReportDialog";
 
 const BLANK = { name: "", phone: "", address: "", gstin: "", pan_aadhaar: "", opening_balance: "", credit_limit: "" };
 
@@ -22,6 +23,10 @@ export default function Customers() {
   const [editingId, setEditingId] = useState(null);
   const [f, setF] = useState(BLANK);
   const [ledgerFor, setLedgerFor] = useState(null);
+  const [reportFor, setReportFor] = useState(null);
+
+  const exportAll = () => downloadFile("/reports/customer-statement/export?format=xlsx", "all_customers_report.xlsx")
+    .catch(() => toast.error("Download failed"));
 
   const openNew = () => { setEditingId(null); setF(BLANK); setOpen(true); };
   const openEdit = (c) => {
@@ -52,6 +57,10 @@ export default function Customers() {
         title="Customers" subtitle="Profiles, history & outstanding balances"
         search={q} setSearch={setQ} searchTestid="search-customers"
         actions={
+          <>
+          <Button variant="outline" className="h-11" onClick={exportAll} data-testid="export-all-customers-btn">
+            <FileSpreadsheet className="h-4 w-4 mr-1" /> All Customers Excel
+          </Button>
           <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) setEditingId(null); }}>
             <DialogTrigger asChild><Button className="h-11 active:scale-95 transition-transform" onClick={openNew} data-testid="add-customer-btn"><Plus className="h-4 w-4 mr-1" /> Add Customer</Button></DialogTrigger>
             <DialogContent>
@@ -77,6 +86,7 @@ export default function Customers() {
               <DialogFooter><Button onClick={save} data-testid="save-customer-btn">Save</Button></DialogFooter>
             </DialogContent>
           </Dialog>
+          </>
         }
       />
       <Card className="border-border/60 scroll-x">
@@ -93,7 +103,8 @@ export default function Customers() {
                 <TableCell><span className="flex items-center gap-1 text-sm text-muted-foreground"><MapPin className="h-3 w-3" />{c.address || "—"}</span></TableCell>
                 <TableCell className="text-right">{c.outstanding > 0 ? <Badge variant="outline" className="text-destructive border-destructive/30">{money(c.outstanding)}</Badge> : <Badge variant="outline" className="text-secondary border-secondary/30">Clear</Badge>}</TableCell>
                 <TableCell className="text-right flex gap-1 justify-end">
-                  <Button variant="ghost" size="icon" onClick={() => setLedgerFor(c)} data-testid={`ledger-customer-${c.id}`}><History className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" title="Full report & Excel" onClick={() => setReportFor(c)} data-testid={`report-customer-${c.id}`}><FileBarChart className="h-4 w-4" /></Button>
+                  <Button variant="ghost" size="icon" title="Ledger & record payment" onClick={() => setLedgerFor(c)} data-testid={`ledger-customer-${c.id}`}><History className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => openEdit(c)} data-testid={`edit-customer-${c.id}`}><Pencil className="h-4 w-4" /></Button>
                   <Button variant="ghost" size="icon" onClick={() => customers.remove(c.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                 </TableCell>
@@ -104,6 +115,7 @@ export default function Customers() {
         </Table>
       </Card>
 
+      <CustomerReportDialog open={!!reportFor} onOpenChange={(o) => !o && setReportFor(null)} customer={reportFor} />
       <LedgerDialog open={!!ledgerFor} onOpenChange={(o) => !o && setLedgerFor(null)} entity={ledgerFor} partyType="customer" onChanged={() => customers.load()} />
     </div>
   );
