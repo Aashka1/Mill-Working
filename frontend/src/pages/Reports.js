@@ -14,6 +14,7 @@ const PRESETS = [
   { value: "yesterday", label: "Yesterday" },
   { value: "this-week", label: "This week" },
   { value: "this-month", label: "This month" },
+  { value: "this-year", label: "This year (Jan–Dec)" },
   { value: "financial-year", label: "Financial year" },
   { value: "custom", label: "Custom range" },
 ];
@@ -241,7 +242,7 @@ export default function Reports() {
               </TableHeader>
               <TableBody>
                 {data.rows.map((row, i) => (
-                  <TableRow key={i} className="hover:bg-muted/50" data-testid={`report-row-${i}`}>
+                  <TableRow key={i} className={`hover:bg-muted/50 ${row._total ? "font-bold bg-muted/40" : ""}`} data-testid={`report-row-${i}`}>
                     {data.columns.map((c) => (
                       <TableCell key={c.key} className={c.align === "right" ? "text-right tabular-nums" : ""}>
                         {fmt(row[c.key], c.type)}

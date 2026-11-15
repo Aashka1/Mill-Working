@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { InvoiceActions } from "@/components/InvoiceActions";
 import { useList, useFilter, PageToolbar, StatusBadge } from "@/components/common";
 import api, { money, today, downloadFile } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -9,7 +10,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Download, FileDown, Info, Pencil, IndianRupee } from "lucide-react";
+import { Plus, Trash2, FileDown, Info, Pencil, IndianRupee } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
 import { PartySelect } from "@/components/PartySelect";
 import { toast } from "sonner";
@@ -205,7 +206,7 @@ export default function OilExtraction() {
                 <TableCell className="text-right flex gap-1 justify-end">
                   {o.payment_status !== "Paid" && o.payment_status !== "Paid to Customer" && <Button variant="ghost" size="icon" onClick={() => setPayFor(o)} data-testid={`pay-oil-${o.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(o)} data-testid={`edit-oil-${o.id}`}><Pencil className="h-4 w-4" /></Button>
-                  <Button variant="ghost" size="icon" onClick={() => downloadFile(`/invoices/${o.id}/pdf`, `${o.invoice_number}.pdf`)} data-testid={`pdf-oil-${o.id}`}><Download className="h-4 w-4" /></Button>
+                  <InvoiceActions refId={o.id} invoiceNumber={o.invoice_number} />
                   <Button variant="ghost" size="icon" onClick={() => oil.remove(o.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                 </TableCell>
               </TableRow>

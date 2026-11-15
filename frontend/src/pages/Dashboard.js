@@ -41,6 +41,24 @@ export default function Dashboard() {
         <StatCard testid="stat-stock" label="Total Stock" value={`${d.total_stock} kg`} icon={Package} accent="primary" sub={`${d.inventory_count} products`} />
       </div>
 
+      {d.profit_periods && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6" data-testid="profit-periods">
+          {[["This month", d.profit_periods.month], [`This year (${d.profit_periods.year.label})`, d.profit_periods.year]].map(([label, p]) => (
+            <Card key={label} className="p-5 border-border/60">
+              <h3 className="font-heading font-bold mb-3">Profit — {label}</h3>
+              <div className="grid grid-cols-3 gap-3 text-sm">
+                <div><p className="text-muted-foreground">Sales</p><p className="font-bold">{money(p.sales)}</p></div>
+                <div><p className="text-muted-foreground">Cost of goods</p><p className="font-bold">− {money(p.cogs)}</p></div>
+                <div><p className="text-muted-foreground">Gross profit</p><p className="font-bold">{money(p.gross_profit)}</p></div>
+                <div><p className="text-muted-foreground">Service income</p><p className="font-bold">+ {money(p.service_income)}</p></div>
+                <div><p className="text-muted-foreground">Expenses</p><p className="font-bold">− {money(p.expenses)}</p></div>
+                <div><p className="text-muted-foreground">Net profit</p><p className={`font-heading font-bold text-lg ${p.net_profit < 0 ? "text-destructive" : "text-secondary"}`}>{money(p.net_profit)}</p></div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
       {day && (
         <Card className="p-6 border-border/60 mb-6" data-testid="daily-summary">
           <div className="flex items-center gap-2 mb-4">

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { InvoiceActions, InvoiceSizeSelect } from "@/components/InvoiceActions";
 import { useNavigate } from "react-router-dom";
-import api, { money, downloadFile, formatApiErrorDetail } from "@/lib/api";
+import api, { money, formatApiErrorDetail } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,7 +10,7 @@ import { Card } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Search as SearchIcon, FileDown, FileText, Printer, Download, Trash2, ExternalLink } from "lucide-react";
+import { Search as SearchIcon, FileDown, FileText, Printer, Trash2, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 
 const PRESETS = [
@@ -18,6 +19,7 @@ const PRESETS = [
   { value: "yesterday", label: "Yesterday" },
   { value: "this-week", label: "This week" },
   { value: "this-month", label: "This month" },
+  { value: "this-year", label: "This year (Jan–Dec)" },
   { value: "financial-year", label: "Financial year" },
   { value: "custom", label: "Custom range" },
 ];
@@ -107,6 +109,7 @@ export default function Search() {
           <p className="text-muted-foreground mt-1">Across sales, purchases, parties, payments, bank and stock</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <InvoiceSizeSelect />
           <Button variant="outline" className="h-11" onClick={() => window.print()} data-testid="search-print">
             <Printer className="h-4 w-4 mr-1" /> Print
           </Button>
@@ -223,11 +226,7 @@ export default function Search() {
                         <ExternalLink className="h-4 w-4" />
                       </Button>
                       {row._invoice && (
-                        <Button variant="ghost" size="icon" title="Download the invoice"
-                          onClick={() => downloadFile(`/invoices/${row.id}/pdf`, `${row.invoice_number}.pdf`)}
-                          data-testid={`print-${row.id}`}>
-                          <Download className="h-4 w-4" />
-                        </Button>
+                        <InvoiceActions refId={row.id} invoiceNumber={row.invoice_number} />
                       )}
                       {/* Deleting a record is an admin action everywhere else,
                           so it is one here too rather than a shortcut around that. */}

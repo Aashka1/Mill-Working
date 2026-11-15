@@ -1,11 +1,11 @@
 import { useState } from "react";
+import { InvoiceActions, InvoiceSizeSelect } from "@/components/InvoiceActions";
 import { useList, useFilter, PageToolbar, StatusBadge } from "@/components/common";
-import { money, downloadFile } from "@/lib/api";
+import { money } from "@/lib/api";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Download } from "lucide-react";
 
 export default function Invoices() {
   const invoices = useList("/invoices");
@@ -17,15 +17,16 @@ export default function Invoices() {
   return (
     <div>
       <PageToolbar
-        title="Invoices" subtitle="All generated bills — download as PDF"
+        title="Invoices" subtitle="All generated bills — download or print"
         search={q} setSearch={setQ} searchTestid="search-invoices"
+        actions={<InvoiceSizeSelect />}
       />
       <Card className="border-border/60 scroll-x">
         <Table>
           <TableHeader><TableRow>
             <TableHead>Invoice No.</TableHead><TableHead>Type</TableHead><TableHead>Date</TableHead>
             <TableHead>Customer</TableHead><TableHead className="text-right">Amount</TableHead>
-            <TableHead>Status</TableHead><TableHead className="text-right">PDF</TableHead>
+            <TableHead>Status</TableHead><TableHead className="text-right">Invoice</TableHead>
           </TableRow></TableHeader>
           <TableBody>
             {filtered.map((i) => (
@@ -37,9 +38,7 @@ export default function Invoices() {
                 <TableCell className="text-right font-medium">{money(i.total)}</TableCell>
                 <TableCell><StatusBadge status={i.payment_status} /></TableCell>
                 <TableCell className="text-right">
-                  <Button variant="ghost" size="icon" onClick={() => downloadFile(`/invoices/${i.ref_id}/pdf`, `${i.invoice_number}.pdf`)} data-testid={`pdf-invoice-${i.ref_id}`}>
-                    <Download className="h-4 w-4" />
-                  </Button>
+                  <span className="inline-flex"><InvoiceActions refId={i.ref_id} invoiceNumber={i.invoice_number} /></span>
                 </TableCell>
               </TableRow>
             ))}

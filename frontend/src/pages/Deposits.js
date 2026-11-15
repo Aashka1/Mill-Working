@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
+import { InvoiceActions } from "@/components/InvoiceActions";
 import { PageToolbar } from "@/components/common";
-import api, { money, today, downloadFile, formatApiErrorDetail } from "@/lib/api";
+import api, { money, today, formatApiErrorDetail } from "@/lib/api";
 import { PartySelect } from "@/components/PartySelect";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,7 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Wheat, Download, Trash2, History, ArrowDownToLine, IndianRupee, HandCoins } from "lucide-react";
+import { Plus, Wheat, Trash2, History, ArrowDownToLine, IndianRupee, HandCoins } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
 import { AdvanceAttaDialog } from "@/components/AdvanceAttaDialog";
 import { toast } from "sonner";
@@ -558,10 +559,7 @@ export default function Deposits() {
                         </Button>
                       )}
                       {e.invoice_number && (
-                        <Button variant="ghost" size="icon" title="Invoice"
-                          onClick={() => downloadFile(`/invoices/${e.id}/pdf`, `${e.invoice_number}.pdf`)}>
-                          <Download className="h-4 w-4" />
-                        </Button>
+                        <InvoiceActions refId={e.id} invoiceNumber={e.invoice_number} />
                       )}
                       <Button variant="ghost" size="icon" title="Delete" onClick={() => removeEntry(e)}>
                         <Trash2 className="h-4 w-4 text-destructive" />

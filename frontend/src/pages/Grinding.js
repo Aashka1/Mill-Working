@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { InvoiceActions } from "@/components/InvoiceActions";
 import { useList, useFilter, PageToolbar, StatusBadge } from "@/components/common";
 import api, { money, today, downloadFile } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -10,7 +11,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Trash2, Download, FileDown, Info, Pencil, IndianRupee, ArrowDownToLine } from "lucide-react";
+import { Plus, Trash2, FileDown, Info, Pencil, IndianRupee, ArrowDownToLine } from "lucide-react";
 import { PaymentDialog } from "@/components/PaymentDialog";
 import { PartySelect } from "@/components/PartySelect";
 import { AdvanceAttaDialog } from "@/components/AdvanceAttaDialog";
@@ -329,7 +330,7 @@ export default function Grinding() {
                 <TableCell className="text-right flex gap-1 justify-end">
                   {g.payment_status !== "Paid" && <Button variant="ghost" size="icon" onClick={() => setPayFor(g)} data-testid={`pay-grinding-${g.id}`}><IndianRupee className="h-4 w-4 text-secondary" /></Button>}
                   <Button variant="ghost" size="icon" onClick={() => openEdit(g)} data-testid={`edit-grinding-${g.id}`}><Pencil className="h-4 w-4" /></Button>
-                  <Button variant="ghost" size="icon" onClick={() => downloadFile(`/invoices/${g.id}/pdf`, `${g.invoice_number}.pdf`)} data-testid={`pdf-grinding-${g.id}`}><Download className="h-4 w-4" /></Button>
+                  <InvoiceActions refId={g.id} invoiceNumber={g.invoice_number} />
                   <Button variant="ghost" size="icon" onClick={() => grinding.remove(g.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
                 </TableCell>
               </TableRow>

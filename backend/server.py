@@ -1504,9 +1504,17 @@ async def build_invoice_data(ref_id: str):
                 "total": o.get("total", o["charge"])}
     return None
 
+# A6 is a quarter of an A4 sheet — the small bill most mills hand over. A4
+# stays available for anyone printing on full sheets.
+INVOICE_SIZES = {"a4": A4, "a6": (105 * mm, 148 * mm)}
+
 @api_router.get("/invoices/{ref_id}/pdf")
-async def invoice_pdf(ref_id: str, request: Request):
+async def invoice_pdf(ref_id: str, request: Request, size: str = "a6", inline: bool = False):
     await get_current_user(request)
+    size = (size or "a6").lower()
+    if size not in INVOICE_SIZES:
+        raise HTTPException(status_code=400, detail="Size must be a4 or a6")
+    small_page = size == "a6"
     data = await build_invoice_data(ref_id)
     if not data:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -1514,11 +1522,20 @@ async def invoice_pdf(ref_id: str, request: Request):
     buyer = await db.customers.find_one({"party_key": party_key(data.get("customer_name", ""))}) or {}
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=16*mm)
+    page = INVOICE_SIZES[size]
+    margin = 6 * mm if small_page else 15 * mm
+    doc = SimpleDocTemplate(buf, pagesize=page, leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=margin,
+                            title=f'Invoice {data.get("invoice_number", "")}')
+    W = page[0] - 2 * margin   # usable width; every column is a share of it
     styles = getSampleStyleSheet()
     title = ParagraphStyle("t", parent=styles["Title"], textColor=colors.HexColor("#B8860B"),
-                           alignment=0, fontSize=18, spaceAfter=2)
-    small = ParagraphStyle("sm", parent=styles["Normal"], fontSize=8.5, leading=11)
+                           alignment=0, fontSize=11 if small_page else 18, leading=13 if small_page else 22,
+                           spaceAfter=1 if small_page else 2)
+    small = ParagraphStyle("sm", parent=styles["Normal"], fontSize=6.5 if small_page else 8.5,
+                           leading=8 if small_page else 11)
+    cellstyle = ParagraphStyle("cell", parent=styles["Normal"], fontSize=6.5 if small_page else 10,
+                               leading=8 if small_page else 12)
 
     def esc(v):
         return str(v or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1546,7 +1563,8 @@ async def invoice_pdf(ref_id: str, request: Request):
     if logo.startswith("data:image"):
         try:
             raw = base64.b64decode(logo.split(",", 1)[1])
-            header_cells[0].append(Image(io.BytesIO(raw), width=26*mm, height=26*mm, kind="proportional"))
+            logo_mm = 14 if small_page else 26
+            header_cells[0].append(Image(io.BytesIO(raw), width=logo_mm*mm, height=logo_mm*mm, kind="proportional"))
         except Exception:
             # A malformed logo must not stop the mill printing a bill.
             logger.warning("Invoice logo could not be decoded; printing without it")
@@ -1554,7 +1572,7 @@ async def invoice_pdf(ref_id: str, request: Request):
     else:
         header_cells[0].append("")
 
-    head_tbl = Table(header_cells, colWidths=[135*mm, 30*mm])
+    head_tbl = Table(header_cells, colWidths=[W * 0.8, W * 0.2])
     head_tbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
                                   ("LEFTPADDING", (0, 0), (-1, -1), 0),
                                   ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
@@ -1567,43 +1585,53 @@ async def invoice_pdf(ref_id: str, request: Request):
     if buyer.get("gstin"):
         buyer_lines.append(f'GSTIN: {esc(buyer["gstin"])}')
 
-    elements = [head_tbl, Spacer(1, 8),
-                Table([[""]], colWidths=[165*mm], style=TableStyle([
+    gap = 3 if small_page else 8
+    elements = [head_tbl, Spacer(1, gap),
+                Table([[""]], colWidths=[W], style=TableStyle([
                     ("LINEBELOW", (0, 0), (-1, -1), 0.75, colors.HexColor("#B8860B"))])),
-                Spacer(1, 8),
+                Spacer(1, gap),
                 Table([[Paragraph("<br/>".join(buyer_lines), small),
                         Paragraph(f'<b>Invoice:</b> {esc(data["invoice_number"])}<br/>'
                                   f'<b>Type:</b> {esc(data["type"])}<br/>'
                                   f'<b>Date:</b> {esc(data["date"])}<br/>'
                                   f'<b>Status:</b> {esc(data["payment_status"])}', small)]],
-                      colWidths=[100*mm, 65*mm],
+                      colWidths=[W * 0.58, W * 0.42],
                       style=TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
                                         ("LEFTPADDING", (0, 0), (-1, -1), 0)])),
-                Spacer(1, 14)]
-    rows = [["Description", "Quantity", "Rate (Rs)", "Amount (Rs)"]]
+                Spacer(1, 6 if small_page else 14)]
+    rows = [["Description", "Qty", "Rate", "Amount"] if small_page
+            else ["Description", "Quantity", "Rate (Rs)", "Amount (Rs)"]]
     for it in data["items"]:
         def cell(v):
             return f'{v:.2f}' if isinstance(v, (int, float)) else (v or "")
-        rows.append([it["desc"], it["qty"], cell(it["rate"]), cell(it["amount"])])
+        # Wrapped, so a long line fits the narrow quarter-page column.
+        rows.append([Paragraph(esc(it["desc"]), cellstyle), it["qty"], cell(it["rate"]), cell(it["amount"])])
     rows.append(["", "", "Total", f'Rs {data["total"]:.2f}'])
-    tbl = Table(rows, colWidths=[80*mm, 30*mm, 35*mm, 35*mm])
+    tbl = Table(rows, colWidths=[W * 0.44, W * 0.18, W * 0.17, W * 0.21])
+    pad = 3 if small_page else 8
     tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#B8860B")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.5 if small_page else 10),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), pad),
+        ("TOPPADDING", (0, 0), (-1, -1), pad),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2 if small_page else 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2 if small_page else 6),
         ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#F5EEDC")),
         ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
     ]))
     elements.append(tbl)
-    elements.append(Spacer(1, 24))
-    elements.append(Paragraph("Thank you for your business!", styles["Italic"]))
+    elements.append(Spacer(1, 8 if small_page else 24))
+    elements.append(Paragraph("Thank you for your business!",
+                              ParagraphStyle("ty", parent=styles["Italic"], fontSize=7 if small_page else 10)))
     doc.build(elements)
     buf.seek(0)
+    # inline lets the browser open it for printing instead of saving it.
+    disposition = "inline" if inline else "attachment"
     return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{data["invoice_number"]}.pdf"'})
+        headers={"Content-Disposition": f'{disposition}; filename="{data["invoice_number"]}.pdf"'})
 
 # ---------------- Reports / Export ----------------
 
@@ -1696,7 +1724,18 @@ async def dashboard(user: dict = Depends(get_current_user)):
         exp = month_income_for(expenses, "amount", m) + month_cogs
         trend.append({"month": label, "income": round(inc, 2), "expense": round(exp, 2)})
 
+    # Same arithmetic as the P&L report, so the three figures always agree with it.
+    pdata = await pl_data()
+    t = local_now().date()
+    year_start = t.replace(month=1, day=1)
+    def period(a, b):
+        f = pl_figures(pdata, a, b)
+        return {k: f[k] for k in ("sales", "cogs", "gross_profit", "service_income", "expenses", "net_profit")}
+    profit_periods = {"month": period(f"{month}-01", today),
+                      "year": {**period(str(year_start), today), "label": str(t.year)}}
+
     return {
+        "profit_periods": profit_periods,
         "total_income": round(total_income, 2),
         "total_sales": round(total_sales, 2),
         "total_purchases": round(total_purchases, 2),
@@ -3684,6 +3723,8 @@ def date_range(preset: str = None, start: str = None, end: str = None):
         return str(today - timedelta(days=today.weekday())), str(today)
     if p in ("this-month", "month"):
         return str(today.replace(day=1)), str(today)
+    if p in ("this-year", "year"):
+        return str(today.replace(month=1, day=1)), str(today)
     if p in ("financial-year", "fy"):
         # Indian financial year runs April to March.
         fy_start = today.replace(month=4, day=1) if today.month >= 4 else today.replace(year=today.year - 1, month=4, day=1)
@@ -4258,19 +4299,26 @@ async def rep_day_book(start, end, **_):
                         {"label": "Purchases", "value": round(sum(r["amount"] for r in rows if r["type"] == "Purchase"), 2), "type": "money"},
                         {"label": "Expenses", "value": round(sum(r["amount"] for r in rows if r["type"] == "Expense"), 2), "type": "money"}]}
 
-async def rep_profit_loss(start, end, **_):
+async def pl_data():
     sales, expenses, products, *serviced = await asyncio.gather(
-        db.sales.find().to_list(30000), db.expenses.find().to_list(30000),
+        db.sales.find().to_list(50000), db.expenses.find().to_list(50000),
         db.products.find().to_list(2000),
-        *[db[bl.coll].find().to_list(30000) for bl in SERVICE_BILLING],
+        *[db[bl.coll].find().to_list(50000) for bl in SERVICE_BILLING],
     )
+    cost_by_name = {p["name"]: p.get("cost_per_unit", 0) or 0 for p in products}
+    return sales, expenses, serviced, cost_by_name
+
+def pl_figures(data, start, end) -> dict:
+    """Profit for one period, worked out the same way everywhere it is shown.
+
+    Sales are not profit: the cost of the goods sold comes off first to give
+    gross profit, service charges (which carry no goods) are added, and
+    expenses come off last to give net profit.
+    """
+    sales, expenses, serviced, cost_by_name = data
     sales = [d for d in sales if in_range(d, start, end)]
     expenses = [d for d in expenses if in_range(d, start, end)]
-    products = {p["name"]: p for p in products}
-    cost_by_name = {n: p.get("cost_per_unit", 0) or 0 for n, p in products.items()}
-
     sale_income = round(sum(sale_revenue(d) for d in sales), 2)
-    gst_collected = round(sum(d.get("total_gst", 0) or 0 for d in sales), 2)
     cogs = round(sum(sale_cogs(d, cost_by_name) for d in sales), 2)
     # Every service the registry knows how to bill, so a module added later
     # cannot be charged to a customer and left out of income.
@@ -4278,27 +4326,94 @@ async def rep_profit_loss(start, end, **_):
                 round(sum(earned(bl, d) for d in rows if in_range(d, start, end)), 2))
                for bl, rows in zip(SERVICE_BILLING, serviced)]
     service_income = round(sum(v for _, v in service), 2)
-    exp_total = round(sum(d.get("amount", 0) for d in expenses), 2)
-
     by_cat = {}
     for e in expenses:
-        by_cat[e.get("category", "Other")] = round(by_cat.get(e.get("category", "Other"), 0) + e.get("amount", 0), 2)
+        k = e.get("category", "Other") or "Other"
+        by_cat[k] = round(by_cat.get(k, 0) + (e.get("amount", 0) or 0), 2)
+    exp_total = round(sum(by_cat.values()), 2)
+    gross = round(sale_income - cogs, 2)
+    return {"sales": sale_income, "cogs": cogs, "gross_profit": gross,
+            "service": service, "service_income": service_income,
+            "total_income": round(sale_income + service_income, 2),
+            "expenses_by_category": by_cat, "expenses": exp_total,
+            "gst": round(sum(d.get("total_gst", 0) or 0 for d in sales), 2),
+            "net_profit": round(gross + service_income - exp_total, 2)}
 
-    rows = [{"head": "Sales income (excluding GST)", "amount": sale_income},
-            {"head": "Less: cost of goods sold", "amount": -cogs},
-            {"head": "Gross profit on sales", "amount": round(sale_income - cogs, 2)}]
-    rows += [{"head": head, "amount": amount} for head, amount in service]
-    rows += [{"head": f'Expense · {k}', "amount": -v} for k, v in sorted(by_cat.items())]
-    net = round(sale_income - cogs + service_income - exp_total, 2)
+async def rep_profit_loss(start, end, **_):
+    f = pl_figures(await pl_data(), start, end)
+    net = f["net_profit"]
+    rows = [{"head": "Sales (excluding GST)", "amount": f["sales"]},
+            {"head": "Less: cost of goods sold", "amount": -f["cogs"]},
+            {"head": "Gross profit on sales", "amount": f["gross_profit"]}]
+    rows += [{"head": f"Add: {head}", "amount": amount} for head, amount in f["service"] if amount]
+    rows.append({"head": "Gross profit + service income", "amount": round(f["gross_profit"] + f["service_income"], 2)})
+    rows += [{"head": f'Less: expense · {k}', "amount": -v} for k, v in sorted(f["expenses_by_category"].items())]
     rows.append({"head": "Net profit" if net >= 0 else "Net loss", "amount": net})
-    if gst_collected:
-        rows.append({"head": "Memo: GST collected on sales (payable, not income)", "amount": gst_collected})
+    if f["gst"]:
+        rows.append({"head": "Memo: GST collected on sales (payable, not income)", "amount": f["gst"]})
     return {"columns": [col("head", "Particulars"), col("amount", "Amount", "money")],
-            "rows": rows,
-            "summary": [{"label": "Income", "value": round(sale_income + service_income, 2), "type": "money"},
-                        {"label": "Cost of goods sold", "value": cogs, "type": "money"},
-                        {"label": "Expenses", "value": exp_total, "type": "money"},
+            "rows": rows, "figures": f,
+            "summary": [{"label": "Total sales", "value": f["sales"], "type": "money"},
+                        {"label": "Cost of goods sold", "value": f["cogs"], "type": "money"},
+                        {"label": "Gross profit", "value": f["gross_profit"], "type": "money"},
+                        {"label": "Service income", "value": f["service_income"], "type": "money"},
+                        {"label": "Expenses", "value": f["expenses"], "type": "money"},
                         {"label": "Net profit" if net >= 0 else "Net loss", "value": net, "type": "money"}]}
+
+def year_label(month: str) -> str:
+    """Calendar year (January to December) a YYYY-MM month falls in."""
+    return month[:4]
+
+def month_end(month: str) -> str:
+    y, m = int(month[:4]), int(month[5:7])
+    nxt = datetime(y + (m == 12), 1 if m == 12 else m + 1, 1)
+    return (nxt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+async def rep_profit_loss_monthly(start, end, **_):
+    """Profit month by month, with a total for each calendar year."""
+    data = await pl_data()
+    sales, expenses, serviced, _ = data
+    dated = [str(d.get("date") or "")[:7] for d in sales + expenses + [r for rows in serviced for r in rows]]
+    dated = [m for m in dated if len(m) == 7 and start[:7] <= m <= end[:7]]
+    if not dated:
+        return {"columns": [col("period", "Month")], "rows": [], "summary": []}
+    # Every month in the span, so a quiet month shows as zero instead of
+    # disappearing from the table.
+    months, m = [], min(dated)
+    last = max(m for m in dated)
+    while m <= last:
+        months.append(m)
+        y, mo = int(m[:4]), int(m[5:7])
+        m = f"{y + (mo == 12)}-{1 if mo == 12 else mo + 1:02d}"
+
+    keys = ("sales", "cogs", "gross_profit", "service_income", "expenses", "net_profit")
+    def row(label, f, bold=False):
+        return {"period": label, **{k: f[k] for k in keys}, "_total": bold}
+    rows, fy_tot, grand = [], {}, {k: 0.0 for k in keys}
+    current_fy = None
+    def close_fy():
+        if current_fy:
+            rows.append(row(f"Year {current_fy} total", {k: round(v, 2) for k, v in fy_tot.items()}, True))
+    for mth in months:
+        fy = year_label(mth)
+        if fy != current_fy:
+            close_fy()
+            current_fy, fy_tot = fy, {k: 0.0 for k in keys}
+        f = pl_figures(data, max(start, f"{mth}-01"), min(end, month_end(mth)))
+        rows.append(row(datetime.strptime(mth, "%Y-%m").strftime("%b %Y"), f))
+        for k in keys:
+            fy_tot[k] += f[k]; grand[k] += f[k]
+    close_fy()
+    return {"columns": [col("period", "Month"), col("sales", "Sales", "money"),
+                        col("cogs", "Cost of goods", "money"), col("gross_profit", "Gross profit", "money"),
+                        col("service_income", "Service income", "money"), col("expenses", "Expenses", "money"),
+                        col("net_profit", "Net profit", "money")],
+            "rows": rows,
+            "summary": [{"label": "Total sales", "value": round(grand["sales"], 2), "type": "money"},
+                        {"label": "Cost of goods sold", "value": round(grand["cogs"], 2), "type": "money"},
+                        {"label": "Expenses", "value": round(grand["expenses"], 2), "type": "money"},
+                        {"label": "Net profit", "value": round(grand["net_profit"], 2), "type": "money"}],
+            "note": "Years are calendar years, January to December."}
 
 async def rep_trial_balance(start, end, **_):
     """A trial balance over the accounts this app actually keeps.
@@ -4324,10 +4439,10 @@ async def rep_trial_balance(start, end, **_):
     stock = await rep_stock(start, end)
     rows.append({"account": "Closing stock (at cost)", "debit": stock["summary"][1]["value"], "credit": 0})
 
-    pl = await rep_profit_loss(start, end)
-    rows.append({"account": "Income", "debit": 0, "credit": pl["summary"][0]["value"]})
-    rows.append({"account": "Cost of goods sold", "debit": pl["summary"][1]["value"], "credit": 0})
-    rows.append({"account": "Expenses", "debit": pl["summary"][2]["value"], "credit": 0})
+    pl = pl_figures(await pl_data(), start, end)
+    rows.append({"account": "Income", "debit": 0, "credit": pl["total_income"]})
+    rows.append({"account": "Cost of goods sold", "debit": pl["cogs"], "credit": 0})
+    rows.append({"account": "Expenses", "debit": pl["expenses"], "credit": 0})
 
     td = round(sum(r["debit"] for r in rows), 2)
     tc = round(sum(r["credit"] for r in rows), 2)
@@ -4526,6 +4641,7 @@ REPORTS = {
     "material-ledger":  {"title": "Grain / Material Ledger",   "group": "Ledgers", "fn": "rep_material_ledger", "party": "customer", "item": True},
     "outstanding":      {"title": "Outstanding (Dues)",        "group": "Summary", "fn": "rep_outstanding"},
     "profit-loss":      {"title": "Profit & Loss",             "group": "Summary", "fn": "rep_profit_loss"},
+    "profit-loss-monthly": {"title": "Profit & Loss — Month-wise & Yearly", "group": "Summary", "fn": "rep_profit_loss_monthly"},
     "trial-balance":    {"title": "Trial Balance",             "group": "Summary", "fn": "rep_trial_balance"},
 }
 
